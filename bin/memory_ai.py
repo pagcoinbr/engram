@@ -27,6 +27,7 @@ _DEFAULTS = {
     # backend + tier drive model choice (see engram_llm.TIER_PRESETS). `experts`
     # is an OPTIONAL per-role override map, e.g. {"distill": {"model": "..."}}.
     "backend": "ollama",                 # ollama | claude
+    "fallback": "",                      # "" | claude — used when backend=ollama is unreachable
     "tier": "small",                     # cpu | small | medium | large  (ollama only)
     "experts": {},
     "claude": {"bin": "claude", "timeout_seconds": 600, "max_turns": 1},

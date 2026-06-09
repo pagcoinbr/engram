@@ -13,6 +13,8 @@ local_enabled: true              # master switch for ALL automated/local memory 
 #   claude  — no GPU: shell out to the `claude` CLI headless (cost = Claude usage).
 #             Used by the always-on loop container (daemon/, backend=claude).
 backend: ollama                  # ollama | claude
+fallback: ""                     # "" | claude — when backend=ollama is unreachable (e.g. GPU box off),
+                                 # fall back to `claude -p` so the 24/7 daemon keeps working. Costs Claude usage.
 
 # Hardware tier (ollama only) — selects a model preset over the expert ROLES.
 # See engram_llm.TIER_PRESETS. Embeddings are always local (nomic, 768-dim).

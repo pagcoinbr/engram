@@ -91,12 +91,20 @@ def model_for(role: str, cfg=None) -> str:
 # ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
+def fallback(cfg=None) -> str:
+    return (_cfg(cfg).get("fallback") or "").strip().lower()
+
 def generate(prompt: str, role: str = "distill", cfg=None) -> str:
     cfg = _cfg(cfg)
-    b = backend(cfg)
-    if b == "claude":
+    if backend(cfg) == "claude":
         return _claude_generate(prompt, role, cfg)
-    return _ollama_generate(prompt, role, cfg)
+    # ollama primary; optional claude fallback when the GPU box is unreachable.
+    try:
+        return _ollama_generate(prompt, role, cfg)
+    except Exception:
+        if fallback(cfg) == "claude":
+            return _claude_generate(prompt, role, cfg)
+        raise
 
 
 def _ollama_generate(prompt: str, role: str, cfg) -> str:

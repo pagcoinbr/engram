@@ -30,7 +30,7 @@ MEMORY_AUTO_SECTION="## Uncategorized (auto-added)"
 [[ -f "${HOME}/.claude/engram.env" ]] && source "${HOME}/.claude/engram.env"
 
 memory_repo()        { printf '%s' "${CLAUDE_MEMORY_REPO:-}"; }   # local-first: empty = no remote sync
-memory_username()    { basename "$HOME"; }
+memory_username()    { printf '%s' "${CLAUDE_MEMORY_USERNAME:-$(basename "$HOME")}"; }  # override for shared/central stores
 
 memory_slug() {
     if [[ -n "${CLAUDE_MEMORY_SLUG:-}" ]]; then
