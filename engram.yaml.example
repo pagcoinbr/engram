@@ -1,0 +1,106 @@
+# engram.yaml — engram configuration. Copy to ~/.claude/engram.yaml (the installer
+# does this for you) and edit. Missing keys fall back to defaults in memory_ai.py.
+#
+# engram is a neuro-inspired memory system for Claude Code: encode (harvest) ->
+# consolidate (curate) -> fixate -> recall (graph). This file controls the LLM
+# backend, the unattended pipeline, and the local light pass.
+
+local_enabled: true              # master switch for ALL automated/local memory work
+
+# ── LLM backend ─────────────────────────────────────────────────────────────
+# How engram runs its LLM work (harvest/distill/injection-check/verify).
+#   ollama  — local models on a GPU box (free, private). Pick a `tier` for your VRAM.
+#   claude  — no GPU: shell out to the `claude` CLI headless (cost = Claude usage).
+#             Used by the always-on loop container (daemon/, backend=claude).
+backend: ollama                  # ollama | claude
+
+# Hardware tier (ollama only) — selects a model preset over the expert ROLES.
+# See engram_llm.TIER_PRESETS. Embeddings are always local (nomic, 768-dim).
+#   cpu     — no GPU; tiny 1-3B models (slow). Most cpu users should set backend: claude.
+#   small   — ~8 GB VRAM  (qwen2.5-coder:7b harvest, llama3.1:8b distill/injection)
+#   medium  — ~16-24 GB   (gpt-oss:20b distill, deepseek-r1:14b injection)
+#   large   — >= 32 GB    (qwen3-coder:30b distill, deepseek-r1:32b injection/verify)
+tier: small
+
+ollama:
+  host: "http://localhost:11434"   # your Ollama endpoint (e.g. a LAN GPU box)
+  timeout_seconds: 1200            # raise for big models on slow hardware (30b on an 8GB host ~2400)
+  num_ctx: 16384                   # distill prompts run ~6-8k tokens; below this Ollama silently truncates
+  num_predict: 8000                # reasoning models spend output tokens on hidden CoT first; keep headroom
+  reasoning_effort: "low"          # for harmony/reasoning models: keep CoT short so the answer comes through
+  keep_alive: "30m"                # hold the model resident so sequential stages skip cold reloads
+
+# Claude-only backend (when backend: claude). Flags are configurable since the
+# claude CLI can vary by version.
+claude:
+  bin: "claude"
+  model: ""                        # blank = CLI default; or pin e.g. "claude-sonnet-4-6"
+  timeout_seconds: 600
+  max_turns: 1                     # single turn, no tool loop — pure text generation
+
+# Embeddings — always local, never a paid API. Used when Ollama is unreachable or
+# backend: claude. nomic-embed-text-v1.5 is 768-dim, matching Ollama's nomic-embed-text.
+embed:
+  fastembed_model: "nomic-ai/nomic-embed-text-v1.5"
+  dim: 768
+
+# OPTIONAL per-role model override. Leave empty to let `tier` decide. Pin a role
+# only if you want a specific model regardless of tier, e.g.:
+# experts:
+#   distill: { model: "qwen3-coder:30b" }
+experts: {}
+
+# ── Light pass (cheap, twice-daily, NO destructive mutation) ─────────────────
+light_pass:
+  enabled: true
+  duplicate_finder:
+    enabled: true
+    expert: "similarity"
+    dup_threshold: 0.86            # cosine >= this => flagged as near-duplicate
+  injection_guard:
+    enabled: true
+    quarantine_suspects: true      # auto-move suspect memories out of recall (reversible)
+  draft_distill: true              # DRAFT (never apply) cluster merges
+  max_items: 60
+
+# ── Unattended pipeline (stages ①→⑤) ────────────────────────────────────────
+# ① harvest transcripts -> .staging/   ②/④ graduate clean candidates -> recall
+# ⑤ promote fixated user-direct memories -> installed skills
+# The `enabled` flags below are LIGHTS-OUT switches. They ship OFF: the pipeline
+# runs every stage in DRY-RUN so you can watch it before granting unattended writes.
+harvest:
+  max_files_per_run: 4
+
+auto_graduate:                     # stage ②/④
+  enabled: false                   # OFF by default — flip on once you trust the harvester's output
+  allow_provenance: ["user-direct"]
+  min_confidence: 0.6
+  dedup_threshold: 0.86
+  injection_check: true
+  staging_ttl_days: 14
+  max_per_run: 8
+
+skill_autoinstall:                 # stage ⑤
+  enabled: false                   # OFF by default (kill-switch: touch ~/.claude/skills/auto/.disabled)
+  require_user_direct: true        # only user-direct memories are skill-eligible
+  adversarial_review: true         # injection expert sanity pass (advisory)
+  max_per_run: 1
+  max_candidates_per_run: 3
+
+# Per-session trigger: a Stop hook launches ONE background curate subagent when a
+# session ran long enough and added enough new memories.
+session_curate:
+  enabled: true
+  min_minutes: 15
+  min_new_memories: 3
+  max_per_day: 2
+
+# Local MCP servers wired into interactive sessions. The graph recall server
+# (graph/mcp_server.py) is registered by the installer as `engram-graph`.
+mcp_servers:
+  engram-graph:
+    note: "Graphiti/Neo4j recall tools: memory_recall / memory_search_facts / memory_neighbors / memory_stats"
+
+# Scheduling — the installer builds the systemd timer / daemon cadence from these.
+schedule:
+  times: ["03:30", "15:30"]

@@ -1,0 +1,10 @@
+[Unit]
+Description=engram memory daemon timer (fires engram-daemon.py --once; per-task cadences applied inside)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

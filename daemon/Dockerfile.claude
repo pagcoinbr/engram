@@ -1,0 +1,24 @@
+# engram daemon — claude-only loop container (no GPU).
+# Runs the maintenance pipeline + graph sync via the Claude Code CLI (backend: claude);
+# embeddings via CPU fastembed. Neo4j is a sibling service (see docker-compose.yml).
+FROM node:22-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-venv git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Claude Code CLI (provides the `claude` binary the claude backend shells out to).
+RUN npm install -g @anthropic-ai/claude-code
+
+# Python deps: engine config (pyyaml), graph (graphiti-core + neo4j), CPU embeddings (fastembed).
+RUN pip3 install --no-cache-dir --break-system-packages \
+      pyyaml graphiti-core neo4j fastembed
+
+# The engram repo is mounted at /engram (read-write so graph state can persist);
+# the memory store + engram.yaml live under /root/.claude (a mounted volume).
+ENV ENGRAM_BIN=/engram/bin \
+    ENGRAM_GRAPH=/engram/graph \
+    ENGRAM_CONFIG=/root/.claude/engram.yaml \
+    ENGRAM_LOG_DIR=/root/.claude/logs
+WORKDIR /engram
+CMD ["python3", "/engram/daemon/engram-daemon.py", "--loop"]

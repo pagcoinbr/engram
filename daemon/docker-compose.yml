@@ -1,0 +1,50 @@
+# engram always-on stack: Neo4j + the daemon loop. Default backend is claude-only
+# (no GPU) — set ANTHROPIC_API_KEY. To use a GPU box instead, set BACKEND=ollama and
+# OLLAMA_HOST in .env and point engram.yaml at it.
+#
+#   cp .env.example .env   # fill NEO4J_PASSWORD, ANTHROPIC_API_KEY, CLAUDE_MEMORY_SLUG
+#   docker compose up -d
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: engram-neo4j
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7474:7474"     # browser (local only)
+      - "127.0.0.1:7687:7687"     # bolt (local only)
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_server_memory_heap_max__size=1g
+      - NEO4J_server_memory_pagecache_size=512m
+    volumes:
+      - ./neo4j/data:/data
+      - ./neo4j/logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  engram-daemon:
+    build:
+      context: ..
+      dockerfile: daemon/Dockerfile.claude
+    container_name: engram-daemon
+    restart: unless-stopped
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    environment:
+      - BACKEND=${BACKEND:-claude}
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      # Claude-only backend auth (headless `claude -p`):
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # Must match the slug of the store you mount below (else MEM_DIR points nowhere):
+      - CLAUDE_MEMORY_SLUG=${CLAUDE_MEMORY_SLUG:?set CLAUDE_MEMORY_SLUG (e.g. -home-youruser)}
+      # Optional remote sync of the shared store (central deploy): owner/repo + a token.
+      - CLAUDE_MEMORY_REPO=${CLAUDE_MEMORY_REPO:-}
+    volumes:
+      - ..:/engram                                  # engram engine + graph + daemon (rw: graph state persists)
+      - ${ENGRAM_CLAUDE_HOME:-./claude-home}:/root/.claude   # engram.yaml + projects/<slug>/memory + logs

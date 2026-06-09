@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# install.sh — install engram into ~/.claude. Idempotent + re-runnable.
+#
+# Interactive by default; non-interactive with flags:
+#   --backend ollama|claude     --tier cpu|small|medium|large   --ollama-host URL
+#   --storage local|github      --repo owner/name (implies github)
+#   --daemon none|systemd|docker
+#   --graph | --no-graph        (build the Neo4j graph venv + register the MCP server)
+#   --yes                       (accept defaults, no prompts)
+#
+# What it does: copies the engine into ~/.claude, writes engram.yaml, merges the
+# Stop/SessionStart hooks into settings.json, optionally builds the graph venv +
+# registers the recall MCP server, seeds synthetic examples (only if the store is
+# empty), and sets up the chosen daemon. Apply-gates ship OFF (dry-run).
+set -eo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLAUDE="${ENGRAM_CLAUDE_HOME:-$HOME/.claude}"
+SETTINGS="$CLAUDE/settings.json"
+
+BACKEND=""; TIER="small"; OLLAMA_HOST="http://localhost:11434"
+STORAGE="local"; REPO_REMOTE=""; DAEMON="none"; YES=0; WANT_GRAPH="auto"
+
+while [[ $# -gt 0 ]]; do case "$1" in
+  --backend) BACKEND="$2"; shift 2;;
+  --tier) TIER="$2"; shift 2;;
+  --ollama-host) OLLAMA_HOST="$2"; shift 2;;
+  --storage) STORAGE="$2"; shift 2;;
+  --repo) REPO_REMOTE="$2"; STORAGE="github"; shift 2;;
+  --daemon) DAEMON="$2"; shift 2;;
+  --graph) WANT_GRAPH="yes"; shift;;
+  --no-graph) WANT_GRAPH="no"; shift;;
+  --yes|-y) YES=1; shift;;
+  -h|--help) sed -n '2,18p' "$0"; exit 0;;
+  *) echo "unknown arg: $1" >&2; exit 2;;
+esac; done
+
+say()  { printf '\033[1;36m[engram]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[engram] warning:\033[0m %s\n' "$*"; }
+ask()  { local __v="$1" __p="$2" __d="$3" __a; if [[ "$YES" == 1 || ! -t 0 ]]; then printf -v "$__v" '%s' "${!__v:-$__d}"; return; fi; read -r -p "$__p [$__d]: " __a || true; printf -v "$__v" '%s' "${__a:-${!__v:-$__d}}"; }
+
+# ---- prereqs ----
+command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
+command -v jq >/dev/null || warn "jq not found — settings.json hook merge will be skipped (install jq + re-run)"
+
+# ---- choices ----
+[[ -z "$BACKEND" ]] && ask BACKEND "LLM backend (ollama=GPU / claude=no-GPU)" "ollama"
+if [[ "$BACKEND" == ollama ]]; then
+  ask TIER "Ollama hardware tier (cpu/small/medium/large)" "$TIER"
+  ask OLLAMA_HOST "Ollama host URL" "$OLLAMA_HOST"
+fi
+ask STORAGE "Storage (local / github)" "$STORAGE"
+[[ "$STORAGE" == github && -z "$REPO_REMOTE" ]] && ask REPO_REMOTE "GitHub memory repo (owner/name)" ""
+ask DAEMON "24h daemon (none / systemd / docker)" "$DAEMON"
+if [[ "$WANT_GRAPH" == auto ]]; then WANT_GRAPH="yes"; ask WANT_GRAPH "Build the Neo4j graph (yes/no)" "yes"; fi
+say "backend=$BACKEND tier=$TIER storage=$STORAGE daemon=$DAEMON graph=$WANT_GRAPH"
+
+# ---- place files ----
+mkdir -p "$CLAUDE/commands" "$CLAUDE/graph" "$CLAUDE/logs"
+install -m 0755 "$REPO"/bin/*.sh "$CLAUDE"/ 2>/dev/null || true
+install -m 0755 "$REPO"/bin/*.py "$CLAUDE"/ 2>/dev/null || true
+install -m 0644 "$REPO"/commands/*.md "$CLAUDE"/commands/ 2>/dev/null || true
+for f in "$REPO"/graph/*.py "$REPO"/graph/*.md "$REPO"/graph/docker-compose.yml; do [[ -e "$f" ]] && install -m 0644 "$f" "$CLAUDE/graph/"; done
+install -m 0755 "$REPO"/daemon/engram-daemon.py "$CLAUDE"/ 2>/dev/null || true
+mkdir -p "$CLAUDE/ui"; [[ -f "$REPO/ui/index.html" ]] && install -m 0644 "$REPO/ui/index.html" "$CLAUDE/ui/"
+say "engine installed into $CLAUDE (GUI: run engram-ui.sh)"
+
+# ---- engram.yaml ----
+if [[ -f "$CLAUDE/engram.yaml" ]]; then
+  say "engram.yaml exists — preserving it (edit by hand to change backend/tier)"
+else
+  sed -e "s|^backend: .*|backend: $BACKEND|" \
+      -e "s|^tier: .*|tier: $TIER|" \
+      -e "s|host: \"http://localhost:11434\"|host: \"$OLLAMA_HOST\"|" \
+      "$REPO/engram.yaml.example" > "$CLAUDE/engram.yaml"
+  say "wrote $CLAUDE/engram.yaml"
+fi
+
+# ---- storage env (opt-in GitHub sync) ----
+if [[ "$STORAGE" == github && -n "$REPO_REMOTE" ]]; then
+  printf 'export CLAUDE_MEMORY_REPO=%q\n' "$REPO_REMOTE" > "$CLAUDE/engram.env"
+  say "GitHub sync -> $REPO_REMOTE (wrote $CLAUDE/engram.env; add the same export to your shell profile for interactive use)"
+  command -v gh >/dev/null || warn "gh CLI not found — needed for GitHub sync"
+else
+  rm -f "$CLAUDE/engram.env" 2>/dev/null || true
+  say "storage: local-only (no remote sync)"
+fi
+
+# ---- python deps (engine) ----
+if ! python3 -c "import yaml" 2>/dev/null; then
+  say "installing pyyaml (engine dep)..."; python3 -m pip install --user -q pyyaml || warn "pip install pyyaml failed"
+fi
+
+# ---- graph venv + MCP ----
+if [[ "$WANT_GRAPH" == yes ]]; then
+  VENV="$CLAUDE/graph/venv"
+  if [[ ! -x "$VENV/bin/python" ]]; then
+    say "building graph venv (graphiti-core, neo4j, fastembed)... this can take a few minutes"
+    if python3 -m venv "$VENV" && "$VENV/bin/pip" install -q --upgrade pip && \
+       "$VENV/bin/pip" install -q graphiti-core neo4j fastembed pyyaml; then
+      say "graph venv ready"
+    else
+      warn "graph venv build failed — install graphiti-core/neo4j/fastembed manually into $VENV"
+    fi
+  fi
+  [[ -f "$CLAUDE/graph/.env" ]] || { printf 'NEO4J_PASSWORD=%s\n' "$(openssl rand -hex 24 2>/dev/null || date +%s)" > "$CLAUDE/graph/.env"; chmod 600 "$CLAUDE/graph/.env"; say "generated graph/.env (Neo4j password)"; }
+  if command -v claude >/dev/null && [[ -x "$VENV/bin/python" ]]; then
+    if ! claude mcp list 2>/dev/null | grep -q engram-graph; then
+      claude mcp add --scope user engram-graph "$VENV/bin/python" "$CLAUDE/graph/mg_mcp_server.py" \
+        && say "registered engram-graph MCP server" || warn "claude mcp add failed (register manually later)"
+    else say "engram-graph MCP already registered"; fi
+  else warn "claude CLI or graph venv missing — skipping MCP registration (run 'claude mcp add' later)"; fi
+  say "start Neo4j: cd $CLAUDE/graph && NEO4J_PASSWORD=\$(grep -oP 'NEO4J_PASSWORD=\\K.*' .env) docker compose up -d"
+fi
+
+# ---- hooks ----
+[[ -f "$SETTINGS" ]] || echo '{}' > "$SETTINGS"
+if command -v jq >/dev/null; then
+  merge_hook(){ jq --arg e "$1" --arg c "$2" '.hooks //= {} | .hooks[$e] //= [] |
+      if ([.hooks[$e][]?|.hooks[]?|.command]|index($c))==null then .hooks[$e] += [{"hooks":[{"type":"command","command":$c}]}] else . end' \
+      "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"; }
+  merge_hook SessionStart "$CLAUDE/memory_curate_check.sh"
+  merge_hook Stop "$CLAUDE/memory_agent.sh"
+  merge_hook Stop "$CLAUDE/memory_session_curate.sh"
+  say "hooks merged into settings.json"
+fi
+
+# ---- seed synthetic examples (only if store empty) ----
+SLUG="${CLAUDE_MEMORY_SLUG:-$(printf '%s' "$HOME" | sed 's|/|-|g')}"
+STORE="$CLAUDE/projects/$SLUG/memory"; mkdir -p "$STORE"
+if ! ls "$STORE"/*.md >/dev/null 2>&1; then
+  if ls "$REPO"/examples/memory/*.md >/dev/null 2>&1; then
+    cp "$REPO"/examples/memory/*.md "$STORE"/; say "seeded ${STORE} with synthetic examples"
+  fi
+fi
+
+# ---- daemon ----
+case "$DAEMON" in
+  systemd)
+    mkdir -p "$HOME/.config/systemd/user" "$HOME/.config/engram"
+    { echo "ENGRAM_BIN=$CLAUDE"; echo "ENGRAM_GRAPH=$CLAUDE/graph"; echo "ENGRAM_CONFIG=$CLAUDE/engram.yaml"; echo "ENGRAM_LOG_DIR=$CLAUDE/logs";
+      [[ -x "$CLAUDE/graph/venv/bin/python" ]] && echo "ENGRAM_GRAPH_PYTHON=$CLAUDE/graph/venv/bin/python"; } > "$HOME/.config/engram/daemon.env"
+    sed "s|^ExecStart=.*|ExecStart=$(command -v python3) $CLAUDE/engram-daemon.py --once|" "$REPO/daemon/engram.service" > "$HOME/.config/systemd/user/engram.service"
+    cp "$REPO/daemon/engram.timer" "$HOME/.config/systemd/user/engram.timer"
+    if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable --now engram.timer 2>/dev/null; then
+      say "systemd timer enabled (engram.timer); 'sudo loginctl enable-linger $USER' to run when logged out"
+    else warn "systemd --user unavailable here — units written; enable on the target host"; fi;;
+  docker)
+    say "docker daemon: cd $REPO/daemon && cp .env.example .env && \$EDITOR .env && docker compose up -d";;
+  none) say "no daemon (run /memory-* commands manually, or set one up later)";;
+esac
+
+say "done. Restart Claude Code so it loads the new commands + MCP server."

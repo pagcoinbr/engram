@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""engram-daemon.py — the always-on engram supervisor.
+
+Runs the memory maintenance pipeline + graph sync + health on independent
+cadences. Two ways to run:
+  systemd (host/ollama):   a .timer fires `engram-daemon.py --once` periodically.
+  container (claude-only): `engram-daemon.py --loop` runs forever (docker-compose.yml).
+
+Each task has its own interval; `--once` runs only the tasks that are DUE (last-run
+times in daemon_state.json), so a single frequent timer yields per-task cadences.
+
+Safety: respects `local_enabled` and the dry-run apply-gates in engram.yaml — the
+daemon nudges and prepares; a human approves mutations. Apply-gates ship OFF.
+
+Tasks + default intervals (s), override via engram.yaml `daemon.intervals`:
+  health      300     backend (ollama|claude) + Neo4j reachability -> log
+  graph       1800    graph_sync.py --insert  (new memories -> graph)
+  maintenance 21600   memory_fixate_cron.sh || memory_pipeline.sh  (light pass + pipeline, gated)
+  export      86400   graph_sync.py --export --verify  (round-trip drift report)
+  reconcile   86400   graph_sync.py --reconcile  (superseded-fact report)
+
+Paths are resolved from env (the installer / container set these):
+  ENGRAM_BIN   engine dir (default ~/.claude)        ENGRAM_GRAPH  graph dir (default $ENGRAM_BIN/graph)
+  ENGRAM_LOG_DIR (default ~/.claude/logs)            NEO4J_URI     (default bolt://127.0.0.1:7687)
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+HERE = Path(__file__).resolve().parent
+HOME = Path.home()
+ENGRAM_BIN = Path(os.environ.get("ENGRAM_BIN", HOME / ".claude"))
+ENGRAM_GRAPH = Path(os.environ.get("ENGRAM_GRAPH", ENGRAM_BIN / "graph"))
+LOG_DIR = Path(os.environ.get("ENGRAM_LOG_DIR", HOME / ".claude" / "logs"))
+STATE = Path(os.environ.get("ENGRAM_DAEMON_STATE", LOG_DIR / "daemon_state.json"))
+
+sys.path.insert(0, str(ENGRAM_BIN))
+try:
+    import memory_ai
+except Exception:
+    memory_ai = None
+
+DEFAULT_INTERVALS = {"health": 300, "graph": 1800, "maintenance": 21600,
+                     "export": 86400, "reconcile": 86400}
+ORDER = ["health", "graph", "maintenance", "export", "reconcile"]
+
+
+def cfg():
+    return memory_ai.load() if memory_ai else {}
+
+def intervals():
+    iv = dict(DEFAULT_INTERVALS)
+    iv.update((cfg().get("daemon", {}) or {}).get("intervals", {}) or {})
+    return iv
+
+def log(msg: str):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    line = f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_DIR / "daemon.log", "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {}
+
+def save_state(s: dict):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(s, indent=1))
+
+def _run(cmd, timeout=3600) -> int:
+    log("run: " + " ".join(str(c) for c in cmd))
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if r.stdout.strip():
+            log(r.stdout.strip()[-2000:])
+        if r.returncode:
+            log(f"  exit {r.returncode}: {(r.stderr or '')[-500:]}")
+        return r.returncode
+    except Exception as e:
+        log(f"  ERROR: {e}")
+        return 1
+
+def _neo4j_up() -> bool:
+    p = urlparse(os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"))
+    try:
+        with socket.create_connection((p.hostname or "127.0.0.1", p.port or 7687), timeout=3):
+            return True
+    except Exception:
+        return False
+
+def _maintenance_script():
+    for c in (os.environ.get("ENGRAM_MAINTENANCE"),
+              ENGRAM_BIN / "memory_fixate_cron.sh", HERE / "memory_fixate_cron.sh",
+              ENGRAM_BIN / "memory_pipeline.sh", HERE / "memory_pipeline.sh"):
+        if c and Path(c).exists():
+            return Path(c)
+    return None
+
+
+# ---- tasks ----------------------------------------------------------------
+def task_health():
+    h = {}
+    try:
+        sys.path.insert(0, str(ENGRAM_BIN))
+        import engram_llm
+        h = engram_llm.health(cfg())
+    except Exception as e:
+        h = {"error": str(e)}
+    h["neo4j"] = _neo4j_up()
+    log(f"health: {json.dumps(h)}")
+
+def task_graph():
+    if not _neo4j_up():
+        log("graph: Neo4j down — skipping insert")
+        return
+    _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--insert"])
+
+def task_maintenance():
+    sh = _maintenance_script()
+    if sh:
+        _run(["bash", str(sh)])
+    else:
+        log("maintenance: no maintenance script found (memory_fixate_cron.sh / memory_pipeline.sh)")
+
+def task_export():
+    if not _neo4j_up():
+        return
+    _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--export", "--verify"])
+
+def task_reconcile():
+    if not _neo4j_up():
+        return
+    _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--reconcile"])
+
+TASKS = {"health": task_health, "graph": task_graph, "maintenance": task_maintenance,
+         "export": task_export, "reconcile": task_reconcile}
+
+
+def tick(force=None):
+    iv, st, now = intervals(), load_state(), int(time.time())
+    enabled = memory_ai.local_enabled(cfg()) if memory_ai else True
+    if force:
+        order = [force]
+    elif not enabled:
+        order = ["health"]
+        log("local_enabled=false — running health only (no automated memory work)")
+    else:
+        order = ORDER
+    for t in order:
+        fn = TASKS.get(t)
+        if not fn:
+            log(f"unknown task: {t}")
+            continue
+        if force or (now - st.get(t, 0)) >= iv[t]:
+            fn()
+            st[t] = now
+    save_state(st)
+
+
+def main():
+    a = sys.argv[1:]
+    if "--force" in a:
+        tick(force=a[a.index("--force") + 1])
+        return
+    if "--loop" in a:
+        base = int(a[a.index("--tick") + 1]) if "--tick" in a else 60
+        log(f"engram-daemon loop start (base tick {base}s; backend={cfg().get('backend','ollama')})")
+        while True:
+            try:
+                tick()
+            except Exception as e:
+                log(f"tick ERROR: {e}")
+            time.sleep(base)
+    tick()  # default: --once
+
+
+if __name__ == "__main__":
+    main()

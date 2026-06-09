@@ -1,0 +1,32 @@
+# engram — never commit data, secrets, or build cruft.
+# Secrets / config with real values
+.env
+*.env
+!*.env.example
+graph/.env
+server_creds*
+*.pem
+*.key
+*.macaroon
+
+# Python build artifacts
+__pycache__/
+*.pyc
+.venv/
+venv/
+graph/venv/
+
+# Runtime state / data (never the operator's memories)
+graph/insert_state.json
+graph/sync_state.json
+graph/extractions/
+graph/export/
+graph/neo4j/
+daemon/neo4j/
+daemon/claude-home/
+logs/
+*.log
+
+# Node (if a real Vite build is added later)
+node_modules/
+ui/dist/

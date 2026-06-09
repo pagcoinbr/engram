@@ -1,0 +1,13 @@
+[Unit]
+Description=engram memory daemon — one maintenance pass (graph sync + pipeline + health)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The installer may rewrite ExecStart to a venv python, and writes daemon.env with
+# ENGRAM_BIN / ENGRAM_GRAPH / NEO4J_URI / ENGRAM_CONFIG etc.
+EnvironmentFile=-%h/.config/engram/daemon.env
+ExecStart=/usr/bin/env python3 %h/.claude/engram-daemon.py --once
+Nice=10
+IOSchedulingClass=idle
