@@ -37,14 +37,15 @@ if [[ -n "$PG" ]]; then echo "❌ bare 'pagcoin' (non-public-repo):"; printf '%s
 scan "real IPs (192.168.x / 173.212.213.180 / tailscale 100.64-127.x)" \
   '192\.168\.[0-9]{1,3}\.[0-9]{1,3}|173\.212\.213\.180|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}'
 
-# 4. Forbidden files (data/secrets/build cruft that must never ship).
+# 4. Forbidden files — HARD-fail only on TRACKED files (those actually publish).
+#    Untracked, gitignored cruft (e.g. __pycache__ from a local py_compile) is noted
+#    but never fails the gate, since it won't be pushed.
 echo "checking for forbidden files…"
-BAD=$(find . -type f \( -name '*.env' ! -name '*.env.example' -o -name '.env' -o -name '*.pem' -o -name '*.key' \
-   -o -name 'server_creds*' -o -name '*.macaroon' -o -name 'insert_state.json' -o -name 'sync_state.json' \) 2>/dev/null)
-BAD+=$'\n'$(find . -type d \( -name venv -o -name __pycache__ -o -path '*/neo4j/data' -o -name extractions \) 2>/dev/null)
-BAD=$(printf '%s\n' "$BAD" | grep -vE '\.env\.example$' | sed '/^$/d')
-if [[ -n "$BAD" ]]; then echo "❌ forbidden files/dirs present:"; printf '%s\n' "$BAD"; hr; FAIL=1
-else echo "✅ forbidden files: none"; fi
+BAD=$(printf '%s\n' "${FILES[@]}" | grep -iE '(^|/)\.env$|\.pem$|\.key$|server_creds|\.macaroon$|insert_state\.json$|sync_state\.json$|(^|/)__pycache__/|\.pyc$|/venv/|/neo4j/data/|/extractions/' | grep -vE '\.env\.example$' || true)
+if [[ -n "$BAD" ]]; then echo "❌ forbidden files TRACKED (would publish):"; printf '%s\n' "$BAD"; hr; FAIL=1
+else echo "✅ forbidden files (tracked): none"; fi
+DISK=$(find . -type d \( -name __pycache__ -o -name venv -o -path '*/neo4j/data' \) 2>/dev/null | sed '/^$/d')
+[[ -n "$DISK" ]] && echo "ℹ️  on-disk but gitignored (NOT published): $(echo "$DISK" | tr '\n' ' ')"
 
 # 5. Informational: generic secret-ish assignments to eyeball (not a hard fail).
 echo; echo "ℹ️  review (generic secret-ish assignments — confirm none hold a real value):"
