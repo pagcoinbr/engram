@@ -110,7 +110,7 @@ def memory_recall_fused(query: str, k: int = 6, type: str = "") -> str:
     # vector leg (optional — degrades to keyword-only if unavailable)
     try:
         store = _get_store()
-        vhits = store.search(query, k=max(k * 2, 10), filters=_filters(store.cfg, type))
+        vhits = store.search(query, k=max(k * 2, 10), filters=_filters(store.cfg, mtype))
         rankings["vector"] = [h["file"] for h in vhits]
         for h in vhits:
             names.setdefault(h["file"], (h["name"], h["description"]))

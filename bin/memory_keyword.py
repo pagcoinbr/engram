@@ -116,8 +116,10 @@ def rank(query: str, k: int = 6, mtype: str | None = None) -> list[tuple[str, fl
             f = tf[i].get(w, 0)
             if not f:
                 continue
-            # non-negative BM25+ idf (avoids negatives when a term is in >half a tiny corpus)
-            idf = math.log(1 + (N - df[w] + 0.5) / (df[w] + 0.5))
+            # non-negative BM25+ idf. The 1+ form is provably >0 for df in [1,N]
+            # (df is built fresh from this corpus, so df<=N); max() documents that
+            # contract and guards any future formula edit.
+            idf = max(0.0, math.log(1 + (N - df[w] + 0.5) / (df[w] + 0.5)))
             s += idf * (f * (_K1 + 1)) / (f + _K1 * (1 - _B + _B * dl[i] / avgdl))
         if s > 0:
             scored.append((fname, s))
