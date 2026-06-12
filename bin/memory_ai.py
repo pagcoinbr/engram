@@ -26,12 +26,17 @@ _DEFAULTS = {
                "num_ctx": 16384, "num_predict": 8000, "reasoning_effort": "low"},
     # backend + tier drive model choice (see engram_llm.TIER_PRESETS). `experts`
     # is an OPTIONAL per-role override map, e.g. {"distill": {"model": "..."}}.
-    "backend": "ollama",                 # ollama | claude
-    "fallback": "",                      # "" | claude — used when backend=ollama is unreachable
+    "backend": "ollama",                 # ollama | claude | llama_cpp
+    "fallback": "",                      # "" | claude — used when the primary backend is unreachable
     "tier": "small",                     # cpu | small | medium | large  (ollama only)
     "experts": {},
     "claude": {"bin": "claude", "timeout_seconds": 600, "max_turns": 1},
-    "embed": {"fastembed_model": "nomic-ai/nomic-embed-text-v1.5", "dim": 768},
+    # OpenAI-compatible llama.cpp server (llama-server /v1). Used when backend=llama_cpp.
+    "llama_cpp": {"url": "http://localhost:8080/v1", "model": "local",
+                  "timeout_seconds": 600, "max_tokens": 8000, "api_key": ""},
+    # embed.provider chooses the embedding path independently of the generation backend
+    # (ollama | fastembed). embed.model overrides the Ollama embedding model (e.g. bge-m3).
+    "embed": {"provider": "", "model": "", "fastembed_model": "nomic-ai/nomic-embed-text-v1.5", "dim": 768},
     "light_pass": {
         "enabled": True,
         "duplicate_finder": {"enabled": True, "expert": "similarity", "dup_threshold": 0.86},

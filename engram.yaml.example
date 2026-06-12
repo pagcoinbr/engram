@@ -12,7 +12,7 @@ local_enabled: true              # master switch for ALL automated/local memory 
 #   ollama  — local models on a GPU box (free, private). Pick a `tier` for your VRAM.
 #   claude  — no GPU: shell out to the `claude` CLI headless (cost = Claude usage).
 #             Used by the always-on loop container (daemon/, backend=claude).
-backend: ollama                  # ollama | claude
+backend: ollama                  # ollama | claude | llama_cpp
 fallback: ""                     # "" | claude — when backend=ollama is unreachable (e.g. GPU box off),
                                  # fall back to `claude -p` so the 24/7 daemon keeps working. Costs Claude usage.
 
@@ -40,9 +40,23 @@ claude:
   timeout_seconds: 600
   max_turns: 1                     # single turn, no tool loop — pure text generation
 
-# Embeddings — always local, never a paid API. Used when Ollama is unreachable or
-# backend: claude. nomic-embed-text-v1.5 is 768-dim, matching Ollama's nomic-embed-text.
+# OpenAI-compatible llama.cpp server (llama-server /v1). Used when backend: llama_cpp.
+# Generation routes to {url}/chat/completions; <think>…</think> reasoning is stripped.
+llama_cpp:
+  url: "http://localhost:8080/v1"   # llama-server base URL (must include /v1)
+  model: "local"                    # the --alias your llama-server reports (e.g. qwen3-14b)
+  timeout_seconds: 600
+  max_tokens: 8000
+  api_key: ""                       # only if your llama-server requires one
+
+# Embeddings — local, never a paid API. The provider is chosen INDEPENDENTLY of the
+# generation backend, so backend: llama_cpp (or claude) can still embed via Ollama.
+#   provider: "" (auto: ollama when backend=ollama, else fastembed) | ollama | fastembed
+#   model:    Ollama embedding model override, e.g. "bge-m3" (1024-dim). Blank = nomic.
+#   dim:      MUST match the embedding model's output (nomic/fastembed=768, bge-m3=1024).
 embed:
+  provider: ""
+  model: ""
   fastembed_model: "nomic-ai/nomic-embed-text-v1.5"
   dim: 768
 

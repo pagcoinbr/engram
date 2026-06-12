@@ -29,7 +29,7 @@ CLI:
   engram_llm.py --embed                 # read text on stdin, print JSON vector
 """
 from __future__ import annotations
-import json, os, subprocess, sys, urllib.request
+import json, os, re, subprocess, sys, urllib.request
 from pathlib import Path
 
 # Make sibling modules importable; the sibling (this dir) wins over ~/.claude so
@@ -96,8 +96,16 @@ def fallback(cfg=None) -> str:
 
 def generate(prompt: str, role: str = "distill", cfg=None) -> str:
     cfg = _cfg(cfg)
-    if backend(cfg) == "claude":
+    b = backend(cfg)
+    if b == "claude":
         return _claude_generate(prompt, role, cfg)
+    if b == "llama_cpp":
+        try:
+            return _llamacpp_generate(prompt, role, cfg)
+        except Exception:
+            if fallback(cfg) == "claude":
+                return _claude_generate(prompt, role, cfg)
+            raise
     # ollama primary; optional claude fallback when the GPU box is unreachable.
     try:
         return _ollama_generate(prompt, role, cfg)
@@ -105,6 +113,44 @@ def generate(prompt: str, role: str = "distill", cfg=None) -> str:
         if fallback(cfg) == "claude":
             return _claude_generate(prompt, role, cfg)
         raise
+
+
+# Qwen3 and other reasoning models emit <think>...</think> before the answer; with
+# format-constrained or JSON-expecting callers that collides. Strip it defensively.
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.S | re.I)
+
+def _strip_think(text: str) -> str:
+    t = _THINK_RE.sub("", text or "")
+    # tolerate an unclosed <think> (truncated CoT): drop everything up to the last </think>,
+    # else if it opens and never closes, drop from the opener.
+    if "<think>" in t.lower():
+        i = t.lower().rfind("</think>")
+        t = t[i + len("</think>"):] if i != -1 else t[: t.lower().find("<think>")]
+    return t.strip()
+
+
+def _llamacpp_generate(prompt: str, role: str, cfg) -> str:
+    """Generation via an OpenAI-compatible llama.cpp server (llama-server /v1).
+    Single user message, no tools — pure text. Honors num_predict as max_tokens."""
+    lc = cfg.get("llama_cpp", {})
+    url = (lc.get("url") or "http://localhost:8080/v1").rstrip("/")
+    oc = cfg.get("ollama", {})
+    body = {
+        "model": lc.get("model") or "local",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": float(lc.get("temperature", oc.get("temperature", 0.2))),
+        "max_tokens": int(lc.get("max_tokens", oc.get("num_predict", 8000))),
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if lc.get("api_key"):
+        headers["Authorization"] = f"Bearer {lc['api_key']}"
+    req = urllib.request.Request(f"{url}/chat/completions",
+                                 data=json.dumps(body).encode(), headers=headers)
+    timeout = int(lc.get("timeout_seconds", _timeout(cfg)))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode())
+    return _strip_think(data["choices"][0]["message"]["content"])
 
 
 def _ollama_generate(prompt: str, role: str, cfg) -> str:
@@ -161,20 +207,31 @@ def _claude_generate(prompt: str, role: str, cfg) -> str:
 # ---------------------------------------------------------------------------
 _FE_MODEL = None
 
+def _embed_provider(cfg) -> str:
+    """Embedding provider, chosen INDEPENDENTLY of the generation backend so a
+    llama.cpp/claude backend can still embed via Ollama. Explicit `embed.provider`
+    wins; otherwise default to ollama when the generation backend is ollama, else
+    the local CPU fastembed path."""
+    p = (cfg.get("embed", {}).get("provider") or "").strip().lower()
+    if p in ("ollama", "fastembed"):
+        return p
+    return "ollama" if backend(cfg) == "ollama" else "fastembed"
+
 def embed(text: str, cfg=None):
     cfg = _cfg(cfg)
-    if backend(cfg) == "ollama":
+    if _embed_provider(cfg) == "ollama":
         try:
             return _ollama_embed(text, cfg)
         except Exception:
-            pass  # GPU/Ollama down -> fall back to CPU fastembed (still 768-dim nomic)
+            pass  # Ollama unreachable -> fall back to CPU fastembed
     return _fastembed_embed(text, cfg)
 
 def embed_dim(cfg=None) -> int:
     return int(_cfg(cfg).get("embed", {}).get("dim", DEFAULT_EMBED_DIM))
 
 def _ollama_embed(text: str, cfg):
-    model = model_for("similarity", cfg) or "nomic-embed-text"
+    # explicit embed.model wins (e.g. bge-m3); else the MoE similarity role; else nomic.
+    model = cfg.get("embed", {}).get("model") or model_for("similarity", cfg) or "nomic-embed-text"
     payload = {"model": model, "prompt": text}
     if cfg.get("ollama", {}).get("keep_alive"):
         payload["keep_alive"] = cfg["ollama"]["keep_alive"]
@@ -216,6 +273,8 @@ def health(cfg=None) -> dict:
             cc = cfg.get("claude", {})
             subprocess.run([cc.get("bin", "claude"), "--version"],
                            capture_output=True, timeout=30, check=True)
+        elif b == "llama_cpp":
+            _llamacpp_generate("reply ok", "triage", cfg)
         else:
             _ollama_generate("reply ok", "triage", cfg)
         out["generate"] = True
