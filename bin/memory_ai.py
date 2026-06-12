@@ -40,6 +40,19 @@ _DEFAULTS = {
         "max_items": 60,
     },
     "session_curate": {"enabled": True, "min_minutes": 15, "min_new_memories": 3, "max_per_day": 2},
+    # OPTIONAL Qdrant vector index over the .md store (semantic recall + fast dedup).
+    # OFF by default: disabled or unreachable => fall back to pure markdown.
+    "vector_store": {
+        "enabled": False,
+        "provider": "qdrant",
+        "url": "http://127.0.0.1:6333",
+        "api_key": "",
+        "collection": "engram_memory",
+        "on_disk": False,
+        "timeout_seconds": 30,
+        "recall": {"default_k": 6, "threshold": 0.0},
+        "duplicate_finder": {"use_vector_store": True},
+    },
     "schedule": {"times": ["03:30"]},
 }
 
@@ -63,6 +76,12 @@ def load() -> dict:
 
 def local_enabled(cfg=None) -> bool:
     return bool((cfg or load()).get("local_enabled", True))
+
+def vector_enabled(cfg=None) -> bool:
+    """True only when the local switch AND the optional vector store are both on.
+    The single place callers check before touching Qdrant (else: markdown fallback)."""
+    cfg = cfg or load()
+    return bool(local_enabled(cfg)) and bool(cfg.get("vector_store", {}).get("enabled", False))
 
 def ollama_host(cfg=None) -> str:
     return (cfg or load())["ollama"]["host"]

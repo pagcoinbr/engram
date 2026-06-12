@@ -15,6 +15,7 @@ __pycache__/
 .venv/
 venv/
 graph/venv/
+vector/venv/
 
 # Runtime state / data (never the operator's memories)
 graph/insert_state.json
@@ -22,6 +23,8 @@ graph/sync_state.json
 graph/extractions/
 graph/export/
 graph/neo4j/
+vector/sync_state.json
+vector/qdrant_storage/
 daemon/neo4j/
 daemon/claude-home/
 logs/

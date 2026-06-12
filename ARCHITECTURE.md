@@ -60,12 +60,35 @@ Every LLM/embedding call routes through one module so the same engine runs on an
   `memory_search_facts`, `memory_neighbors`, `memory_stats` as MCP tools (`engram-graph`).
   Claude calls them on demand; the `.md` store stays directly readable for verbatim facts.
 
+## 4b. The vector index (Qdrant) — OPTIONAL
+A second, independent index over the same `.md` store, for dense semantic search and
+fast (ANN) dedup. **Off by default**; enable with `./install.sh --vector`. With it
+disabled or Qdrant unreachable, engram falls back to pure markdown (the in-memory
+cosine duplicate finder + graph recall) — nothing breaks.
+- **Qdrant** (loopback, via `vector/docker-compose.yml`), driven natively by
+  `qdrant-client`. Embeddings route through `engram_llm.embed()` (768-dim), the *same*
+  space as the graph — so there is one embedding stack, not two.
+- `vector_store.py` (`EngramVectorStore`) maps one `.md` → one point with a deterministic
+  uuid5 id (re-insert upserts, never duplicates); payload carries `{file, name,
+  description, type, slug, sha}` for filtered search/delete and staleness checks.
+- `vector_sync.py` is the sha-synced orchestrator (`--insert`/`--rebuild`/`--delete`/
+  `--status`), mirroring `graph_sync.py`. `save_memory.sh`/`delete_memory.sh` fire
+  best-effort, non-blocking single-file syncs; the daemon does the bulk cadence.
+- The light pass (`memory_light_curate.py`) uses Qdrant ANN for the duplicate finder
+  when enabled (O(n·log n)), falling back to the O(n²) cosine loop otherwise.
+- Authority model: **.md-authoritative**. Qdrant is a *rebuildable* index — losing it
+  never loses a memory; `--rebuild` regenerates it. `ensure_collection` guards against an
+  embedding-dim mismatch (model swap → rebuild).
+- **How Claude consumes it**: `vector_mcp_server.py` exposes `memory_vector_recall`,
+  `memory_vector_search`, `memory_vector_stats` (`engram-vector`).
+
 ## 5. The daemon (24/7) — `daemon/engram-daemon.py`
 A supervisor that runs tasks on independent cadences (a due-check against
 `daemon_state.json` means one timer yields per-task intervals):
-`health` (backend + Neo4j) · `graph` (`graph_sync --insert`) · `maintenance` (light pass +
-pipeline, gated) · `export --verify` · `reconcile`. Two shapes: **systemd** user timer
-(`--once`) or the **claude-only loop container** (`--loop`, `daemon/docker-compose.yml`).
+`health` (backend + Neo4j + Qdrant when enabled) · `graph` (`graph_sync --insert`) ·
+`vector` (`vector_sync --insert`, when enabled) · `maintenance` (light pass + pipeline,
+gated) · `export --verify` · `reconcile`. Two shapes: **systemd** user timer (`--once`)
+or the **claude-only loop container** (`--loop`, `daemon/docker-compose.yml`).
 Respects `local_enabled` and the dry-run gates.
 
 ## 6. File map
@@ -73,6 +96,7 @@ Respects `local_enabled` and the dry-run gates.
 bin/      engine + engram_llm.py (+ engram_api.py for the GUI)  → installs to ~/.claude/
 commands/ the 6 /memory-* slash commands                        → ~/.claude/commands/
 graph/    Graphiti/Neo4j: graph_sync, mg_config, mcp_server, …  → ~/.claude/graph/ (+ venv)
+vector/   OPTIONAL Qdrant: vector_store, vector_sync, mcp_server → ~/.claude/vector/ (+ venv)
 daemon/   engram-daemon.py, systemd units, Dockerfile + compose
 ui/       React/Vite GUI (FastAPI backend = bin/engram_api.py)
 examples/memory/  synthetic seed memories (the AcmeCorp stack)

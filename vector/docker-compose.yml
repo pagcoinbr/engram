@@ -1,0 +1,16 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: engram-qdrant
+    restart: unless-stopped
+    # Bound to loopback only — the vector index never listens on the LAN.
+    ports:
+      - "127.0.0.1:6333:6333"   # REST/HTTP (local only)
+      - "127.0.0.1:6334:6334"   # gRPC (local only)
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12

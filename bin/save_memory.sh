@@ -61,6 +61,11 @@ if memory_index_add_line "$MEMORY_MD" "$FILENAME" "$DESCRIPTION"; then
     echo "[save-memory] Updated MEMORY.md index"
 fi
 
+# Optional vector index: best-effort, non-blocking upsert of just this file into
+# Qdrant (no-op unless installed with --vector and enabled). Markdown stays the
+# source of truth; this only refreshes the semantic index.
+memory_vector_sync --insert --only "$FILENAME"
+
 # Auto-consolidate bookkeeping: count NEW memories since the last curate pass so
 # memory_curate_check.sh can nudge a consolidation when the store has grown.
 if [[ "$WAS_NEW" == "1" ]] && command -v jq >/dev/null 2>&1; then

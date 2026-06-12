@@ -36,6 +36,54 @@ def embed_text(p: Path) -> str:
     s = ((nm.group(1) if nm else "") + " " + (ds.group(1) if ds else "")).strip()
     return s or p.stem
 
+
+def _vector_dupes(cfg, thr):
+    """ANN duplicate finder via the OPTIONAL Qdrant index — O(n·log n) instead of
+    O(n²). Returns a list of (score, a, b) pairs, or None when the vector store is
+    disabled/unreachable (so the caller falls back to the cosine path)."""
+    if not memory_ai.vector_enabled(cfg):
+        return None
+    try:
+        sys.path.insert(0, str(Path.home() / ".claude" / "vector"))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "vector"))
+        import vector_config as vc
+        from vector_store import EngramVectorStore
+    except Exception:
+        return None
+    try:
+        store = EngramVectorStore(cfg)
+        store.ensure_collection()
+        print("_(duplicate finder: using Qdrant ANN index)_\n")
+        return store.find_duplicates(threshold=thr)
+    except vc.VectorUnavailable as e:
+        print(f"_vector store unreachable ({e}) — falling back to cosine._\n")
+        return None
+    except Exception as e:
+        print(f"_vector duplicate finder failed ({e}) — falling back to cosine._\n")
+        return None
+
+
+def _cosine_dupes(files, cfg, thr):
+    """The pure-markdown fallback: embed each file's name+description and do the
+    O(n²) pairwise cosine. Returns (score, a, b) pairs, or None if embeddings are
+    unreachable."""
+    embs = {}
+    try:
+        for p in files:
+            embs[p.name] = memory_ai.ollama_embed(embed_text(p), cfg=cfg)
+    except Exception as e:
+        print(f"_similarity expert unreachable: {e}_\n")
+        return None
+    names = list(embs)
+    pairs = []
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            c = cosine(embs[names[i]], embs[names[j]])
+            if c >= thr:
+                pairs.append((c, names[i], names[j]))
+    pairs.sort(reverse=True)
+    return pairs
+
 def main():
     cfg = memory_ai.load()
     if not memory_ai.local_enabled(cfg):
@@ -52,28 +100,17 @@ def main():
     if cur.get("enabled", True):
         thr = float(cur.get("dup_threshold", 0.86))
         print(f"## Duplicate Finder — semantic near-duplicate / merge candidates (cosine ≥ {thr:.2f})\n")
-        embs = {}
-        try:
-            for p in files:
-                embs[p.name] = memory_ai.ollama_embed(embed_text(p), cfg=cfg)
-        except Exception as e:
-            print(f"_similarity expert unreachable: {e}_\n")
-            embs = {}
-        if embs:
-            names = list(embs)
-            pairs = []
-            for i in range(len(names)):
-                for j in range(i + 1, len(names)):
-                    c = cosine(embs[names[i]], embs[names[j]])
-                    if c >= thr:
-                        pairs.append((c, names[i], names[j]))
-            pairs.sort(reverse=True)
-            if not pairs:
-                print(f"_No semantic near-duplicates above {thr:.2f}._\n")
-            else:
-                for c, a, b in pairs[:30]:
-                    print(f"- `{c:.3f}`  {a}  ⇄  {b}")
-                print(f"\n_{len(pairs)} candidate pair(s). Run `/memory-curate` (Duplicate Finder) to merge — human-gated._\n")
+        pairs = _vector_dupes(cfg, thr)          # Qdrant ANN when the optional vector store is on
+        if pairs is None:                        # disabled/unreachable -> pure-markdown cosine fallback
+            pairs = _cosine_dupes(files, cfg, thr)
+        if pairs is None:
+            pass                                 # similarity expert unreachable (already reported)
+        elif not pairs:
+            print(f"_No semantic near-duplicates above {thr:.2f}._\n")
+        else:
+            for c, a, b in pairs[:30]:
+                print(f"- `{c:.3f}`  {a}  ⇄  {b}")
+            print(f"\n_{len(pairs)} candidate pair(s). Run `/memory-curate` (Duplicate Finder) to merge — human-gated._\n")
 
     # ---------- INJECTION GUARD (trust signals + suspects) ----------
     fx = lp.get("injection_guard", lp.get("fixation", {}))

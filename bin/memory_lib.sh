@@ -184,3 +184,21 @@ memory_push_index() {
     [[ -f "$idx" ]] || return 0
     memory_with_index_lock _gh_put_file "$repo" "${remote}/MEMORY.md" "${1:-update MEMORY.md index}" "$idx"
 }
+
+# memory_vector_sync <args...> — fire a best-effort, NON-BLOCKING vector_sync.py
+# call (e.g. "--insert --only foo.md" or "--delete foo.md"). The OPTIONAL Qdrant
+# index is only installed with `./install.sh --vector`; when it's absent this is a
+# zero-cost no-op, and when present vector_sync re-checks vector_store.enabled and
+# no-ops itself if disabled/unreachable. Backgrounded with output discarded so a
+# slow or down Qdrant never delays (or fails) a save/delete. Mirrors the local-first
+# posture of the optional GitHub push above.
+memory_vector_sync() {
+    local script="${HOME}/.claude/vector/vector_sync.py"
+    [[ -f "$script" ]] || return 0
+    # Prefer the vector venv (has qdrant-client) > env override > graph venv > python3.
+    local py="${ENGRAM_VECTOR_PYTHON:-}"
+    [[ -z "$py" && -x "${HOME}/.claude/vector/venv/bin/python" ]] && py="${HOME}/.claude/vector/venv/bin/python"
+    [[ -z "$py" ]] && py="${ENGRAM_GRAPH_PYTHON:-python3}"
+    command -v "$py" >/dev/null 2>&1 || [[ -x "$py" ]] || py="python3"
+    ( "$py" "$script" "$@" >/dev/null 2>&1 & ) 2>/dev/null || true
+}

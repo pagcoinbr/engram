@@ -97,11 +97,36 @@ session_curate:
   min_new_memories: 3
   max_per_day: 2
 
+# ── Vector store (OPTIONAL) ─────────────────────────────────────────────────
+# A Qdrant index over the .md store for semantic recall + fast (ANN) dedup. The
+# .md files remain the source of truth; Qdrant is a rebuildable index over them.
+# OFF by default: with this disabled OR Qdrant unreachable, engram falls back to
+# pure markdown (the in-memory cosine duplicate finder + graph recall) — nothing
+# breaks. Embeddings reuse engram_llm.embed() (768-dim nomic), so the vector space
+# matches the graph exactly. Enable with `./install.sh --vector`, then start Qdrant:
+#   cd ~/.claude/vector && docker compose up -d
+vector_store:
+  enabled: false                 # master switch (parallels the optional --graph)
+  provider: qdrant               # qdrant (only backend for now)
+  url: "http://127.0.0.1:6333"   # loopback Qdrant
+  api_key: ""                    # for Qdrant Cloud; blank for local
+  collection: "engram_memory"
+  on_disk: false                 # true = store vectors on disk (less RAM, slower search)
+  timeout_seconds: 30
+  recall:
+    default_k: 6                 # how many memories memory_vector_recall returns
+    threshold: 0.0               # min cosine for a search hit (0 = no floor)
+  duplicate_finder:
+    use_vector_store: true       # light pass uses Qdrant ANN instead of O(n^2) cosine when enabled
+
 # Local MCP servers wired into interactive sessions. The graph recall server
-# (graph/mcp_server.py) is registered by the installer as `engram-graph`.
+# (graph/mcp_server.py) is registered by the installer as `engram-graph`; the
+# optional vector recall server (vector/vector_mcp_server.py) as `engram-vector`.
 mcp_servers:
   engram-graph:
     note: "Graphiti/Neo4j recall tools: memory_recall / memory_search_facts / memory_neighbors / memory_stats"
+  engram-vector:
+    note: "Qdrant semantic recall (optional): memory_vector_recall / memory_vector_search / memory_vector_stats"
 
 # Scheduling — the installer builds the systemd timer / daemon cadence from these.
 schedule:

@@ -61,7 +61,8 @@ daemon. Restart Claude Code afterward so it loads the new commands.
 ## How Claude uses it
 - **Commands** (in any session): `/memory-checkpoint`, `/memory-curate`, `/memory-fixate`, `/memory-to-skill`, `/memory-reformat`, `/memory-clean-review`.
 - **Graph recall** (the `engram-graph` MCP server): Claude calls `memory_recall`, `memory_search_facts`, `memory_neighbors`, `memory_stats` on demand to load only the relevant memories — instead of dumping the whole store into context.
-- **Automatic**: a Stop hook harvests new facts; the daemon consolidates/fixates/syncs the graph on a cadence.
+- **Vector recall** (the optional `engram-vector` MCP server): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search over the store via Qdrant. Off by default; enable with `./install.sh --vector`.
+- **Automatic**: a Stop hook harvests new facts; the daemon consolidates/fixates/syncs the graph (and the vector index, if enabled) on a cadence.
 
 ## The 24/7 daemon
 `engram-daemon` runs the pipeline + graph sync + health on independent cadences:
@@ -82,16 +83,23 @@ daemon. Restart Claude Code afterward so it loads the new commands.
         │                                     insert │  │ export (byte-exact) │
         ▼                                            ▼  │                     │
    recall (MCP) ◀──────── memory_recall ◀─── Neo4j graph (Graphiti) ──────────┘
-                                              associative / temporal
+        ▲                                     associative / temporal
+        └──── memory_vector_recall ◀─── Qdrant vector index (OPTIONAL) ───────┘
+                                        dense semantic search + fast dedup
         all LLM + embedding calls route through engram_llm:
            ollama (tiered)  |  claude (claude -p)   ·   embed: ollama nomic | fastembed (CPU)
         supervised 24/7 by engram-daemon (systemd timer OR docker compose)
 ```
+> Both the graph and the vector index are **optional, rebuildable indexes** over the
+> `.md` store. With neither (or with their services down), engram still runs on pure
+> markdown. Add the vector index with `./install.sh --vector` (see [vector/README.md](vector/README.md)).
+
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full data flow and **[CONFIG.md](CONFIG.md)** for `engram.yaml`.
 
 ## Requirements
 - `python3`, `jq` (engine). `git`/`gh` for optional sync.
 - Graph: Docker (Neo4j) + a Python venv (graphiti-core, neo4j, fastembed) — the installer builds it.
+- Vector index (optional): Docker (Qdrant) + a Python venv (qdrant-client, mcp, fastembed) — `./install.sh --vector` builds it.
 - A backend: a reachable Ollama, **or** the `claude` CLI + an Anthropic API key.
 
 ## Status
