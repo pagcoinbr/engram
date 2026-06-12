@@ -40,6 +40,12 @@ _DEFAULTS = {
         "max_items": 60,
     },
     "session_curate": {"enabled": True, "min_minutes": 15, "min_new_memories": 3, "max_per_day": 2},
+    # Hybrid recall: fuse graph + vector + keyword (BM25) via Reciprocal Rank Fusion.
+    "recall": {
+        "hybrid": {"enabled": True, "k_rrf": 60, "default_k": 6,
+                   "weights": {"graph": 1.0, "vector": 1.0, "keyword": 1.0}},
+        "scope_to_slug": True,   # restrict vector/hybrid recall to the current store's slug
+    },
     # OPTIONAL Qdrant vector index over the .md store (semantic recall + fast dedup).
     # OFF by default: disabled or unreachable => fall back to pure markdown.
     "vector_store": {
@@ -82,6 +88,14 @@ def vector_enabled(cfg=None) -> bool:
     The single place callers check before touching Qdrant (else: markdown fallback)."""
     cfg = cfg or load()
     return bool(local_enabled(cfg)) and bool(cfg.get("vector_store", {}).get("enabled", False))
+
+def recall_cfg(cfg=None) -> dict:
+    """The hybrid-recall config block (k_rrf, default_k, weights, scope_to_slug).
+    Used by the graph/vector MCP servers to fuse + scope recall."""
+    return (cfg or load()).get("recall", {}) or {}
+
+def scope_to_slug(cfg=None) -> bool:
+    return bool(recall_cfg(cfg).get("scope_to_slug", True))
 
 def ollama_host(cfg=None) -> str:
     return (cfg or load())["ollama"]["host"]

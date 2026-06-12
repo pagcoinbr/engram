@@ -119,6 +119,21 @@ vector_store:
   duplicate_finder:
     use_vector_store: true       # light pass uses Qdrant ANN instead of O(n^2) cosine when enabled
 
+# ── Hybrid recall (Reciprocal Rank Fusion) ──────────────────────────────────
+# Fuse the recall paths — graph (associative/temporal), vector (dense semantic),
+# and keyword (BM25 lexical) — into one ranking keyed by the .md filename, so the
+# indexes are greater than the sum. The full 3-way `memory_recall_hybrid` lives on
+# the engram-graph MCP server (warm graph + in-process Qdrant); engram-vector
+# exposes a 2-way `memory_recall_fused` (vector+keyword) for no-graph installs.
+# Each ranker degrades independently — a disabled/down backend just drops out.
+recall:
+  scope_to_slug: true            # restrict vector/hybrid recall to the current store's slug
+  hybrid:
+    enabled: true
+    k_rrf: 60                    # RRF constant (standard 60); damps low-rank contributions
+    default_k: 6                 # how many fused memories a recall returns
+    weights: { graph: 1.0, vector: 1.0, keyword: 1.0 }   # per-ranker RRF weight
+
 # Local MCP servers wired into interactive sessions. The graph recall server
 # (graph/mcp_server.py) is registered by the installer as `engram-graph`; the
 # optional vector recall server (vector/vector_mcp_server.py) as `engram-vector`.

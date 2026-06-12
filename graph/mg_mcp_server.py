@@ -9,10 +9,19 @@ Registered (the installer does this for you) with:
         <engram graph dir>/venv/bin/python <engram graph dir>/mg_mcp_server.py
 """
 import logging
+import sys
 from collections import defaultdict
+from pathlib import Path
 
 logging.getLogger("neo4j").setLevel(logging.ERROR)
 logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+
+# Shared engine modules (memory_ai / memory_keyword / memory_fusion) live flat in
+# ~/.claude; the optional vector store in ~/.claude/vector. Make both importable so
+# the hybrid tool can fuse graph + vector + keyword in-process.
+sys.path.insert(0, str(Path.home() / ".claude" / "vector"))
+if str(Path.home() / ".claude") not in sys.path:
+    sys.path.append(str(Path.home() / ".claude"))
 
 from mcp.server.fastmcp import FastMCP
 from mg_config import build_graphiti
@@ -28,31 +37,126 @@ async def _graph():
     return _g
 
 
-@mcp.tool()
-async def memory_recall(query: str, k: int = 6) -> str:
-    """Recall the most relevant memories for a task/query using hybrid graph+vector
-    search. Returns the top memory names, their descriptions, and the matched facts.
-    Use at the start of work to load only the relevant memories instead of all of them."""
-    g = await _graph()
+async def _graph_ranked(g, query: str, k: int, mtype: str = "") -> tuple[list, dict, dict]:
+    """Core graph recall: hybrid-search facts, group by episode, rank by fact count.
+    Returns (ranked_files, facts_by_file, meta_by_file) where ranked_files is a
+    best-first list of UNIQUE .md filenames (duplicate episodes collapsed). Optionally
+    filter to a memory `type`. Shared by memory_recall and memory_recall_hybrid."""
     edges = await g.search(query, num_results=k * 3)
     fact_by_ep = defaultdict(list)
     for e in edges:
         for u in (getattr(e, "episodes", None) or []):
             fact_by_ep[u].append(e.fact)
     if not fact_by_ep:
-        return f"(no memories matched: {query})"
+        return [], {}, {}
     recs, _, _ = await g.driver.execute_query(
         "MATCH (e:Episodic) WHERE e.uuid IN $u "
-        "RETURN e.uuid AS uuid, e.fm_name AS name, e.fm_description AS desc, e.file AS file",
+        "RETURN e.uuid AS uuid, e.fm_name AS name, e.fm_description AS desc, "
+        "e.file AS file, e.fm_type AS type",
         u=list(fact_by_ep.keys()))
     meta = {r["uuid"]: r for r in recs}
-    ranked = sorted(fact_by_ep, key=lambda u: -len(fact_by_ep[u]))[:k]
-    out = [f"Recalled {len(ranked)} memories for: {query}", ""]
-    for u in ranked:
+    ranked_uuids = sorted(fact_by_ep, key=lambda u: -len(fact_by_ep[u]))
+    ranked_files, facts, fmeta, seen = [], {}, {}, set()
+    for u in ranked_uuids:
         m = meta.get(u, {})
-        out.append(f"- {m.get('name') or m.get('file')}: {(m.get('desc') or '').strip()}")
-        for f in fact_by_ep[u][:3]:
-            out.append(f"    - {f}")
+        f = m.get("file") or u
+        if mtype and (m.get("type") or "") != mtype:
+            continue
+        if f in seen:                      # collapse multiple episodes of one file
+            continue
+        seen.add(f)
+        ranked_files.append(f)
+        facts[f] = fact_by_ep[u]
+        fmeta[f] = m
+    return ranked_files, facts, fmeta
+
+
+@mcp.tool()
+async def memory_recall(query: str, k: int = 6) -> str:
+    """Recall the most relevant memories for a task/query using hybrid graph+vector
+    search. Returns the top memory names, their descriptions, and the matched facts.
+    Use at the start of work to load only the relevant memories instead of all of them."""
+    g = await _graph()
+    ranked, facts, meta = await _graph_ranked(g, query, k)
+    if not ranked:
+        return f"(no memories matched: {query})"
+    out = [f"Recalled {len(ranked[:k])} memories for: {query}", ""]
+    for f in ranked[:k]:
+        m = meta.get(f, {})
+        out.append(f"- {m.get('name') or f}: {(m.get('desc') or '').strip()}")
+        for fact in facts.get(f, [])[:3]:
+            out.append(f"    - {fact}")
+    return "\n".join(out)
+
+
+@mcp.tool()
+async def memory_recall_hybrid(query: str, k: int = 6, type: str = "") -> str:
+    """The BEST recall: fuse graph (associative/temporal) + vector (dense semantic) +
+    keyword (BM25 lexical) into one ranking via Reciprocal Rank Fusion, keyed by the
+    .md filename. Use at the start of work to load the most relevant memories. Each
+    ranker degrades independently — a disabled/down vector store or graph just drops
+    out. Optionally filter by memory `type` (user|feedback|project|reference)."""
+    import asyncio
+    import memory_ai
+    import memory_fusion
+    import memory_keyword
+
+    cfg = memory_ai.load()
+    rc = memory_ai.recall_cfg(cfg).get("hybrid", {})
+    mtype = type or ""
+    want = max(k * 2, 10)
+    rankings, names, facts = {}, {}, {}
+
+    # graph leg
+    try:
+        g = await _graph()
+        granked, gfacts, gmeta = await _graph_ranked(g, query, want, mtype)
+        rankings["graph"] = granked
+        facts.update(gfacts)
+        for f, m in gmeta.items():
+            names.setdefault(f, (m.get("name"), m.get("desc")))
+    except Exception:
+        pass  # Neo4j down -> graph drops out
+
+    # vector leg (optional; in-process Qdrant via the shared vector store)
+    try:
+        if memory_ai.vector_enabled(cfg):
+            import vector_config as vc
+            from vector_store import EngramVectorStore, slug as _vslug
+            store = EngramVectorStore(cfg)
+            store.ensure_collection()
+            vf = {}
+            if mtype:
+                vf["type"] = mtype
+            if memory_ai.scope_to_slug(cfg):
+                vf["slug"] = _vslug()
+            vhits = await asyncio.to_thread(store.search, query, want, 0.0, (vf or None))
+            rankings["vector"] = [h["file"] for h in vhits]
+            for h in vhits:
+                names.setdefault(h["file"], (h["name"], h["description"]))
+    except Exception:
+        pass  # vector store disabled/unreachable -> drops out
+
+    # keyword leg (pure-python; effectively always available)
+    try:
+        krank = memory_keyword.rank(query, want, mtype or None)
+        rankings["keyword"] = [f for f, _ in krank]
+    except Exception:
+        pass
+
+    fused = memory_fusion.fuse(rankings, k_rrf=int(rc.get("k_rrf", 60)),
+                               weights=rc.get("weights"))[:k]
+    if not fused:
+        return f"(no memories matched: {query})"
+    out = [f"Recalled {len(fused)} memories for: {query}", ""]
+    for d in fused:
+        if d["file"] not in names:                  # keyword-only hit -> read frontmatter
+            nm, desc, _ = memory_keyword.meta(d["file"])
+            names[d["file"]] = (nm, desc)
+        nm, desc = names[d["file"]]
+        out.append(f"- {nm or d['file']} [{'+'.join(d['sources'])}]: {(desc or '').strip()}")
+        for fact in facts.get(d["file"], [])[:2]:
+            out.append(f"    - {fact}")
     return "\n".join(out)
 
 

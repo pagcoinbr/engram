@@ -80,7 +80,25 @@ cosine duplicate finder + graph recall) — nothing breaks.
   never loses a memory; `--rebuild` regenerates it. `ensure_collection` guards against an
   embedding-dim mismatch (model swap → rebuild).
 - **How Claude consumes it**: `vector_mcp_server.py` exposes `memory_vector_recall`,
-  `memory_vector_search`, `memory_vector_stats` (`engram-vector`).
+  `memory_vector_search`, `memory_vector_stats` (`engram-vector`). Vector search takes a
+  `type` filter and scopes to the current store `slug` by default (`recall.scope_to_slug`).
+
+## 4c. Hybrid recall (Reciprocal Rank Fusion)
+engram has three recall paths — **graph** (associative/temporal), **vector** (dense
+semantic), and **keyword** (BM25 lexical, `bin/memory_keyword.py` — pure-python over the
+`.md` store, catches exact ids/ports/paths embeddings blur). `memory_recall_hybrid` fuses
+them into one ranking with **RRF** (`bin/memory_fusion.py`): each memory scores
+`Σ weight/(k_rrf + rank)` across the rankers that returned it, keyed by the `.md` filename
+(the shared join key: Qdrant payload `file`, graph `e.file`, keyword over filenames).
+- **Where it runs**: the full 3-way tool lives on **engram-graph** (warm graphiti +
+  in-process Qdrant via the shared `vector_store`; the installer adds `qdrant-client` to the
+  graph venv when `--vector`). The keyword + fusion modules are zero-dep and live in the
+  engine dir, importable from either venv. For no-graph installs, **engram-vector** exposes
+  a 2-way `memory_recall_fused` (vector+keyword).
+- **Graceful degradation**: each ranker is independently try/excepted — a disabled/down
+  vector store or graph simply drops out of the fusion; keyword is effectively always there.
+- **Config**: `recall.hybrid` (`k_rrf`, `default_k`, per-ranker `weights`) +
+  `recall.scope_to_slug` in `engram.yaml`.
 
 ## 5. The daemon (24/7) — `daemon/engram-daemon.py`
 A supervisor that runs tasks on independent cadences (a due-check against

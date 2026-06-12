@@ -94,24 +94,31 @@ class EngramVectorStore:
         )
 
     # ---- reads ---------------------------------------------------------------
-    def search(self, query: str, k: int = 6, threshold: float = 0.0) -> list[dict]:
+    def search(self, query: str, k: int = 6, threshold: float = 0.0,
+               filters: dict | None = None) -> list[dict]:
+        """Semantic search. `filters` accepts {"type": str|list, "slug": str} and is
+        translated to a Qdrant payload filter (None = unfiltered)."""
         qv = engram_llm.embed(query, self.cfg)
         res = self.client.query_points(
             collection_name=self.collection, query=qv, limit=k,
+            query_filter=self._build_filter(filters),
             score_threshold=(threshold or None), with_payload=True).points
         return [self._hit(p) for p in res]
 
-    def find_duplicates(self, threshold: float = 0.86, max_pairs: int = 30) -> list[tuple]:
+    def find_duplicates(self, threshold: float = 0.86, max_pairs: int = 30,
+                        scope_slug: bool = True) -> list[tuple]:
         """ANN near-duplicate finder — replaces the O(n²) pairwise cosine loop.
         For each indexed point, ask Qdrant for its nearest neighbours and keep
-        pairs scoring >= threshold (deduped, sorted high->low)."""
+        pairs scoring >= threshold (deduped, sorted high->low). Scoped to the
+        current slug by default so a shared collection doesn't cross stores."""
+        qfilter = self._build_filter({"slug": slug()}) if scope_slug else None
         seen = set()
         pairs = []
         for pt in self._scroll_all(with_vectors=True):
             f_a = (pt.payload or {}).get("file", str(pt.id))
             hits = self.client.query_points(
                 collection_name=self.collection, query=pt.vector, limit=6,
-                with_payload=True).points
+                query_filter=qfilter, with_payload=True).points
             for h in hits:
                 f_b = (h.payload or {}).get("file", str(h.id))
                 if f_b == f_a or h.score < threshold:
@@ -133,6 +140,23 @@ class EngramVectorStore:
                 "dim": self.dim, "on_disk": vc.on_disk(self.cfg)}
 
     # ---- helpers -------------------------------------------------------------
+    @staticmethod
+    def _build_filter(filters: dict | None):
+        """Translate {"type": str|list, "slug": str} -> qdrant Filter (None if empty).
+        Scalars use MatchValue; lists use MatchAny. Unknown keys are matched as-is."""
+        if not filters:
+            return None
+        from qdrant_client import models as qm
+        must = []
+        for key, val in filters.items():
+            if val is None or val == "" or val == []:
+                continue
+            if isinstance(val, (list, tuple, set)):
+                must.append(qm.FieldCondition(key=key, match=qm.MatchAny(any=list(val))))
+            else:
+                must.append(qm.FieldCondition(key=key, match=qm.MatchValue(value=val)))
+        return qm.Filter(must=must) if must else None
+
     def _scroll_all(self, *, with_vectors: bool):
         offset = None
         while True:

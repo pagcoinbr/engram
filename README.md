@@ -61,7 +61,8 @@ daemon. Restart Claude Code afterward so it loads the new commands.
 ## How Claude uses it
 - **Commands** (in any session): `/memory-checkpoint`, `/memory-curate`, `/memory-fixate`, `/memory-to-skill`, `/memory-reformat`, `/memory-clean-review`.
 - **Graph recall** (the `engram-graph` MCP server): Claude calls `memory_recall`, `memory_search_facts`, `memory_neighbors`, `memory_stats` on demand to load only the relevant memories — instead of dumping the whole store into context.
-- **Vector recall** (the optional `engram-vector` MCP server): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search over the store via Qdrant. Off by default; enable with `./install.sh --vector`.
+- **Hybrid recall** (`memory_recall_hybrid`, on `engram-graph`): the best single recall — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename. Each ranker degrades independently; optional `type` filter.
+- **Vector recall** (the optional `engram-vector` MCP server): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search over the store via Qdrant (with a `type` filter, scoped to the current store). Plus `memory_recall_fused` (vector+keyword) for no-graph installs. Off by default; enable with `./install.sh --vector`.
 - **Automatic**: a Stop hook harvests new facts; the daemon consolidates/fixates/syncs the graph (and the vector index, if enabled) on a cadence.
 
 ## The 24/7 daemon

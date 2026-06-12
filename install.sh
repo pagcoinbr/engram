@@ -142,6 +142,13 @@ if [[ "$WANT_VECTOR" == yes ]]; then
         && say "registered engram-vector MCP server" || warn "claude mcp add failed (register manually later)"
     else say "engram-vector MCP already registered"; fi
   else warn "claude CLI or vector venv missing — skipping MCP registration (run 'claude mcp add' later)"; fi
+  # Hybrid recall: the warm engram-graph server queries Qdrant in-process, so the
+  # GRAPH venv needs qdrant-client too. Idempotent; harmless if graph isn't built.
+  if [[ -x "$CLAUDE/graph/venv/bin/python" ]]; then
+    "$CLAUDE/graph/venv/bin/pip" install -q qdrant-client \
+      && say "added qdrant-client to graph venv (enables memory_recall_hybrid)" \
+      || warn "could not add qdrant-client to graph venv (hybrid will fall back to graph+keyword)"
+  fi
   say "start Qdrant: cd $CLAUDE/vector && docker compose up -d"
   # Seed the index from any memories already on disk (best-effort; no-op if Qdrant is down).
   [[ -x "$VVENV/bin/python" ]] && "$VVENV/bin/python" "$CLAUDE/vector/vector_sync.py" --rebuild 2>/dev/null || true
