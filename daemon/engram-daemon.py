@@ -92,8 +92,15 @@ def _run(cmd, timeout=3600) -> int:
         log(f"  ERROR: {e}")
         return 1
 
+def _neo4j_uri() -> str:
+    """NEO4J_URI env override > engram.yaml graph.neo4j_uri > loopback. Mirrors
+    mg_config._neo4j_uri so the daemon probes the SAME Neo4j the graph code uses."""
+    return (os.environ.get("NEO4J_URI")
+            or (cfg().get("graph", {}) or {}).get("neo4j_uri")
+            or "bolt://127.0.0.1:7687")
+
 def _neo4j_up() -> bool:
-    p = urlparse(os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"))
+    p = urlparse(_neo4j_uri())
     try:
         with socket.create_connection((p.hostname or "127.0.0.1", p.port or 7687), timeout=3):
             return True
