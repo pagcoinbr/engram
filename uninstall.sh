@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh — remove engram from ~/.claude. KEEPS your memory store by default.
-#   --purge   also remove the memory store, engram.yaml/engram.env, and the graph venv + .env
+#   --purge   also remove the memory store, engram.yaml/engram.env, the graph venv + .env,
+#             and the vector venv + Qdrant storage
 set -eo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE="${ENGRAM_CLAUDE_HOME:-$HOME/.claude}"
@@ -14,6 +15,8 @@ say(){ printf '\033[1;36m[engram]\033[0m %s\n' "$*"; }
 rm -f "$CLAUDE/engram-daemon.py"
 [[ -d "$REPO/graph" ]] && for f in "$REPO"/graph/*.py "$REPO"/graph/*.md; do rm -f "$CLAUDE/graph/$(basename "$f")"; done
 rm -f "$CLAUDE/graph/docker-compose.yml"
+[[ -d "$REPO/vector" ]] && for f in "$REPO"/vector/*.py; do rm -f "$CLAUDE/vector/$(basename "$f")"; done
+rm -f "$CLAUDE/vector/docker-compose.yml" "$CLAUDE/vector/sync_state.json"
 say "removed engine files"
 
 # hooks (drop our three commands; prune now-empty groups)
@@ -27,8 +30,9 @@ if command -v jq >/dev/null && [[ -f "$SETTINGS" ]]; then
   else rm -f "$SETTINGS.tmp"; fi
 fi
 
-# MCP server
+# MCP servers
 command -v claude >/dev/null && claude mcp remove engram-graph >/dev/null 2>&1 && say "removed engram-graph MCP" || true
+command -v claude >/dev/null && claude mcp remove engram-vector >/dev/null 2>&1 && say "removed engram-vector MCP" || true
 
 # daemon
 systemctl --user disable --now engram.timer >/dev/null 2>&1 || true
@@ -38,8 +42,9 @@ say "removed daemon units"
 
 if [[ "$PURGE" == 1 ]]; then
   SLUG="${CLAUDE_MEMORY_SLUG:-$(printf '%s' "$HOME" | sed 's|/|-|g')}"
-  rm -rf "$CLAUDE/graph/venv" "$CLAUDE/graph/.env" "$CLAUDE/engram.yaml" "$CLAUDE/engram.env" "$CLAUDE/projects/$SLUG/memory"
-  say "PURGED graph venv + config + memory store"
+  rm -rf "$CLAUDE/graph/venv" "$CLAUDE/graph/.env" "$CLAUDE/vector/venv" "$CLAUDE/vector/qdrant_storage" \
+         "$CLAUDE/engram.yaml" "$CLAUDE/engram.env" "$CLAUDE/projects/$SLUG/memory"
+  say "PURGED graph + vector venvs + config + memory store"
 else
   say "kept your memory store + engram.yaml (use --purge to remove them too)"
 fi

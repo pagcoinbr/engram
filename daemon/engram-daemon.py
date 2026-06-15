@@ -36,6 +36,7 @@ HERE = Path(__file__).resolve().parent
 HOME = Path.home()
 ENGRAM_BIN = Path(os.environ.get("ENGRAM_BIN", HOME / ".claude"))
 ENGRAM_GRAPH = Path(os.environ.get("ENGRAM_GRAPH", ENGRAM_BIN / "graph"))
+ENGRAM_VECTOR = Path(os.environ.get("ENGRAM_VECTOR", ENGRAM_BIN / "vector"))
 LOG_DIR = Path(os.environ.get("ENGRAM_LOG_DIR", HOME / ".claude" / "logs"))
 STATE = Path(os.environ.get("ENGRAM_DAEMON_STATE", LOG_DIR / "daemon_state.json"))
 
@@ -45,9 +46,9 @@ try:
 except Exception:
     memory_ai = None
 
-DEFAULT_INTERVALS = {"health": 300, "graph": 1800, "maintenance": 21600,
-                     "export": 86400, "reconcile": 86400}
-ORDER = ["health", "graph", "maintenance", "export", "reconcile"]
+DEFAULT_INTERVALS = {"health": 300, "graph": 1800, "vector": 1800,
+                     "maintenance": 21600, "export": 86400, "reconcile": 86400}
+ORDER = ["health", "graph", "vector", "maintenance", "export", "reconcile"]
 
 
 def cfg():
@@ -99,6 +100,23 @@ def _neo4j_up() -> bool:
     except Exception:
         return False
 
+def _vector_enabled() -> bool:
+    return bool(memory_ai and memory_ai.vector_enabled(cfg()))
+
+def _qdrant_up() -> bool:
+    url = (cfg().get("vector_store", {}) or {}).get("url", "http://127.0.0.1:6333")
+    p = urlparse(url)
+    try:
+        with socket.create_connection((p.hostname or "127.0.0.1", p.port or 6333), timeout=3):
+            return True
+    except Exception:
+        return False
+
+def _vector_python() -> str:
+    """Python that can import qdrant-client: the vector venv if present, else this one."""
+    cand = os.environ.get("ENGRAM_VECTOR_PYTHON") or str(ENGRAM_VECTOR / "venv" / "bin" / "python")
+    return cand if Path(cand).exists() else sys.executable
+
 def _maintenance_script():
     for c in (os.environ.get("ENGRAM_MAINTENANCE"),
               ENGRAM_BIN / "memory_fixate_cron.sh", HERE / "memory_fixate_cron.sh",
@@ -118,6 +136,8 @@ def task_health():
     except Exception as e:
         h = {"error": str(e)}
     h["neo4j"] = _neo4j_up()
+    if _vector_enabled():
+        h["qdrant"] = _qdrant_up()
     log(f"health: {json.dumps(h)}")
 
 def task_graph():
@@ -125,6 +145,14 @@ def task_graph():
         log("graph: Neo4j down — skipping insert")
         return
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--insert"])
+
+def task_vector():
+    if not _vector_enabled():
+        return  # optional + off -> pure-markdown; nothing to do
+    if not _qdrant_up():
+        log("vector: Qdrant down — skipping insert")
+        return
+    _run([_vector_python(), str(ENGRAM_VECTOR / "vector_sync.py"), "--insert"])
 
 def task_maintenance():
     sh = _maintenance_script()
@@ -143,8 +171,8 @@ def task_reconcile():
         return
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--reconcile"])
 
-TASKS = {"health": task_health, "graph": task_graph, "maintenance": task_maintenance,
-         "export": task_export, "reconcile": task_reconcile}
+TASKS = {"health": task_health, "graph": task_graph, "vector": task_vector,
+         "maintenance": task_maintenance, "export": task_export, "reconcile": task_reconcile}
 
 
 def tick(force=None):

@@ -29,3 +29,8 @@ else
     echo "[save-content] ERROR pushing ${FILENAME}" >&2
     exit 1
 fi
+
+# Optional vector index: best-effort, non-blocking re-embed of the rewritten file
+# (no-op unless installed with --vector and enabled). Content changed, so the
+# sha-synced upsert refreshes its vector.
+memory_vector_sync --insert --only "$FILENAME"

@@ -61,9 +61,54 @@ Turn the first two on only after you've watched the dry-run output and trust it.
 ## Daemon cadences
 ```yaml
 daemon:
-  intervals: { health: 300, graph: 1800, maintenance: 21600, export: 86400, reconcile: 86400 }
+  intervals: { health: 300, graph: 1800, vector: 1800, maintenance: 21600, export: 86400, reconcile: 86400 }
 schedule:
   times: ["03:30", "15:30"]   # systemd timer fallback fire times
+```
+
+## Vector store (Qdrant) — optional
+A semantic index over the `.md` store for dense recall + fast (ANN) dedup. **Off by
+default**; with it disabled or Qdrant unreachable, engram falls back to pure markdown.
+Enable with `./install.sh --vector` (which also flips `enabled: true` and registers the
+`engram-vector` MCP server). Embeddings reuse `engram_llm.embed()` (768-dim), so the
+vector space matches the graph.
+
+```yaml
+vector_store:
+  enabled: false                 # master switch (parallels the optional --graph)
+  provider: qdrant
+  url: "http://127.0.0.1:6333"   # loopback Qdrant
+  api_key: ""                    # for Qdrant Cloud; blank for local
+  collection: "engram_memory"
+  on_disk: false                 # true = vectors on disk (less RAM, slower)
+  timeout_seconds: 30
+  recall:        { default_k: 6, threshold: 0.0 }
+  duplicate_finder: { use_vector_store: true }   # light pass uses Qdrant ANN instead of O(n^2) cosine
+```
+Env overrides: `ENGRAM_QDRANT_URL`, `ENGRAM_QDRANT_API_KEY`, `ENGRAM_VECTOR_COLLECTION`.
+The vector venv lives at `~/.claude/vector/venv`. Start the service with
+`cd ~/.claude/vector && docker compose up -d`; seed/rebuild with
+`vector_sync.py --rebuild`. See [vector/README.md](vector/README.md).
+
+The vector recall/search MCP tools accept a `type` filter
+(`user|feedback|project|reference`) and, by default, scope results to the current
+store's `slug` (toggle below).
+
+## Hybrid recall (Reciprocal Rank Fusion)
+`memory_recall_hybrid` (on `engram-graph`) fuses graph + vector + keyword (BM25) into
+one ranking keyed by the memory filename. `memory_recall_fused` (on `engram-vector`)
+is the 2-way (vector+keyword) variant for no-graph installs. Each ranker degrades
+independently. The installer adds `qdrant-client` to the graph venv on `--vector` so
+the warm graph server can query Qdrant in-process.
+
+```yaml
+recall:
+  scope_to_slug: true            # restrict vector/hybrid recall to the current store's slug
+  hybrid:
+    enabled: true
+    k_rrf: 60                    # RRF constant (standard 60)
+    default_k: 6                 # fused memories returned
+    weights: { graph: 1.0, vector: 1.0, keyword: 1.0 }
 ```
 
 ## Graph (Neo4j)

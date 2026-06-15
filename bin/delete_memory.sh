@@ -61,3 +61,7 @@ if [[ -f "$MEMORY_MD" ]] && grep -qF "](${FILENAME})" "$MEMORY_MD"; then
 else
     echo "[delete-memory] No MEMORY.md index line for ${FILENAME}"
 fi
+
+# Optional vector index: best-effort, non-blocking removal of this file's point
+# from Qdrant (no-op unless installed with --vector and enabled).
+memory_vector_sync --delete "$FILENAME"

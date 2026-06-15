@@ -12,7 +12,7 @@ local_enabled: true              # master switch for ALL automated/local memory 
 #   ollama  — local models on a GPU box (free, private). Pick a `tier` for your VRAM.
 #   claude  — no GPU: shell out to the `claude` CLI headless (cost = Claude usage).
 #             Used by the always-on loop container (daemon/, backend=claude).
-backend: ollama                  # ollama | claude
+backend: ollama                  # ollama | claude | llama_cpp
 fallback: ""                     # "" | claude — when backend=ollama is unreachable (e.g. GPU box off),
                                  # fall back to `claude -p` so the 24/7 daemon keeps working. Costs Claude usage.
 
@@ -40,9 +40,23 @@ claude:
   timeout_seconds: 600
   max_turns: 1                     # single turn, no tool loop — pure text generation
 
-# Embeddings — always local, never a paid API. Used when Ollama is unreachable or
-# backend: claude. nomic-embed-text-v1.5 is 768-dim, matching Ollama's nomic-embed-text.
+# OpenAI-compatible llama.cpp server (llama-server /v1). Used when backend: llama_cpp.
+# Generation routes to {url}/chat/completions; <think>…</think> reasoning is stripped.
+llama_cpp:
+  url: "http://localhost:8080/v1"   # llama-server base URL (must include /v1)
+  model: "local"                    # the --alias your llama-server reports (e.g. qwen3-14b)
+  timeout_seconds: 600
+  max_tokens: 8000
+  api_key: ""                       # only if your llama-server requires one
+
+# Embeddings — local, never a paid API. The provider is chosen INDEPENDENTLY of the
+# generation backend, so backend: llama_cpp (or claude) can still embed via Ollama.
+#   provider: "" (auto: ollama when backend=ollama, else fastembed) | ollama | fastembed
+#   model:    Ollama embedding model override, e.g. "bge-m3" (1024-dim). Blank = nomic.
+#   dim:      MUST match the embedding model's output (nomic/fastembed=768, bge-m3=1024).
 embed:
+  provider: ""
+  model: ""
   fastembed_model: "nomic-ai/nomic-embed-text-v1.5"
   dim: 768
 
@@ -97,11 +111,51 @@ session_curate:
   min_new_memories: 3
   max_per_day: 2
 
+# ── Vector store (OPTIONAL) ─────────────────────────────────────────────────
+# A Qdrant index over the .md store for semantic recall + fast (ANN) dedup. The
+# .md files remain the source of truth; Qdrant is a rebuildable index over them.
+# OFF by default: with this disabled OR Qdrant unreachable, engram falls back to
+# pure markdown (the in-memory cosine duplicate finder + graph recall) — nothing
+# breaks. Embeddings reuse engram_llm.embed() (768-dim nomic), so the vector space
+# matches the graph exactly. Enable with `./install.sh --vector`, then start Qdrant:
+#   cd ~/.claude/vector && docker compose up -d
+vector_store:
+  enabled: false                 # master switch (parallels the optional --graph)
+  provider: qdrant               # qdrant (only backend for now)
+  url: "http://127.0.0.1:6333"   # loopback Qdrant
+  api_key: ""                    # for Qdrant Cloud; blank for local
+  collection: "engram_memory"
+  on_disk: false                 # true = store vectors on disk (less RAM, slower search)
+  timeout_seconds: 30
+  recall:
+    default_k: 6                 # how many memories memory_vector_recall returns
+    threshold: 0.0               # min cosine for a search hit (0 = no floor)
+  duplicate_finder:
+    use_vector_store: true       # light pass uses Qdrant ANN instead of O(n^2) cosine when enabled
+
+# ── Hybrid recall (Reciprocal Rank Fusion) ──────────────────────────────────
+# Fuse the recall paths — graph (associative/temporal), vector (dense semantic),
+# and keyword (BM25 lexical) — into one ranking keyed by the .md filename, so the
+# indexes are greater than the sum. The full 3-way `memory_recall_hybrid` lives on
+# the engram-graph MCP server (warm graph + in-process Qdrant); engram-vector
+# exposes a 2-way `memory_recall_fused` (vector+keyword) for no-graph installs.
+# Each ranker degrades independently — a disabled/down backend just drops out.
+recall:
+  scope_to_slug: true            # restrict vector/hybrid recall to the current store's slug
+  hybrid:
+    enabled: true
+    k_rrf: 60                    # RRF constant (standard 60); damps low-rank contributions
+    default_k: 6                 # how many fused memories a recall returns
+    weights: { graph: 1.0, vector: 1.0, keyword: 1.0 }   # per-ranker RRF weight
+
 # Local MCP servers wired into interactive sessions. The graph recall server
-# (graph/mcp_server.py) is registered by the installer as `engram-graph`.
+# (graph/mcp_server.py) is registered by the installer as `engram-graph`; the
+# optional vector recall server (vector/vector_mcp_server.py) as `engram-vector`.
 mcp_servers:
   engram-graph:
     note: "Graphiti/Neo4j recall tools: memory_recall / memory_search_facts / memory_neighbors / memory_stats"
+  engram-vector:
+    note: "Qdrant semantic recall (optional): memory_vector_recall / memory_vector_search / memory_vector_stats"
 
 # Scheduling — the installer builds the systemd timer / daemon cadence from these.
 schedule:

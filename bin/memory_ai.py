@@ -26,12 +26,17 @@ _DEFAULTS = {
                "num_ctx": 16384, "num_predict": 8000, "reasoning_effort": "low"},
     # backend + tier drive model choice (see engram_llm.TIER_PRESETS). `experts`
     # is an OPTIONAL per-role override map, e.g. {"distill": {"model": "..."}}.
-    "backend": "ollama",                 # ollama | claude
-    "fallback": "",                      # "" | claude — used when backend=ollama is unreachable
+    "backend": "ollama",                 # ollama | claude | llama_cpp
+    "fallback": "",                      # "" | claude — used when the primary backend is unreachable
     "tier": "small",                     # cpu | small | medium | large  (ollama only)
     "experts": {},
     "claude": {"bin": "claude", "timeout_seconds": 600, "max_turns": 1},
-    "embed": {"fastembed_model": "nomic-ai/nomic-embed-text-v1.5", "dim": 768},
+    # OpenAI-compatible llama.cpp server (llama-server /v1). Used when backend=llama_cpp.
+    "llama_cpp": {"url": "http://localhost:8080/v1", "model": "local",
+                  "timeout_seconds": 600, "max_tokens": 8000, "api_key": ""},
+    # embed.provider chooses the embedding path independently of the generation backend
+    # (ollama | fastembed). embed.model overrides the Ollama embedding model (e.g. bge-m3).
+    "embed": {"provider": "", "model": "", "fastembed_model": "nomic-ai/nomic-embed-text-v1.5", "dim": 768},
     "light_pass": {
         "enabled": True,
         "duplicate_finder": {"enabled": True, "expert": "similarity", "dup_threshold": 0.86},
@@ -40,6 +45,25 @@ _DEFAULTS = {
         "max_items": 60,
     },
     "session_curate": {"enabled": True, "min_minutes": 15, "min_new_memories": 3, "max_per_day": 2},
+    # Hybrid recall: fuse graph + vector + keyword (BM25) via Reciprocal Rank Fusion.
+    "recall": {
+        "hybrid": {"enabled": True, "k_rrf": 60, "default_k": 6,
+                   "weights": {"graph": 1.0, "vector": 1.0, "keyword": 1.0}},
+        "scope_to_slug": True,   # restrict vector/hybrid recall to the current store's slug
+    },
+    # OPTIONAL Qdrant vector index over the .md store (semantic recall + fast dedup).
+    # OFF by default: disabled or unreachable => fall back to pure markdown.
+    "vector_store": {
+        "enabled": False,
+        "provider": "qdrant",
+        "url": "http://127.0.0.1:6333",
+        "api_key": "",
+        "collection": "engram_memory",
+        "on_disk": False,
+        "timeout_seconds": 30,
+        "recall": {"default_k": 6, "threshold": 0.0},
+        "duplicate_finder": {"use_vector_store": True},
+    },
     "schedule": {"times": ["03:30"]},
 }
 
@@ -63,6 +87,20 @@ def load() -> dict:
 
 def local_enabled(cfg=None) -> bool:
     return bool((cfg or load()).get("local_enabled", True))
+
+def vector_enabled(cfg=None) -> bool:
+    """True only when the local switch AND the optional vector store are both on.
+    The single place callers check before touching Qdrant (else: markdown fallback)."""
+    cfg = cfg or load()
+    return bool(local_enabled(cfg)) and bool(cfg.get("vector_store", {}).get("enabled", False))
+
+def recall_cfg(cfg=None) -> dict:
+    """The hybrid-recall config block (k_rrf, default_k, weights, scope_to_slug).
+    Used by the graph/vector MCP servers to fuse + scope recall."""
+    return (cfg or load()).get("recall", {}) or {}
+
+def scope_to_slug(cfg=None) -> bool:
+    return bool(recall_cfg(cfg).get("scope_to_slug", True))
 
 def ollama_host(cfg=None) -> str:
     return (cfg or load())["ollama"]["host"]

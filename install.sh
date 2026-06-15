@@ -6,6 +6,7 @@
 #   --storage local|github      --repo owner/name (implies github)
 #   --daemon none|systemd|docker
 #   --graph | --no-graph        (build the Neo4j graph venv + register the MCP server)
+#   --vector | --no-vector      (build the Qdrant vector venv + register the MCP server)
 #   --yes                       (accept defaults, no prompts)
 #
 # What it does: copies the engine into ~/.claude, writes engram.yaml, merges the
@@ -19,7 +20,7 @@ CLAUDE="${ENGRAM_CLAUDE_HOME:-$HOME/.claude}"
 SETTINGS="$CLAUDE/settings.json"
 
 BACKEND=""; TIER="small"; OLLAMA_HOST="http://localhost:11434"
-STORAGE="local"; REPO_REMOTE=""; DAEMON="none"; YES=0; WANT_GRAPH="auto"
+STORAGE="local"; REPO_REMOTE=""; DAEMON="none"; YES=0; WANT_GRAPH="auto"; WANT_VECTOR="auto"
 
 while [[ $# -gt 0 ]]; do case "$1" in
   --backend) BACKEND="$2"; shift 2;;
@@ -30,6 +31,8 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --daemon) DAEMON="$2"; shift 2;;
   --graph) WANT_GRAPH="yes"; shift;;
   --no-graph) WANT_GRAPH="no"; shift;;
+  --vector) WANT_VECTOR="yes"; shift;;
+  --no-vector) WANT_VECTOR="no"; shift;;
   --yes|-y) YES=1; shift;;
   -h|--help) sed -n '2,18p' "$0"; exit 0;;
   *) echo "unknown arg: $1" >&2; exit 2;;
@@ -53,14 +56,16 @@ ask STORAGE "Storage (local / github)" "$STORAGE"
 [[ "$STORAGE" == github && -z "$REPO_REMOTE" ]] && ask REPO_REMOTE "GitHub memory repo (owner/name)" ""
 ask DAEMON "24h daemon (none / systemd / docker)" "$DAEMON"
 if [[ "$WANT_GRAPH" == auto ]]; then WANT_GRAPH="yes"; ask WANT_GRAPH "Build the Neo4j graph (yes/no)" "yes"; fi
-say "backend=$BACKEND tier=$TIER storage=$STORAGE daemon=$DAEMON graph=$WANT_GRAPH"
+if [[ "$WANT_VECTOR" == auto ]]; then WANT_VECTOR="no"; ask WANT_VECTOR "Build the Qdrant vector index (yes/no)" "no"; fi
+say "backend=$BACKEND tier=$TIER storage=$STORAGE daemon=$DAEMON graph=$WANT_GRAPH vector=$WANT_VECTOR"
 
 # ---- place files ----
-mkdir -p "$CLAUDE/commands" "$CLAUDE/graph" "$CLAUDE/logs"
+mkdir -p "$CLAUDE/commands" "$CLAUDE/graph" "$CLAUDE/vector" "$CLAUDE/logs"
 install -m 0755 "$REPO"/bin/*.sh "$CLAUDE"/ 2>/dev/null || true
 install -m 0755 "$REPO"/bin/*.py "$CLAUDE"/ 2>/dev/null || true
 install -m 0644 "$REPO"/commands/*.md "$CLAUDE"/commands/ 2>/dev/null || true
 for f in "$REPO"/graph/*.py "$REPO"/graph/*.md "$REPO"/graph/docker-compose.yml; do [[ -e "$f" ]] && install -m 0644 "$f" "$CLAUDE/graph/"; done
+for f in "$REPO"/vector/*.py "$REPO"/vector/docker-compose.yml; do [[ -e "$f" ]] && install -m 0644 "$f" "$CLAUDE/vector/"; done
 install -m 0755 "$REPO"/daemon/engram-daemon.py "$CLAUDE"/ 2>/dev/null || true
 mkdir -p "$CLAUDE/ui"; [[ -f "$REPO/ui/index.html" ]] && install -m 0644 "$REPO/ui/index.html" "$CLAUDE/ui/"
 say "engine installed into $CLAUDE (GUI: run engram-ui.sh)"
@@ -73,6 +78,12 @@ else
       -e "s|^tier: .*|tier: $TIER|" \
       -e "s|host: \"http://localhost:11434\"|host: \"$OLLAMA_HOST\"|" \
       "$REPO/engram.yaml.example" > "$CLAUDE/engram.yaml"
+  # Flip the optional vector store on only when --vector was chosen: rewrite the
+  # FIRST `enabled:` line inside the vector_store: block (robust to spacing).
+  if [[ "$WANT_VECTOR" == yes ]]; then
+    awk '/^vector_store:/{inv=1} inv && /^[[:space:]]+enabled:/{sub(/enabled:[[:space:]]*false/,"enabled: true"); inv=0} {print}' \
+        "$CLAUDE/engram.yaml" > "$CLAUDE/engram.yaml.tmp" && mv "$CLAUDE/engram.yaml.tmp" "$CLAUDE/engram.yaml"
+  fi
   say "wrote $CLAUDE/engram.yaml"
 fi
 
@@ -113,6 +124,36 @@ if [[ "$WANT_GRAPH" == yes ]]; then
   say "start Neo4j: cd $CLAUDE/graph && NEO4J_PASSWORD=\$(grep -oP 'NEO4J_PASSWORD=\\K.*' .env) docker compose up -d"
 fi
 
+# ---- vector venv + MCP (optional Qdrant index) ----
+if [[ "$WANT_VECTOR" == yes ]]; then
+  VVENV="$CLAUDE/vector/venv"
+  if [[ ! -x "$VVENV/bin/python" ]]; then
+    say "building vector venv (mcp, qdrant-client, fastembed)... this can take a few minutes"
+    if python3 -m venv "$VVENV" && "$VVENV/bin/pip" install -q --upgrade pip && \
+       "$VVENV/bin/pip" install -q "mcp[cli]" qdrant-client fastembed pyyaml; then
+      say "vector venv ready"
+    else
+      warn "vector venv build failed — install mcp/qdrant-client/fastembed manually into $VVENV"
+    fi
+  fi
+  if command -v claude >/dev/null && [[ -x "$VVENV/bin/python" ]]; then
+    if ! claude mcp list 2>/dev/null | grep -q engram-vector; then
+      claude mcp add --scope user engram-vector "$VVENV/bin/python" "$CLAUDE/vector/vector_mcp_server.py" \
+        && say "registered engram-vector MCP server" || warn "claude mcp add failed (register manually later)"
+    else say "engram-vector MCP already registered"; fi
+  else warn "claude CLI or vector venv missing — skipping MCP registration (run 'claude mcp add' later)"; fi
+  # Hybrid recall: the warm engram-graph server queries Qdrant in-process, so the
+  # GRAPH venv needs qdrant-client too. Idempotent; harmless if graph isn't built.
+  if [[ -x "$CLAUDE/graph/venv/bin/python" ]]; then
+    "$CLAUDE/graph/venv/bin/pip" install -q qdrant-client \
+      && say "added qdrant-client to graph venv (enables memory_recall_hybrid)" \
+      || warn "could not add qdrant-client to graph venv (hybrid will fall back to graph+keyword)"
+  fi
+  say "start Qdrant: cd $CLAUDE/vector && docker compose up -d"
+  # Seed the index from any memories already on disk (best-effort; no-op if Qdrant is down).
+  [[ -x "$VVENV/bin/python" ]] && "$VVENV/bin/python" "$CLAUDE/vector/vector_sync.py" --rebuild 2>/dev/null || true
+fi
+
 # ---- hooks ----
 [[ -f "$SETTINGS" ]] || echo '{}' > "$SETTINGS"
 if command -v jq >/dev/null; then
@@ -139,7 +180,8 @@ case "$DAEMON" in
   systemd)
     mkdir -p "$HOME/.config/systemd/user" "$HOME/.config/engram"
     { echo "ENGRAM_BIN=$CLAUDE"; echo "ENGRAM_GRAPH=$CLAUDE/graph"; echo "ENGRAM_CONFIG=$CLAUDE/engram.yaml"; echo "ENGRAM_LOG_DIR=$CLAUDE/logs";
-      [[ -x "$CLAUDE/graph/venv/bin/python" ]] && echo "ENGRAM_GRAPH_PYTHON=$CLAUDE/graph/venv/bin/python"; } > "$HOME/.config/engram/daemon.env"
+      [[ -x "$CLAUDE/graph/venv/bin/python" ]] && echo "ENGRAM_GRAPH_PYTHON=$CLAUDE/graph/venv/bin/python";
+      [[ -x "$CLAUDE/vector/venv/bin/python" ]] && echo "ENGRAM_VECTOR_PYTHON=$CLAUDE/vector/venv/bin/python"; } > "$HOME/.config/engram/daemon.env"
     sed "s|^ExecStart=.*|ExecStart=$(command -v python3) $CLAUDE/engram-daemon.py --once|" "$REPO/daemon/engram.service" > "$HOME/.config/systemd/user/engram.service"
     cp "$REPO/daemon/engram.timer" "$HOME/.config/systemd/user/engram.timer"
     if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable --now engram.timer 2>/dev/null; then

@@ -25,9 +25,15 @@ const API = "";
 const j = (p,o)=>fetch(API+p,o).then(r=>r.ok?r.json():r.text().then(t=>{throw new Error(t)}));
 const TYPE_COLOR = {user:"bg-violet-900 text-violet-200",feedback:"bg-amber-900 text-amber-200",
   project:"bg-emerald-900 text-emerald-200",reference:"bg-sky-900 text-sky-200"};
+const SOURCE_COLOR = {graph:"bg-fuchsia-900 text-fuchsia-200",vector:"bg-cyan-900 text-cyan-200",
+  keyword:"bg-orange-900 text-orange-200"};
+const TYPES = ["","user","feedback","project","reference"];
 
 function Chip({children,cls}){return <span className={"chip "+(cls||"bg-slate-700 text-slate-200")}>{children}</span>;}
 function Dot({ok}){return <span className={"inline-block w-2.5 h-2.5 rounded-full "+(ok?"bg-emerald-400":"bg-rose-500")}/>;}
+function TypeSelect({value,onChange}){return <select value={value} onChange={e=>onChange(e.target.value)}
+  className="bg-slate-900 rounded px-2 py-1 text-sm border border-slate-700">
+  {TYPES.map(t=><option key={t} value={t}>{t||"all types"}</option>)}</select>;}
 
 function Dashboard(){
   const [h,setH]=useState(null),[g,setG]=useState(null),[err,setErr]=useState(null);
@@ -43,6 +49,8 @@ function Dashboard(){
     <Stat label="Neo4j" v={<Dot ok={h.neo4j}/>} sub={h.neo4j?"up":"down"}/>
     <Stat label="Memories" v={h.memories}/>
     {g&&<Stat label="Graph" v={g.episodes+" eps"} sub={g.entities+" entities · "+g.facts+" facts"}/>}
+    <Stat label="Vector" v={h.vector&&h.vector.enabled?(h.vector.reachable?(h.vector.points+" pts"):<Dot ok={false}/>):"off"}
+      sub={!h.vector||!h.vector.enabled?"disabled":(h.vector.reachable?"Qdrant up":"Qdrant down")}/>
     <div className="card p-4 sm:col-span-2 lg:col-span-4"><div className="text-xs text-slate-500 mb-1">daemon last-run</div>
       <div className="text-sm">{last}</div>
       {h.detail&&<div className="text-xs text-amber-400 mt-2">{h.detail}</div>}</div>
@@ -106,6 +114,78 @@ function Graph(){
         {!nb.edges.length&&<div className="text-slate-600">no edges</div>}</div>}</div></div>;
 }
 
+function Recall(){
+  const [q,setQ]=useState(""),[type,setType]=useState(""),[k,setK]=useState(6),
+    [res,setRes]=useState(null),[busy,setBusy]=useState(false),[err,setErr]=useState("");
+  const go=()=>{if(!q.trim())return;setBusy(true);setErr("");setRes(null);
+    j("/api/recall/hybrid?k="+k+"&type="+encodeURIComponent(type)+"&q="+encodeURIComponent(q))
+      .then(d=>setRes(d)).catch(e=>setErr(e.message)).finally(()=>setBusy(false));};
+  return <div className="card p-4">
+    <div className="text-sm mb-2">Hybrid recall — fuses graph + vector + keyword (Reciprocal Rank Fusion)</div>
+    <div className="flex gap-2 flex-wrap">
+      <input value={q} onChange={e=>setQ(e.target.value)} onKeyDown={e=>e.key==="Enter"&&go()}
+        placeholder="what do I know about…" className="flex-1 min-w-[14rem] bg-slate-900 rounded px-2 py-1 text-sm"/>
+      <TypeSelect value={type} onChange={setType}/>
+      <input type="number" min="1" max="20" value={k} onChange={e=>setK(+e.target.value||6)}
+        title="results" className="w-16 bg-slate-900 rounded px-2 py-1 text-sm"/>
+      <button onClick={go} className="px-3 bg-sky-700 rounded text-sm">Recall</button></div>
+    {busy&&<div className="text-slate-500 text-sm mt-3">…</div>}
+    {err&&<div className="text-rose-400 text-xs mt-3">{err}</div>}
+    {res&&<div className="mt-3">
+      <div className="text-xs text-slate-500 mb-2">sources used: {res.sources_used&&res.sources_used.length?
+        res.sources_used.map(s=><Chip key={s} cls={SOURCE_COLOR[s]}>{s}</Chip>):" none"}</div>
+      <div className="space-y-2">{res.results.map(r=><div key={r.file} className="p-2 rounded bg-slate-900/60">
+        <div className="flex justify-between items-center gap-2">
+          <span className="text-sm truncate">{r.name}</span>
+          <span className="flex gap-1 shrink-0">{r.sources.map(s=><Chip key={s} cls={SOURCE_COLOR[s]}>{s}</Chip>)}</span></div>
+        <div className="text-xs text-slate-500">{r.description}</div>
+        {r.facts.map((f,i)=><div key={i} className="text-xs text-slate-400 pl-3">↳ {f}</div>)}</div>)}
+        {!res.results.length&&<div className="text-slate-600 text-sm">no memories matched</div>}</div></div>}
+    <div className="text-xs text-slate-600 mt-3">Each ranker degrades independently — a disabled vector store or a down graph simply drops out.</div>
+  </div>;
+}
+
+function Vector(){
+  const [st,setSt]=useState(null),[q,setQ]=useState(""),[type,setType]=useState(""),
+    [hits,setHits]=useState(null),[out,setOut]=useState(""),[busy,setBusy]=useState("");
+  const loadStats=useCallback(()=>j("/api/vector/stats").then(setSt).catch(e=>setSt({error:e.message})),[]);
+  useEffect(()=>{loadStats();},[loadStats]);
+  const search=()=>{if(!q.trim())return;setHits(null);
+    j("/api/vector/search?type="+encodeURIComponent(type)+"&q="+encodeURIComponent(q)).then(setHits).catch(e=>setHits({note:e.message}));};
+  const sync=(mode)=>{if(mode==="rebuild"&&!confirm("Rebuild the whole index? (re-embeds every memory)"))return;
+    setBusy(mode);setOut("");j("/api/vector/sync",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode})})
+      .then(d=>setOut(d.out||"(done)")).catch(e=>setOut("error: "+e.message)).finally(()=>{setBusy("");loadStats();});};
+  if(!st)return <div className="text-slate-500">loading…</div>;
+  const off=!st.enabled;
+  return <div className="grid lg:grid-cols-2 gap-4">
+    <div className="card p-4">
+      <div className="text-sm mb-2">Qdrant index</div>
+      {off?<div className="text-xs text-slate-500">vector store disabled — enable with <code className="text-slate-300">./install.sh --vector</code> (or set <code>vector_store.enabled: true</code>).</div>
+        :st.reachable?<div className="text-sm space-y-1">
+          <div>Status: <Dot ok={true}/> reachable</div>
+          <div className="text-slate-400">points: <span className="text-slate-200">{st.points}</span></div>
+          <div className="text-slate-400">collection: <span className="text-slate-200">{st.collection}</span></div>
+          <div className="text-slate-400">dim: {st.dim} · on_disk: {String(st.on_disk)}</div></div>
+        :<div className="text-xs text-rose-400">Qdrant unreachable: {st.error}</div>}
+      {!off&&<div className="flex gap-2 mt-3">
+        <button onClick={()=>sync("insert")} disabled={!!busy} className="px-3 py-1 bg-sky-700 rounded text-sm disabled:opacity-50">{busy==="insert"?"syncing…":"Sync new"}</button>
+        <button onClick={()=>sync("rebuild")} disabled={!!busy} className="px-3 py-1 bg-amber-800 rounded text-sm disabled:opacity-50">{busy==="rebuild"?"rebuilding…":"Rebuild"}</button></div>}
+      {out&&<pre className="whitespace-pre-wrap text-xs mt-3 text-slate-400">{out}</pre>}
+    </div>
+    <div className="card p-4">
+      <div className="text-sm mb-2">Semantic search</div>
+      <div className="flex gap-2 flex-wrap"><input value={q} onChange={e=>setQ(e.target.value)} onKeyDown={e=>e.key==="Enter"&&search()}
+        placeholder="search memories…" className="flex-1 min-w-[12rem] bg-slate-900 rounded px-2 py-1 text-sm"/>
+        <TypeSelect value={type} onChange={setType}/>
+        <button onClick={search} disabled={off} className="px-3 bg-sky-700 rounded text-sm disabled:opacity-50">Search</button></div>
+      {hits&&hits.note&&<div className="text-amber-400 text-xs mt-3">{hits.note}</div>}
+      {hits&&hits.hits&&<div className="mt-3 space-y-1">{hits.hits.map(h=><div key={h.file} className="text-xs">
+        <span className="text-cyan-300">{h.score.toFixed(3)}</span> <span className="text-slate-300">{h.name||h.file}</span>
+        <span className="text-slate-500"> — {h.description}</span></div>)}
+        {!hits.hits.length&&<div className="text-slate-600 text-xs">no matches</div>}</div>}
+    </div></div>;
+}
+
 function Skills(){const [s,setS]=useState(null);useEffect(()=>{j("/api/skills").then(setS);},[]);
   if(!s)return <div className="text-slate-500">loading…</div>;
   return <div className="grid gap-4 lg:grid-cols-2"><div className="card p-4"><div className="text-sm mb-2">Installed skills ({s.installed.length})</div>
@@ -124,7 +204,7 @@ function Queues(){const [qd,setQd]=useState(null);useEffect(()=>{j("/api/queues"
 
 function App(){
   const [tab,setTab]=useState("Dashboard");
-  const tabs={Dashboard:<Dashboard/>,Memories:<Memories/>,Graph:<Graph/>,Skills:<Skills/>,Queues:<Queues/>};
+  const tabs={Dashboard:<Dashboard/>,Memories:<Memories/>,Recall:<Recall/>,Vector:<Vector/>,Graph:<Graph/>,Skills:<Skills/>,Queues:<Queues/>};
   return <div className="max-w-6xl mx-auto p-5">
     <div className="flex items-center gap-3 mb-5">
       <span className="text-2xl">🧠</span><span className="text-xl font-semibold">engram</span>
