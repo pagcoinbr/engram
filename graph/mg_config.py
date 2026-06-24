@@ -28,7 +28,25 @@ import engram_llm  # provider abstraction (ollama | claude); embed() = ollama no
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 LLM_MODEL = os.environ.get("MG_LLM_MODEL", "llama3.1:8b")
 SMALL_MODEL = os.environ.get("MG_SMALL_MODEL", "llama3.1:8b")
-NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687")
+
+
+def _neo4j_uri() -> str:
+    """Resolve the Neo4j bolt URI: NEO4J_URI env override > engram.yaml
+    `graph.neo4j_uri` > loopback default. Honors the operator's engram.yaml so the
+    setting isn't decorative; defensive so a missing/unreadable config still works."""
+    if os.environ.get("NEO4J_URI"):
+        return os.environ["NEO4J_URI"]
+    try:
+        import memory_ai  # in ~/.claude (already on sys.path above)
+        uri = (memory_ai.load().get("graph", {}) or {}).get("neo4j_uri")
+        if uri:
+            return str(uri).strip()
+    except Exception:
+        pass
+    return "bolt://127.0.0.1:7687"
+
+
+NEO4J_URI = _neo4j_uri()
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
 CANONICAL_GROUP = "canonical"   # group_id for gate-approved memories
 

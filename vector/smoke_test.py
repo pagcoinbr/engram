@@ -9,8 +9,14 @@ Run:
 (or just `python vector/smoke_test.py` once configured).
 """
 from __future__ import annotations
+import os
 import sys
 from pathlib import Path
+
+# Hermetic by default: never recreate/tear down the operator's real collection.
+# An explicit ENGRAM_VECTOR_COLLECTION still wins (but is refused if it matches
+# the configured real collection — that's the index this test must never touch).
+os.environ.setdefault("ENGRAM_VECTOR_COLLECTION", "engram_smoke")
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -29,6 +35,11 @@ SAMPLES = [
 
 
 def main() -> int:
+    real = (vc._vcfg().get("collection") or "engram_memory").strip()
+    if vc.collection_name() == real:
+        print(f"REFUSING to run against the real collection {real!r} — "
+              "set ENGRAM_VECTOR_COLLECTION to a throwaway name (e.g. engram_smoke).")
+        return 2
     try:
         store = EngramVectorStore()
     except vc.VectorUnavailable as e:
