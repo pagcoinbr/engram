@@ -14,6 +14,19 @@ REPO="$(memory_repo)"
 REMOTE_PATH="$(memory_remote_path)"
 LOCAL_DIR="$(memory_dir)"
 
+# 0. Local recoverability snapshot. Remote deletes are git-recoverable ONLY when
+# CLAUDE_MEMORY_REPO is set; with no remote (local-first) a plain rm is permanent.
+# Always snapshot to .trash/ first so every deletion has a local undo. .trash is a
+# subdir, so MEM_DIR.glob("*.md") (non-recursive) never picks these up.
+TRASH_DIR="${LOCAL_DIR}/.trash"
+if [[ -f "${LOCAL_DIR}/${FILENAME}" ]]; then
+    mkdir -p "$TRASH_DIR"
+    TS="$(date -u +%Y%m%dT%H%M%SZ)"
+    cp -p "${LOCAL_DIR}/${FILENAME}" "${TRASH_DIR}/${TS}-${FILENAME}"
+    echo "[delete-memory] Backed up to .trash/${TS}-${FILENAME} (restore: mv it back, then save_memory.sh)"
+    find "$TRASH_DIR" -type f -name '*.md' -mtime +90 -delete 2>/dev/null || true
+fi
+
 # 1. Remove the local file
 if [[ -f "${LOCAL_DIR}/${FILENAME}" ]]; then
     rm -f "${LOCAL_DIR}/${FILENAME}"

@@ -28,7 +28,7 @@ Env tunables: CLAUDE_MEMORY_SLUG, MEM_AGE_FULL_DAYS, MEM_FREQ_CAP,
               MEM_SURV_CAP, MEM_SUSPECT_AGE_DAYS, MEM_W_AGE/W_FREQ/W_SURV.
 """
 from __future__ import annotations
-import json, math, os, re, subprocess, sys, glob
+import json, math, os, re, subprocess, sys, glob, gzip
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,13 +48,31 @@ REMOTE_DIR = f"{USERNAME}/projects/{SLUG}/memory"
 
 # ---- tunables -------------------------------------------------------------
 AGE_FULL_DAYS    = float(os.environ.get("MEM_AGE_FULL_DAYS", "365"))
-FREQ_CAP         = float(os.environ.get("MEM_FREQ_CAP", "40"))
+FREQ_CAP         = float(os.environ.get("MEM_FREQ_CAP", "40"))   # legacy floor for freq normalisation
 SURV_CAP         = float(os.environ.get("MEM_SURV_CAP", "5"))
 SUSPECT_AGE_DAYS = float(os.environ.get("MEM_SUSPECT_AGE_DAYS", "7"))
 W_AGE  = float(os.environ.get("MEM_W_AGE",  "0.35"))
 W_FREQ = float(os.environ.get("MEM_W_FREQ", "0.40"))
 W_SURV = float(os.environ.get("MEM_W_SURV", "0.25"))
 REVIEW_BASE_DAYS = 7
+
+# Frequency discrimination (fixes the "every memory is mentioned everywhere"
+# saturation): a token appearing in more than DISTINCT_DF_FRAC of human sessions
+# is "generic" and excluded; a memory's frequency = popularity of its most-
+# discussed *distinctive* token. freq is then self-normalised against a corpus
+# percentile (FREQ_NORM_PCTL) so the score discriminates regardless of corpus size.
+DISTINCT_DF_FRAC   = float(os.environ.get("MEM_DISTINCT_DF_FRAC", "0.10"))
+KW_MAX             = int(os.environ.get("MEM_KW_MAX", "16"))
+FREQ_NORM_PCTL     = float(os.environ.get("MEM_FREQ_NORM_PCTL", "90"))
+# A memory only earns "corroborated" once it has matured: survived >=1
+# distillation pass OR aged past CORROB_MIN_AGE_DAYS. This stops a brand-new
+# (possibly self-asserting / injected) memory from being auto-trusted purely
+# because its topic is frequently discussed.
+CORROB_MIN_AGE_DAYS = float(os.environ.get("MEM_CORROB_MIN_AGE_DAYS", "7"))
+# Optional: cap how many transcripts the frequency pass scans (0 = all). A
+# stop-gap for speed until the incremental index lands; sampling still yields a
+# representative DF distribution because DISTINCT_DF_FRAC is relative.
+FREQ_SAMPLE        = int(os.environ.get("MEM_FREQ_SAMPLE", "0"))
 
 # Self-persistence / injection patterns. A *recent, uncorroborated* memory that
 # matches these is treated as a possible "memory virus" and routed to a human.
@@ -161,18 +179,25 @@ def resolve_created(fname: str, fm: dict, path: Path, st_mem: dict) -> str:
 
 # ---- keyword extraction + frequency ---------------------------------------
 def keywords(fname: str, fm: dict) -> set[str]:
-    toks = set()
+    """Candidate match terms, ordered by likely distinctiveness. File-stem tokens
+    (e.g. tron / lnbits / depix / rebalancer) are the strongest identifiers, so
+    they come FIRST; name/description terms follow. We deliberately do NOT rank by
+    length (that prefers generic long words like 'infrastructure' and drops
+    distinctive short ones). Final per-token generic-ness is decided corpus-wide
+    by document-frequency in build_frequency()."""
+    ordered = []
+    seen = set()
+    def add(tok):
+        tl = tok.lower()
+        if len(tl) >= 4 and tl not in STOPWORDS and tl not in seen:
+            seen.add(tl); ordered.append(tl)
     stem = re.sub(r"\.md$", "", fname)
     for t in re.split(r"[_\-]", stem):
-        if len(t) >= 4 and t.lower() not in STOPWORDS:
-            toks.add(t.lower())
+        add(t)
     for field in (fm.get("name", ""), fm.get("description", "")):
         for w in re.findall(r"[A-Za-z][A-Za-z0-9_.-]{4,}", field):
-            wl = w.lower()
-            if wl not in STOPWORDS:
-                toks.add(wl)
-    # keep the most distinctive (longest) handful to limit false matches
-    return set(sorted(toks, key=len, reverse=True)[:8])
+            add(w)
+    return set(ordered[:KW_MAX])
 
 SYSREMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
 
@@ -208,39 +233,145 @@ def human_text(path: str) -> str:
     text = SYSREMINDER_RE.sub("", text)
     return text.lower()
 
-def build_frequency(mem_keywords: dict[str, set[str]]) -> dict[str, int]:
-    """Count distinct sessions whose HUMAN-typed text mentions a memory's
-    keywords (injected context excluded — see human_text)."""
+# ---- incremental transcript-token cache -----------------------------------
+# JSON-parsing all ~150k transcripts every run is what made scoring take ~6 min
+# and time the weekly hook out at 180 s. We cache, per transcript (keyed by
+# mtime+size), the SET of candidate tokens in its human text. The cache is
+# vocabulary-INDEPENDENT (it stores the transcript's own tokens, not the
+# intersection with current memory keywords), so editing a memory's
+# name/description does NOT invalidate it — document-frequency is recomputed by
+# in-memory set intersection. Only new/changed transcripts are parsed.
+FREQ_CACHE = MEM_DIR / ".freq_cache.json.gz"
+CACHE_SCHEMA = 2
+TOKEN_RE = re.compile(r"[a-z][a-z0-9_.-]{3,}")
+
+def _candidate_tokens(text: str) -> list[str]:
+    return sorted({w for w in TOKEN_RE.findall(text)
+                   if len(w) >= 4 and w not in STOPWORDS})
+
+def transcript_tokens(path: str) -> list[str]:
+    text = human_text(path)
+    return _candidate_tokens(text) if text else []
+
+def _load_freq_cache() -> dict:
+    try:
+        with gzip.open(FREQ_CACHE, "rt", encoding="utf-8") as fh:
+            c = json.load(fh)
+        if c.get("schema") == CACHE_SCHEMA and isinstance(c.get("transcripts"), dict):
+            return c
+    except Exception:
+        pass
+    return {"schema": CACHE_SCHEMA, "transcripts": {}}
+
+def _save_freq_cache(cache: dict) -> None:
+    try:
+        tmp = FREQ_CACHE.with_suffix(".gz.tmp")
+        with gzip.open(tmp, "wt", encoding="utf-8") as fh:
+            json.dump(cache, fh, separators=(",", ":"))
+        tmp.replace(FREQ_CACHE)
+    except Exception as e:
+        print(f"[score] WARN: could not write freq cache: {e}", file=sys.stderr)
+
+def build_frequency(mem_keywords: dict[str, set[str]]) -> tuple[dict[str, int], int]:
+    """Per-memory conversation frequency that discriminates, computed incrementally.
+
+    Each candidate token's session document-frequency is the number of distinct
+    HUMAN-typed sessions containing it (injected context excluded — see
+    human_text). A token in more than DISTINCT_DF_FRAC of sessions is "generic"
+    (e.g. 'service', 'gateway') and dropped. A memory's frequency = the
+    document-frequency of its most-discussed *distinctive* token (0 if it has
+    none) — replacing the old "any keyword matches → +1" union, which saturated.
+
+    Transcript tokens are read from / written to a per-transcript cache so only
+    new or changed transcripts are JSON-parsed. Returns (freq_by_name, n_sessions)."""
     all_kw = set()
     for kws in mem_keywords.values():
         all_kw |= kws
-    freq = {name: 0 for name in mem_keywords}
-    for tr in glob.glob(str(PROJ_DIR / "*.jsonl")):
-        text = human_text(tr)
-        if not text:
+
+    cache = _load_freq_cache()
+    tdict = cache["transcripts"]
+    trs = sorted(glob.glob(str(PROJ_DIR / "*.jsonl")))
+    if FREQ_SAMPLE and len(trs) > FREQ_SAMPLE:
+        step = len(trs) / FREQ_SAMPLE
+        trs = [trs[int(i * step)] for i in range(FREQ_SAMPLE)]
+
+    df = {kw: 0 for kw in all_kw}
+    n_sessions = 0
+    live = set()
+    dirty = False
+    parsed = 0
+    for tr in trs:
+        name = os.path.basename(tr)
+        live.add(name)
+        try:
+            sttr = os.stat(tr)
+        except OSError:
             continue
-        present = {kw for kw in all_kw if kw in text}
-        if not present:
+        ent = tdict.get(name)
+        if ent and ent.get("m") == int(sttr.st_mtime) and ent.get("s") == sttr.st_size:
+            toks = ent["t"]
+        else:
+            toks = transcript_tokens(tr)
+            tdict[name] = {"m": int(sttr.st_mtime), "s": sttr.st_size, "t": toks}
+            dirty = True
+            parsed += 1
+            # Periodically flush so a cold build that gets killed (e.g. the 180s
+            # weekly-hook cap) still persists progress and self-heals next run
+            # instead of looping forever on a never-written cache.
+            if parsed % 20000 == 0:
+                _save_freq_cache(cache)
+        if not toks:
             continue
-        for name, kws in mem_keywords.items():
-            if kws & present:
-                freq[name] += 1
-    return freq
+        n_sessions += 1
+        for kw in (set(toks) & all_kw):   # C-level set intersection (fast)
+            df[kw] += 1
+
+    # Archived corpus: cache entries whose raw .jsonl is no longer on disk (moved
+    # or compressed by transcript retention) STILL count — the cache is the
+    # authoritative corpus for frequency; the raw file is only needed to (re)derive
+    # tokens. So retention can shrink disk without distorting the frequency signal.
+    # We therefore do NOT prune here; intentional cleanup is via `--vacuum`.
+    if not FREQ_SAMPLE:
+        for name, ent in tdict.items():
+            if name in live:
+                continue
+            toks = ent.get("t")
+            if toks:
+                n_sessions += 1
+                for kw in (set(toks) & all_kw):
+                    df[kw] += 1
+    if dirty:
+        _save_freq_cache(cache)
+    print(f"[score] freq: {len(trs)} transcripts ({parsed} parsed, "
+          f"{len(trs) - parsed} from cache), {n_sessions} with human text",
+          file=sys.stderr)
+
+    ceil_df = max(1, int(DISTINCT_DF_FRAC * n_sessions))
+    freq = {}
+    for name, kws in mem_keywords.items():
+        distinctive = [df[kw] for kw in kws if df.get(kw, 0) <= ceil_df]
+        freq[name] = max(distinctive) if distinctive else 0
+    return freq, n_sessions
 
 # ---- scoring --------------------------------------------------------------
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
-def score_memory(age_days, freq, survival, suspicion):
+def score_memory(age_days, freq, survival, suspicion, freq_norm):
     age_s  = clamp(math.log1p(max(age_days, 0)) / math.log1p(AGE_FULL_DAYS), 0, 1)
-    freq_s = clamp(freq / FREQ_CAP, 0, 1)
+    # log-scaled and self-normalised against a corpus percentile (freq_norm), so
+    # freq spreads across [0,1] instead of saturating to 1.0 for everything.
+    freq_s = clamp(math.log1p(max(freq, 0)) / math.log1p(max(freq_norm, 1.0)), 0, 1)
     surv_s = clamp(survival / SURV_CAP, 0, 1)
     conf = W_AGE * age_s + W_FREQ * freq_s + W_SURV * surv_s
+    # "earns trust over time": a memory must have matured before it can be
+    # corroborated — survived a distillation pass, or aged past the threshold.
+    matured = survival >= 1 or age_days >= CORROB_MIN_AGE_DAYS
     if suspicion:
         status = "suspect"
     elif conf >= 0.66 and survival >= 3:
         status = "fixed"
-    elif conf >= 0.33:
+    elif conf >= 0.33 and matured:
         status = "corroborated"
     else:
         status = "provisional"
@@ -263,6 +394,24 @@ def main():
         print(f"[score] recorded survival for {len([x for x in names if x.strip()])} memories")
         return
 
+    if "--vacuum" in args:
+        # Drop freq-cache entries whose transcript is GENUINELY gone — not present
+        # as a raw .jsonl, a compressed .jsonl.gz, or under an archive/ subdir.
+        # (Archived transcripts are kept so they keep contributing to frequency.)
+        cache = _load_freq_cache()
+        tdict = cache.get("transcripts", {})
+        archive = PROJ_DIR / "archive"
+        removed = 0
+        for name in list(tdict):
+            if (PROJ_DIR / name).exists() or (PROJ_DIR / (name + ".gz")).exists() \
+               or (archive / name).exists() or (archive / (name + ".gz")).exists():
+                continue
+            del tdict[name]; removed += 1
+        _save_freq_cache(cache)
+        print(f"[score] vacuum: removed {removed} dead cache entries, "
+              f"{len(tdict)} remain")
+        return
+
     as_json = "--json" in args
     if not MEM_DIR.is_dir():
         print(f"[score] no memory dir at {MEM_DIR}", file=sys.stderr); sys.exit(1)
@@ -278,7 +427,15 @@ def main():
         mem_fm[p.name] = frontmatter(txt)
         mem_kw[p.name] = keywords(p.name, mem_fm[p.name])
 
-    freq = build_frequency(mem_kw)
+    freq, n_sessions = build_frequency(mem_kw)
+    # self-normalising scale: the FREQ_NORM_PCTL-th percentile of non-zero
+    # frequencies (floored at the legacy FREQ_CAP) is treated as "fully frequent".
+    nz = sorted(v for v in freq.values() if v > 0)
+    if nz:
+        idx = min(len(nz) - 1, int(round((FREQ_NORM_PCTL / 100.0) * (len(nz) - 1))))
+        freq_norm = max(float(nz[idx]), FREQ_CAP)
+    else:
+        freq_norm = FREQ_CAP
 
     rows = []
     for p in files:
@@ -297,7 +454,7 @@ def main():
         body = mem_text[name]
         persist = bool(PERSIST_RE.search(body))
         suspicion = persist and survival == 0 and f <= 1 and age_days <= SUSPECT_AGE_DAYS
-        conf, status, review, parts = score_memory(age_days, f, survival, suspicion)
+        conf, status, review, parts = score_memory(age_days, f, survival, suspicion, freq_norm)
         st_mem["last_status"] = status
         st_mem["last_score"] = conf
         st_mem["last_scored"] = iso(now())

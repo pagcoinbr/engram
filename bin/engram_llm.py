@@ -182,24 +182,53 @@ def _claude_generate(prompt: str, role: str, cfg) -> str:
     cc = cfg.get("claude", {})
     claude_bin = cc.get("bin", "claude")
     timeout = int(cc.get("timeout_seconds", 600))
-    cmd = [claude_bin, "-p", prompt, "--output-format", "json",
+    cmd = [claude_bin, "-p", prompt, "--output-format", "text",
            "--max-turns", str(cc.get("max_turns", 1))]
     if cc.get("model"):
         cmd += ["--model", cc["model"]]
     # Restrict tools to nothing — this is pure text generation in an unattended loop.
     if cc.get("allowed_tools_flag", "--allowedTools"):
         cmd += [cc.get("allowed_tools_flag", "--allowedTools"), cc.get("allowed_tools", "")]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True)
-    except FileNotFoundError:
-        raise RuntimeError(f"claude CLI not found (configured bin: {claude_bin!r})")
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"claude -p failed (exit {e.returncode}): {(e.stderr or '')[:300]}")
-    try:
-        data = json.loads(out.stdout)
-        return data.get("result", "") if isinstance(data, dict) else str(data)
-    except json.JSONDecodeError:
-        return out.stdout.strip()  # tolerate plain-text output
+    # The unattended timer window can hit transient failures (OAuth token refresh,
+    # a brief usage cap, a flaky spawn) that surface as exit 1 with empty stderr —
+    # which used to skip the WHOLE week's distillation. Retry a few times with
+    # backoff so one blip doesn't lose the run. FileNotFoundError is NOT retried
+    # (a missing bin won't fix itself).
+    import time as _time
+    attempts = max(1, int(cc.get("retries", 3)))
+    backoff = float(cc.get("retry_backoff_seconds", 5))
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True)
+            break
+        except FileNotFoundError:
+            raise RuntimeError(f"claude CLI not found (configured bin: {claude_bin!r})")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            detail = (getattr(e, "stderr", "") or "")[:300]
+            kind = "timeout" if isinstance(e, subprocess.TimeoutExpired) else f"exit {e.returncode}"
+            last_err = RuntimeError(f"claude -p failed ({kind}): {detail}")
+            if attempt < attempts - 1:
+                _time.sleep(backoff * (attempt + 1))
+    else:
+        raise last_err
+    # With --output-format text the CLI prints only the final result text. Some CLI
+    # versions still emit stream-json (a LIST of events, or a single dict) even so —
+    # extract the result defensively so the caller never ingests raw event wrappers.
+    text = out.stdout.strip()
+    if text[:1] in ("[", "{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data.get("result", text)
+            if isinstance(data, list):
+                for e in reversed(data):
+                    if isinstance(e, dict) and e.get("type") == "result" \
+                            and isinstance(e.get("result"), str):
+                        return e["result"]
+        except json.JSONDecodeError:
+            pass
+    return text
 
 
 # ---------------------------------------------------------------------------

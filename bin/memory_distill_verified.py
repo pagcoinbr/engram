@@ -60,6 +60,30 @@ SECRET_RE = re.compile(
 def looks_secret(line: str) -> bool:
     return bool(SECRET_RE.search(line))
 
+# A previously auto-generated "## Reference facts (verbatim — auto-preserved …)"
+# trailer must not be re-fed to the model (it bloats the prompt and accretes across
+# passes). We strip it from the LLM INPUT, but still extract the checklist from the
+# FULL body so any fact that lives only in the trailer is still preserved.
+PRIOR_APPENDIX_RE = re.compile(r"\n#+\s*Reference facts \(verbatim.*\Z",
+                               re.DOTALL | re.IGNORECASE)
+
+def strip_prior_appendix(text: str) -> str:
+    return PRIOR_APPENDIX_RE.sub("\n", text)
+
+def fact_present(disp: str, kind: str, hay: str, hay_norm: str) -> bool:
+    """True if a fact is already conveyed by the prose, tolerant of formatting.
+    The old `formatted-token in prose` substring check produced false 'missing'
+    (e.g. fact `port 3110` never matches prose `:3110`), which re-appended facts the
+    prose already stated — the accretion this dedup fixes."""
+    d = disp.lower()
+    if d in hay:
+        return True
+    if kind == "port":
+        num = re.sub(r"\D", "", d)
+        return bool(num) and re.search(rf"(?<!\d){num}(?!\d)", hay) is not None
+    dn = re.sub(r"[^a-z0-9]", "", d)        # separator-insensitive (paths/files/env)
+    return len(dn) >= 4 and dn in hay_norm
+
 def extract_facts(text: str):
     seen = {}
     for pat, kind in FACT_PATTERNS:
@@ -106,6 +130,15 @@ SIMPLE_PROMPT = (
     "vars, commands). Do NOT invent facts. Output ONLY the merged memory.\n\n")
 
 def ollama_stream(prompt, cfg):
+    # Honor the configured backend. On backend=claude (no GPU box — e.g. testserver)
+    # there is no local Ollama to stream from; route the SAME prompt through the
+    # backend-aware provider (single-shot `claude -p`) and return the (text, done,
+    # elapsed) contract the caller expects. Only backend=ollama streams natively below.
+    import engram_llm
+    if engram_llm.backend(cfg) != "ollama":
+        _t0 = time.time()
+        out = engram_llm.generate(prompt, "distill", cfg)
+        return out, "stop", time.time() - _t0
     host = memory_ai.ollama_host(cfg); model = memory_ai.expert_model("distill", cfg)
     oc = cfg.get("ollama", {})
     body = json.dumps({"model": model, "prompt": prompt, "stream": True,
@@ -139,7 +172,9 @@ def distill_cluster(key, files, cfg=None, verbose=False):
     facts = {}; fact_src = {}; all_caveats = []
     for f in files:
         body = (MEM / f).read_text(errors="ignore")
-        members_text += f"### {f}\n{body}\n\n---\n\n"
+        # Feed the model the prose WITHOUT any prior auto-appendix (no re-parroting,
+        # no accretion); extract the preservation checklist from the FULL body.
+        members_text += f"### {f}\n{strip_prior_appendix(body)}\n\n---\n\n"
         for norm, (disp, kind) in extract_facts(body).items():
             facts.setdefault(norm, (disp, kind))
             if norm not in fact_src:
@@ -159,8 +194,10 @@ def distill_cluster(key, files, cfg=None, verbose=False):
             break
 
     out_low = out.lower()
-    present = [n for n in facts if n in out_low]
-    missing = [n for n in facts if n not in out_low]
+    out_norm = re.sub(r"[^a-z0-9]", "", out_low)
+    present = {n for n, (disp, kind) in facts.items()
+              if fact_present(disp, kind, out_low, out_norm)}
+    missing = [n for n in facts if n not in present]
     natural_cov = len(present) / max(1, len(facts))
     present_cav = [c for c, _ in all_caveats if c.lower() in out_low]
     missing_cav = [(c, f) for c, f in all_caveats if c.lower() not in out_low]
@@ -185,7 +222,9 @@ def distill_cluster(key, files, cfg=None, verbose=False):
 
     final = out.rstrip() + appendix + "\n"
     final_low = final.lower()
-    final_cov = len([n for n in facts if n in final_low]) / max(1, len(facts))
+    final_norm = re.sub(r"[^a-z0-9]", "", final_low)
+    final_cov = len([n for n, (disp, kind) in facts.items()
+                     if fact_present(disp, kind, final_low, final_norm)]) / max(1, len(facts))
     report = {
         "cluster": key, "notes": files,
         "hard_facts": len(facts), "caveats": len(all_caveats),
