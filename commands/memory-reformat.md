@@ -1,5 +1,5 @@
 ---
-description: Convert existing memories to the Summary → numbered Index → Body shape (feedback_memory_file_format) so each file is graspable at a glance. The prose rewrite runs on the LOCAL Ollama LLM (never Anthropic tokens, content stays on the LAN); facts are preserved, nothing is dropped, and every push is human-gated. Dry-run by default.
+description: Convert existing memories to the Summary → numbered Index → Body shape (feedback_memory_file_format) so each file is graspable at a glance. The prose rewrite runs on the configured backend (engram.yaml — LOCAL Ollama if reachable to keep content on the LAN, else Claude); facts are preserved, nothing is dropped, and every push is human-gated. Dry-run by default.
 argument-hint: empty/"dry-run" (default) | "apply" | "memory=<name>" | "big-min=<chars>"
 ---
 
@@ -31,9 +31,11 @@ left alone. Show the table; if unscoped, work top-down and tell the user how man
 (`name`/`description`/`type`) **verbatim** — you are not changing it. Note the existing
 `MEMORY.md` one-line description (you'll reuse it on save).
 
-## Step 3 — reformat on the LOCAL LLM (Ollama MCP, in the background)
+## Step 3 — reformat on the configured backend
 
-Run the Ollama call **in the background** — wrap it in a general-purpose `Agent` spawned
+First resolve the backend: `python3 -c "import sys;sys.path.insert(0,'$HOME/.claude');import memory_ai,engram_llm;print(engram_llm.backend(memory_ai.load()))"`. When it is `claude` (the current setting on this box) or the Ollama GPU host is unreachable, **Claude performs the reformat itself** using the same prompt/fields below — skip the Ollama call entirely.
+
+**If `ollama` (and reachable):** run the Ollama call **in the background** — wrap it in a general-purpose `Agent` spawned
 with `run_in_background: true` (Ollama is slow/heavy; never block the session — see
 `[[feedback_ollama_always_background]]`). Have the agent call **`mcp__ollama__ollama_code`**
 with:
@@ -56,9 +58,11 @@ The "verbatim" trap: telling the model to copy tables byte-for-byte makes `self_
 harmless column-padding changes. Phrase it as cell-value/fact preservation + "spelling
 unchanged" (catches the model's own typos) and let whitespace normalise.
 
-If `mcp__ollama__ollama_code` is not loaded, `ToolSearch` for it; if still unavailable, ask the
-user to restart the Ollama MCP — **never** shell out / curl-bypass the LAN LLM (see
-`[[feedback_no_dodge_on_hook_deny]]`, `[[feedback_offload_to_ollama]]`).
+When `backend: ollama`: if `mcp__ollama__ollama_code` is not loaded, `ToolSearch` for it; if still
+unavailable, **fall back to having Claude do the reformat directly** (same prompt/fields) — do NOT
+stall the pass. Never shell out / curl-bypass to reach a LAN LLM (see
+`[[feedback_no_dodge_on_hook_deny]]`, `[[feedback_offload_to_ollama]]`); the legitimate fallback is
+Claude itself, matching `engram.yaml`'s `fallback:` setting.
 
 ## Step 4 — GATE (always, before any push)
 
@@ -84,10 +88,10 @@ continue to the next, or stop and let the user resume with `/memory-reformat` la
 
 - Dry-run is the default; Step 4 gates every push.
 - **Restructure, never distill** — no fact may be dropped; `dropped` must be empty to save.
-- The **local LLM** does all prose (Ollama MCP, `qwen3.6:35b`); Claude only orchestrates.
-- The Ollama call runs in the **background** (background Agent), never blocking the session.
+- Prose rewriting runs on the **configured backend** (`engram.yaml`): Ollama (`mcp__ollama__ollama_code`, `qwen3.6:35b`) when `backend: ollama` and reachable, else Claude does it directly. Don't stall the pass on an unreachable Ollama.
+- When using Ollama, run it in the **background** (background Agent), never blocking the session.
 - Frontmatter (`name`/`description`/`type`) and filename are preserved unchanged.
-- Only `save_memory.sh` touches the store + `MEMORY.md`; changes are git-recoverable.
-- Never bypass the Ollama MCP for the rewrite.
+- Only `save_memory.sh` touches the store + `MEMORY.md`. Note: changes are git-recoverable ONLY if `CLAUDE_MEMORY_REPO` is configured (see the no-remote caveat); otherwise keep a local backup before destructive edits.
+- Never shell out / curl-bypass to reach a LAN LLM; the legitimate non-Ollama path is Claude itself.
 
 $ARGUMENTS

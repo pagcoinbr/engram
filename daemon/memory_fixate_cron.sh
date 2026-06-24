@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# memory_fixate_cron.sh — twice-daily LIGHT memory maintenance (systemd timer).
+# memory_fixate_cron.sh — 4x-daily memory maintenance (systemd timer).
 #
-# Gated by memory_ai.yaml `local_enabled`. All work is local (Ollama on the LAN):
-#   1. score + auto-QUARANTINE suspect/injection memories (reversible)
-#   2. CURATION: semantic near-duplicate / cluster detection (embeddings expert)
-#   3. FIXATION: trust-signal snapshot
-#   4. surface the report, THEN (best-effort, bounded) draft cluster distillations
+# Time-of-day dispatch (schedule.claude_hours in memory_ai.yaml):
+#   DAYTIME  → claude -p subagent: API-backed scoring + dedup review + report
+#   NIGHTTIME → full local Ollama pipeline: score/quarantine/embed/distill/harvest
 #
-# It NEVER merges or deletes memories unattended — those stay human-gated via
-# /memory-curate apply and /memory-fixate apply. Suspects are quarantined (moved
-# out of recall), never deleted.
+# Neither path merges or deletes memories unattended. Suspects quarantined (reversible).
 
 set -uo pipefail
 source "${HOME}/.claude/memory_lib.sh" 2>/dev/null || true
 AI="${HOME}/.claude/memory_ai.py"
+# Heavy/vector scripts (score, light-curate, distill) need qdrant-client + fastembed
+# + numpy. Run them on the engram vector venv — the SAME interpreter the engram-vector
+# MCP server uses — because the systemd timer's /usr/bin/python3 is PEP-668
+# externally-managed and lacks those, which silently degrades the Duplicate Finder to
+# cosine ("vector store unreachable"). Fall back to python3 if the venv is missing.
+PYBIN="${HOME}/.claude/vector/venv/bin/python"
+[[ -x "$PYBIN" ]] || PYBIN="$(command -v python3)"
 LOGROOT="${HOME}/.claude/logs/fixation"
 mkdir -p "$LOGROOT"
 exec >>"${LOGROOT}/cron.log" 2>&1
@@ -32,9 +35,55 @@ QUAR="${MEM_DIR}/.quarantine"
 TS="$(date +%Y%m%d-%H%M%S)"; OUTDIR="${LOGROOT}/${TS}"
 REPORT="${OUTDIR}/REPORT.md"; SCORES="${OUTDIR}/scores.json"
 mkdir -p "$OUTDIR" "$QUAR"
-echo "[$(date -Iseconds)] maintenance start (store=$MEM_DIR)"
 
-python3 "${HOME}/.claude/memory_score.py" --json > "$SCORES" 2>/dev/null \
+# ── Time-of-day dispatch ─────────────────────────────────────────────────────
+# Daytime (schedule.claude_hours): claude -p subagent — API reasoning, no Ollama.
+# Nighttime: fall through to the full Ollama pipeline (harvest/distill/pipeline).
+HOUR=$(date +%-H)
+_CH="$(python3 "$AI" --get schedule.claude_hours 2>/dev/null || echo '[7,20]')"
+C_START=$(echo "$_CH" | python3 -c "import json,sys; print(json.load(sys.stdin)[0])" 2>/dev/null || echo 7)
+C_END=$(echo   "$_CH" | python3 -c "import json,sys; print(json.load(sys.stdin)[1])" 2>/dev/null || echo 20)
+if (( HOUR >= C_START && HOUR < C_END )); then
+    echo "[$(date -Iseconds)] daytime run (hour=${HOUR}) -> pre-compute Ollama, then claude -p analysis"
+    (
+        # Pre-run Ollama work in shell so claude -p only does text analysis (no tool calls to Ollama).
+        # This avoids the pre-tool-use hook blocking writes to ~/.claude/ and keeps claude -p fast.
+        "$PYBIN" "${HOME}/.claude/memory_score.py" --json > "$SCORES" 2>/dev/null \
+            || { echo "[$(date -Iseconds)] ERROR scoring; skip daytime run"; exit 1; }
+        "$PYBIN" "${HOME}/.claude/memory_light_curate.py" > "${OUTDIR}/curate.txt" 2>/dev/null
+
+        # Feed pre-computed data to claude -p for analysis; capture report via stdout (no Write tool).
+        SCORES_SNIPPET=$(python3 -c "import sys; print(open('${SCORES}').read()[:3000])" 2>/dev/null)
+        CURATE_SNIPPET=$(head -100 "${OUTDIR}/curate.txt" 2>/dev/null)
+
+        MEMORY_SUBAGENT=1 claude -p \
+"Analyze this memory maintenance data and return ONLY a markdown report (no other text).
+Do NOT call any tools — all data is provided below.
+
+SCORES (JSON):
+${SCORES_SNIPPET}
+
+LIGHT CURATE OUTPUT:
+${CURATE_SNIPPET}
+
+Return a concise markdown report with these sections:
+## Daytime maintenance — $(date -Iseconds)
+## Status (one line)
+## Merge candidates (top 3-5 file pairs + one-line rationale each)
+## Stale / possibly wrong (memories that look outdated)
+## Quarantine (any suspects noted in the curate output)
+No tool calls. Output only the markdown." \
+            --allowedTools "" > "$REPORT" 2>/dev/null
+
+        ln -sfn "$OUTDIR" "${LOGROOT}/latest"
+        printf '%s\n' "$REPORT" > "${LOGROOT}/.unread"
+        echo "[$(date -Iseconds)] daytime claude -p done -> $REPORT"
+    ) &
+    exit 0
+fi
+echo "[$(date -Iseconds)] nighttime run (hour=${HOUR}) -> Ollama pipeline (store=$MEM_DIR)"
+
+"$PYBIN" "${HOME}/.claude/memory_score.py" --json > "$SCORES" 2>/dev/null \
     || { echo "[$(date -Iseconds)] ERROR scoring; abort"; exit 0; }
 
 {
@@ -68,8 +117,14 @@ if [[ "$(python3 "$AI" --get light_pass.injection_guard.quarantine_suspects 2>/d
 fi
 
 # 2 + 3. light analysis: curation (embeddings) + fixation snapshot
-python3 "${HOME}/.claude/memory_light_curate.py" >> "$REPORT" 2>>"${LOGROOT}/cron.log" \
+"$PYBIN" "${HOME}/.claude/memory_light_curate.py" >> "$REPORT" 2>>"${LOGROOT}/cron.log" \
     || echo "_light pass errored — see cron.log_" >> "$REPORT"
+
+# 3b. structural lint (report-only): Index↔section drift, duplicate headers,
+# dangling wikilinks, frontmatter gaps. Advisory; never blocks.
+{ echo; echo "## Structural lint"; echo; } >> "$REPORT"
+python3 "${HOME}/.claude/memory_lint.py" >> "$REPORT" 2>>"${LOGROOT}/cron.log" \
+    || echo "_lint errored — see cron.log_" >> "$REPORT"
 
 # surface NOW so the report is usable even if distillation drafting is slow
 ln -sfn "$OUTDIR" "${LOGROOT}/latest"
@@ -79,7 +134,7 @@ echo "[$(date -Iseconds)] report surfaced -> $REPORT"
 # 4. heavy, best-effort, bounded: draft cluster distillations (appended)
 if [[ "$(python3 "$AI" --get light_pass.draft_distill 2>/dev/null)" == "true" ]]; then
     { echo; echo "## Proposed distillations (drafts — NOT applied; run /memory-fixate apply to act)"; echo; } >> "$REPORT"
-    python3 "${HOME}/.claude/memory_distill.py" >> "$REPORT" 2>>"${LOGROOT}/cron.log" \
+    "$PYBIN" "${HOME}/.claude/memory_distill.py" >> "$REPORT" 2>>"${LOGROOT}/cron.log" \
         || echo "_distill drafting errored — see cron.log_" >> "$REPORT"
 fi
 echo "[$(date -Iseconds)] maintenance done -> $REPORT"
