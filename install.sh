@@ -161,6 +161,7 @@ if command -v jq >/dev/null; then
       if ([.hooks[$e][]?|.hooks[]?|.command]|index($c))==null then .hooks[$e] += [{"hooks":[{"type":"command","command":$c}]}] else . end' \
       "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"; }
   merge_hook SessionStart "$CLAUDE/memory_curate_check.sh"
+  merge_hook SessionStart "$CLAUDE/codex-availability-warn.sh"
   merge_hook Stop "$CLAUDE/memory_agent.sh"
   merge_hook Stop "$CLAUDE/memory_session_curate.sh"
   say "hooks merged into settings.json"
@@ -184,8 +185,36 @@ case "$DAEMON" in
       [[ -x "$CLAUDE/vector/venv/bin/python" ]] && echo "ENGRAM_VECTOR_PYTHON=$CLAUDE/vector/venv/bin/python"; } > "$HOME/.config/engram/daemon.env"
     sed "s|^ExecStart=.*|ExecStart=$(command -v python3) $CLAUDE/engram-daemon.py --once|" "$REPO/daemon/engram.service" > "$HOME/.config/systemd/user/engram.service"
     cp "$REPO/daemon/engram.timer" "$HOME/.config/systemd/user/engram.timer"
+    # Optional nightly Codex-gated curate+fixate APPLY (headless Claude). ExecStart is
+    # templated to the real $CLAUDE path (honours ENGRAM_CLAUDE_HOME). Enabled (NOT
+    # started) only when MEMORY_NIGHTLY_APPLY=1 — it moves memory unattended; opt in
+    # once you trust the Codex gate + DRYRUN output.
+    # Plain copy — the unit reads ENGRAM_BIN at runtime (no path templated into it).
+    # daemon.env (written above) carries ENGRAM_BIN=$CLAUDE for alternate homes.
+    if [[ -f "$REPO/daemon/memory-nightly-apply.timer" && -f "$REPO/daemon/memory-nightly-apply.service" ]]; then
+      cp "$REPO/daemon/memory-nightly-apply.service" "$HOME/.config/systemd/user/memory-nightly-apply.service"
+      cp "$REPO/daemon/memory-nightly-apply.timer" "$HOME/.config/systemd/user/memory-nightly-apply.timer"
+    elif [[ "${MEMORY_NIGHTLY_APPLY:-0}" == "1" ]]; then
+      warn "MEMORY_NIGHTLY_APPLY=1 but nightly units missing from repo — NOT enabling"
+    fi
     if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable --now engram.timer 2>/dev/null; then
       say "systemd timer enabled (engram.timer); 'sudo loginctl enable-linger $USER' to run when logged out"
+      if [[ "${MEMORY_NIGHTLY_APPLY:-0}" == "1" ]]; then
+        # enable --now is safe here: the timer is Persistent=false with a future
+        # OnCalendar, so --now starts it ticking toward the next 03:37 and never
+        # catch-up-runs an APPLY during install.
+        if [[ -x "$CLAUDE/memory_nightly_apply.sh" && -f "$HOME/.config/systemd/user/memory-nightly-apply.timer" ]]; then
+          systemctl --user enable --now memory-nightly-apply.timer 2>/dev/null \
+            && say "nightly Codex-gated apply ENABLED (active; fires nightly at 03:37)" \
+            || warn "could not enable memory-nightly-apply.timer"
+        else warn "MEMORY_NIGHTLY_APPLY=1 but runner/timer artifacts missing — NOT enabled"; fi
+      elif systemctl --user is-enabled memory-nightly-apply.timer >/dev/null 2>&1; then
+        # Reinstall without opt-in must not silently leave a previously-enabled timer running.
+        systemctl --user disable --now memory-nightly-apply.timer >/dev/null 2>&1 || true
+        say "nightly apply timer DISABLED (MEMORY_NIGHTLY_APPLY not set this run)"
+      else
+        say "nightly apply installed but NOT enabled — set MEMORY_NIGHTLY_APPLY=1 to turn on"
+      fi
     else warn "systemd --user unavailable here — units written; enable on the target host"; fi;;
   docker)
     say "docker daemon: cd $REPO/daemon && cp .env.example .env && \$EDITOR .env && docker compose up -d";;

@@ -37,8 +37,20 @@ ollama:
 claude:
   bin: "claude"
   model: ""                        # blank = CLI default; or pin e.g. "claude-sonnet-4-6"
+                                   # (the optional nightly apply job reads this too — pin a strong
+                                   #  model like "claude-opus-4-8" if you enable memory-nightly-apply)
   timeout_seconds: 600
   max_turns: 1                     # single turn, no tool loop — pure text generation
+
+# Daemon task cadences (override engram-daemon.py DEFAULT_INTERVALS, in seconds).
+# COMMENTED OUT so a fresh install keeps the busy defaults (30-min graph/vector).
+# Uncomment for a "quiet fleet": reconcile graph + vector ONCE A DAY and disable
+# the in-daemon maintenance pipeline (use the nightly apply job / manual /memory-*).
+# daemon:
+#   intervals:
+#     graph: 86400        # graph_sync.py --insert cadence
+#     vector: 86400       # vector_sync.py --insert cadence
+#     maintenance: 315360000   # ~off — fixate/curate stay human-gated or nightly-only
 
 # OpenAI-compatible llama.cpp server (llama-server /v1). Used when backend: llama_cpp.
 # Generation routes to {url}/chat/completions; <think>…</think> reasoning is stripped.
@@ -105,11 +117,25 @@ skill_autoinstall:                 # stage ⑤
 
 # Per-session trigger: a Stop hook launches ONE background curate subagent when a
 # session ran long enough and added enough new memories.
+# Set enabled: false if you prefer human-gated /memory-curate, or the nightly job below.
 session_curate:
   enabled: true
   min_minutes: 15
   min_new_memories: 3
   max_per_day: 2
+
+# OPTIONAL nightly memory maintenance (bin/memory_nightly_apply.sh + the
+# memory-nightly-apply systemd timer). Once a night a headless Claude (uses
+# claude.model above) runs /memory-curate + /memory-fixate and Codex-reviews the
+# plan; the morning report is surfaced on the TUI by bin/codex-availability-warn.sh.
+# DETERMINISTIC: the LLM is read-only and only PROPOSES a plan; a shell Codex-reviews
+# each op and applies ONLY approved ones (the LLM never mutates), so a prompt injection
+# can at worst yield a bad plan. FAIL-CLOSED: if Codex is unavailable it plans only.
+# Enable (opt-in, applies nightly at 03:37): MEMORY_NIGHTLY_APPLY=1 ./install.sh  (or
+# `systemctl --user enable --now memory-nightly-apply.timer` — safe; Persistent=false
+# so --now never catch-up-runs). Runner env:
+# DRYRUN=1 (test: plan+review only), MAX_CONSOLIDATIONS, MAX_DELETIONS,
+# NIGHTLY_ALLOW_FAILOPEN=1 (apply even if Codex is down — NOT recommended).
 
 # ── Vector store (OPTIONAL) ─────────────────────────────────────────────────
 # A Qdrant index over the .md store for semantic recall + fast (ANN) dedup. The

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run nightly Codex-gated memory maintenance once a night
+
+[Timer]
+# Night, once a day, off the :00/:30 marks. Persistent=false on purpose: a missed
+# 03:37 (host asleep) must NOT catch-up-run an unattended APPLY at an unexpected
+# time — it simply waits for the next night. So `enable --now` is safe (starts the
+# timer ticking toward the next 03:37; never fires immediately).
+OnCalendar=*-*-* 03:37:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

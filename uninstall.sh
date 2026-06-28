@@ -9,6 +9,11 @@ SETTINGS="$CLAUDE/settings.json"
 PURGE=0; [[ "${1:-}" == "--purge" ]] && PURGE=1
 say(){ printf '\033[1;36m[engram]\033[0m %s\n' "$*"; }
 
+# Stop running services FIRST — before removing any engine files — so an in-flight
+# nightly apply can't be killed mid-plan after its helper scripts are deleted.
+systemctl --user disable --now engram.timer memory-nightly-apply.timer >/dev/null 2>&1 || true
+systemctl --user stop memory-nightly-apply.service engram.service >/dev/null 2>&1 || true
+
 # engine files (by the names shipped in the repo)
 [[ -d "$REPO/bin" ]] && for f in "$REPO"/bin/*; do rm -f "$CLAUDE/$(basename "$f")"; done
 [[ -d "$REPO/commands" ]] && for f in "$REPO"/commands/*; do rm -f "$CLAUDE/commands/$(basename "$f")"; done
@@ -19,11 +24,11 @@ rm -f "$CLAUDE/graph/docker-compose.yml"
 rm -f "$CLAUDE/vector/docker-compose.yml" "$CLAUDE/vector/sync_state.json"
 say "removed engine files"
 
-# hooks (drop our three commands; prune now-empty groups)
+# hooks (drop our commands; prune now-empty groups)
 if command -v jq >/dev/null && [[ -f "$SETTINGS" ]]; then
   if jq '.hooks //= {} | .hooks |= (to_entries
         | map(.value |= (map(.hooks |= map(select((.command // "")
-              | test("(memory_curate_check|memory_agent|memory_session_curate)\\.sh")|not)))
+              | test("(memory_curate_check|memory_agent|memory_session_curate|codex-availability-warn)\\.sh")|not)))
             | map(select((.hooks|length) > 0))))
         | from_entries)' "$SETTINGS" > "$SETTINGS.tmp"; then
     mv "$SETTINGS.tmp" "$SETTINGS"; say "removed hooks from settings.json"
@@ -34,9 +39,10 @@ fi
 command -v claude >/dev/null && claude mcp remove engram-graph >/dev/null 2>&1 && say "removed engram-graph MCP" || true
 command -v claude >/dev/null && claude mcp remove engram-vector >/dev/null 2>&1 && say "removed engram-vector MCP" || true
 
-# daemon
-systemctl --user disable --now engram.timer >/dev/null 2>&1 || true
-rm -f "$HOME/.config/systemd/user/engram.service" "$HOME/.config/systemd/user/engram.timer" "$HOME/.config/engram/daemon.env"
+# daemon unit files (services already stopped at the top)
+rm -f "$HOME/.config/systemd/user/engram.service" "$HOME/.config/systemd/user/engram.timer" \
+      "$HOME/.config/systemd/user/memory-nightly-apply.service" "$HOME/.config/systemd/user/memory-nightly-apply.timer" \
+      "$HOME/.config/engram/daemon.env"
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 say "removed daemon units"
 

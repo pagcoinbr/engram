@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly Codex-gated memory maintenance (curate+fixate apply, headless Claude)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Headless apply agent; long-running. ExecStart reads ENGRAM_BIN at runtime (from the
+# EnvironmentFile) so alternate install homes work WITHOUT templating user-supplied
+# paths into the unit (avoids quoting/specifier injection); %h/.claude is the fallback.
+EnvironmentFile=-%h/.config/engram/daemon.env
+ExecStart=/bin/sh -c 'exec "${ENGRAM_BIN:-%h/.claude}/memory_nightly_apply.sh"'
+TimeoutStartSec=3600
