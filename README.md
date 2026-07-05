@@ -24,6 +24,30 @@ It's not a flat notes file. It's a pipeline modeled on how human memory actually
 Your memories are plain Markdown files (`.md`) — the source of truth, readable and
 git-friendly. The graph is a continuously-synced *index* over them.
 
+## How it works — the lifecycle of a memory
+
+engram is a pipeline, not a notes file. A fact moves through stages; you (or the
+daemon) drive it forward, and it earns trust as it goes:
+
+1. **Encode** — a Stop hook *harvests* durable candidate facts from the session
+   transcript into `.staging/` (quarantined, not yet trusted).
+2. **Graduate** — candidates that pass provenance + dedup + injection checks become
+   real `.md` memories. Off by default: the pipeline prepares, a human approves.
+3. **Consolidate** — `/memory-curate` clusters narrow, overlapping facts and merges
+   them into class-level "umbrella" memories; stale ones are pruned.
+4. **Fixate** — `/memory-fixate` scores each memory (age + how often it recurs + how
+   many distillations it survived + injection-suspicion) and graduates it
+   *suspect → provisional → corroborated → fixed*. Trusted memories get distilled
+   tighter and reviewed less often; suspect (possibly-poisoned) ones are gated through you.
+5. **Recall** — the `.md` store is continuously synced into a **Neo4j graph** and a
+   **Qdrant vector index**. At query time engram fuses graph (associative/temporal) +
+   vector (semantic) + keyword (BM25) via Reciprocal Rank Fusion, so Claude loads only
+   the memories relevant to the task instead of the whole store.
+
+The `.md` files are always the source of truth; the graph and vector index are
+**rebuildable indexes** over them. Everything runs locally, and every automated
+mutation is **dry-run + human-approved**.
+
 ---
 
 ## Why you'd want it
@@ -61,11 +85,26 @@ daemon. Restart Claude Code afterward so it loads the new commands.
 > `ENGRAM_CLAUDE_HOME=~/engram-sandbox/.claude ./install.sh --yes`
 
 ## How Claude uses it
-- **Commands** (in any session): `/memory-checkpoint`, `/memory-curate`, `/memory-fixate`, `/memory-to-skill`, `/memory-reformat`, `/memory-clean-review`.
-- **Graph recall** (the `engram-graph` MCP server): Claude calls `memory_recall`, `memory_search_facts`, `memory_neighbors`, `memory_stats` on demand to load only the relevant memories — instead of dumping the whole store into context.
+
+### Commands
+Run in any Claude session. Each is **dry-run first** — it shows a plan and you approve before anything is written or deleted.
+
+| Command | What it does |
+|---|---|
+| **`/memory-checkpoint`** | Review the current session and save any new, durable facts as memories (dedup-aware). |
+| **`/memory-curate`** | *Systems consolidation.* Cluster narrow / overlapping facts and merge them into class-level "umbrella" memories; prune the stale ones. |
+| **`/memory-fixate`** | *Long-term potentiation.* Score memories (age + recurrence + distillation-survival + injection-suspicion), distill/merge the trusted ones, and gate suspect (possibly-poisoned) memories through you. |
+| **`/memory-reformat`** | Rewrite memories into the canonical **Summary → Index → Body** shape so each file is graspable at a glance (facts preserved, nothing dropped). |
+| **`/memory-clean-review`** | Walk the store file-by-file with you deciding **keep / edit / delete** on each — fully human-driven. |
+| **`/memory-to-skill`** | Promote a high-trust, frequently-recalled *procedural* memory into a first-class Claude Code skill. |
+
+### Recall — how the right memories reach Claude
+- **Graph recall** (`engram-graph` MCP): `memory_recall`, `memory_search_facts`, `memory_neighbors`, `memory_stats` — Claude loads only the relevant memories on demand, instead of dumping the whole store into context.
 - **Hybrid recall** (`memory_recall_hybrid`, on `engram-graph`): the best single recall — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename. Each ranker degrades independently; optional `type` filter.
-- **Vector recall** (the optional `engram-vector` MCP server): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search over the store via Qdrant (with a `type` filter, scoped to the current store). Plus `memory_recall_fused` (vector+keyword) for no-graph installs. Off by default; enable with `./install.sh --vector`.
-- **Automatic**: a Stop hook harvests new facts; the daemon consolidates/fixates/syncs the graph (and the vector index, if enabled) on a cadence.
+- **Vector recall** (the optional `engram-vector` MCP): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search via Qdrant. Plus `memory_recall_fused` (vector+keyword) for no-graph installs. Off by default; enable with `./install.sh --vector`.
+
+### Automatic
+A Stop hook harvests new facts each session; the daemon consolidates / fixates / syncs the graph (and the vector index, if enabled) on a cadence — all dry-run + human-approved.
 
 ## The 24/7 daemon
 `engram-daemon` runs the pipeline + graph sync + health on independent cadences:
