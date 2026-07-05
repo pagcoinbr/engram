@@ -1,6 +1,8 @@
-# engram
+<p align="center">
+  <img src="assets/engram-logo.svg" alt="engram — neuro-inspired memory for Claude Code" width="840">
+</p>
 
-**A neuro-inspired memory organism for Claude Code.**
+<p align="center"><b>A neuro-inspired memory organism for Claude Code.</b></p>
 
 An *engram* is the physical trace a memory leaves in the brain. This is that, for your
 AI: a local-first memory system that *encodes* what you do, *consolidates* it into

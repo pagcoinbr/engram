@@ -1,0 +1,71 @@
+<svg width="1200" height="340" viewBox="0 0 1200 340" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="engram — neuro-inspired memory for Claude Code">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="340" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0a0e1c"/>
+      <stop offset="0.55" stop-color="#0f1730"/>
+      <stop offset="1" stop-color="#0b1226"/>
+    </linearGradient>
+    <linearGradient id="trace" x1="70" y1="250" x2="300" y2="90" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="0.5" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#a855f7"/>
+    </linearGradient>
+    <linearGradient id="wordmark" x1="392" y1="120" x2="392" y2="215" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#cdd6f4"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#6366f1" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#6366f1" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- panel -->
+  <rect x="0" y="0" width="1200" height="340" rx="28" fill="url(#bg)"/>
+  <rect x="0.75" y="0.75" width="1198.5" height="338.5" rx="27.25" fill="none" stroke="#26305a" stroke-width="1.5"/>
+  <ellipse cx="185" cy="170" rx="180" ry="150" fill="url(#halo)"/>
+
+  <!-- knowledge graph: dim mesh (the store) -->
+  <g stroke="#33406b" stroke-width="1.6" opacity="0.75">
+    <line x1="95" y1="235" x2="150" y2="150"/>
+    <line x1="150" y1="150" x2="120" y2="80"/>
+    <line x1="150" y1="150" x2="235" y2="120"/>
+    <line x1="235" y1="120" x2="300" y2="75"/>
+    <line x1="235" y1="120" x2="285" y2="200"/>
+    <line x1="150" y1="150" x2="190" y2="245"/>
+    <line x1="190" y1="245" x2="285" y2="200"/>
+    <line x1="285" y1="200" x2="315" y2="265"/>
+    <line x1="120" y1="80" x2="235" y2="120"/>
+  </g>
+  <g fill="#46538a">
+    <circle cx="120" cy="80" r="6"/>
+    <circle cx="300" cy="75" r="6"/>
+    <circle cx="285" cy="200" r="6"/>
+    <circle cx="315" cy="265" r="6"/>
+    <circle cx="95" cy="235" r="6"/>
+  </g>
+
+  <!-- the engram: one bright memory trace threading the graph -->
+  <g filter="url(#glow)">
+    <path d="M95 235 L150 150 L235 120 L300 75" fill="none" stroke="url(#trace)" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M150 150 L190 245" fill="none" stroke="url(#trace)" stroke-width="3" stroke-linecap="round" opacity="0.85"/>
+  </g>
+  <g>
+    <circle cx="150" cy="150" r="9" fill="#2dd4bf"/>
+    <circle cx="235" cy="120" r="8.5" fill="#6366f1"/>
+    <circle cx="190" cy="245" r="7" fill="#818cf8"/>
+    <circle cx="300" cy="75" r="7.5" fill="#a855f7"/>
+    <circle cx="95" cy="235" r="7" fill="#2dd4bf"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="392" y="192" font-family="'Inter','Segoe UI',system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif" font-size="118" font-weight="700" letter-spacing="-3" fill="url(#wordmark)">engram</text>
+  <rect x="396" y="214" width="360" height="3" rx="1.5" fill="url(#trace)"/>
+
+  <!-- tagline -->
+  <text x="398" y="256" font-family="'Inter','Segoe UI',system-ui,-apple-system,Arial,sans-serif" font-size="24" font-weight="500" letter-spacing="5.5" fill="#8b9ac9">NEURO-INSPIRED MEMORY FOR CLAUDE CODE</text>
+</svg>
