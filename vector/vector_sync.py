@@ -28,6 +28,7 @@ if str(Path.home() / ".claude") not in sys.path:
     sys.path.append(str(Path.home() / ".claude"))
 import memory_ai
 import vector_config as vc
+import engram_secrets
 from vector_store import EngramVectorStore
 
 SYNC_STATE = HERE / "sync_state.json"   # file -> sha256(.md) last indexed
@@ -61,6 +62,19 @@ def _frontmatter(p: Path) -> tuple[str, str, str]:
         m = re.search(rf"^\s*{key}:\s*(.+)$", t, re.M)
         return m.group(1).strip().strip('"\'') if m else ""
     return field("name") or p.stem, field("description"), field("type")
+
+
+def _body(p: Path) -> str:
+    """Redacted body text after the frontmatter, for richer embeddings (R1). The
+    body is SECRET-REDACTED before it leaves this process because the embedding
+    provider may be an off-box host — a scanner-missed secret in a body must not
+    be shipped there. Empty on any parse issue (embed still works off name+desc)."""
+    t = p.read_text(errors="ignore")
+    if t.startswith("---"):
+        end = t.find("\n---", 3)
+        if end != -1:
+            t = t[end + 4:]
+    return re.sub(r"\s+", " ", engram_secrets.redact(t)[0]).strip()
 
 
 def _store():
@@ -106,7 +120,7 @@ def cmd_insert(only=None) -> int:
         try:
             name, desc, mtype = _frontmatter(p)
             sha = _sha(p)
-            store.upsert(filename=p.name, name=name, description=desc, mtype=mtype, sha=sha)
+            store.upsert(filename=p.name, name=name, description=desc, mtype=mtype, sha=sha, body=_body(p))
             sync[p.name] = sha
             n += 1
             print(f"[vector] indexed {p.name}")
@@ -137,7 +151,7 @@ def cmd_rebuild() -> int:
         try:
             name, desc, mtype = _frontmatter(p)
             sha = _sha(p)
-            store.upsert(filename=p.name, name=name, description=desc, mtype=mtype, sha=sha)
+            store.upsert(filename=p.name, name=name, description=desc, mtype=mtype, sha=sha, body=_body(p))
             sync[p.name] = sha
             n += 1
         except Exception as e:

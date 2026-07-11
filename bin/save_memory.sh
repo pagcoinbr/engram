@@ -35,6 +35,12 @@ if [[ -z "$CONTENT" ]]; then
     exit 1
 fi
 
+# Secret guard: block before writing locally AND before any GitHub push. Scan
+# the body AND the description (the description is written into MEMORY.md and
+# pushed, so a secret there leaks via the index path).
+memory_guard_secret_content "$CONTENT" "save-memory" || exit 1
+memory_guard_secret_content "$DESCRIPTION" "save-memory-desc" || exit 1
+
 # Save locally
 printf '%s\n' "$CONTENT" > "${LOCAL_DIR}/${FILENAME}"
 

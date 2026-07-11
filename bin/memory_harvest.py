@@ -63,6 +63,32 @@ VALID_TYPES = {"user", "feedback", "project", "reference"}
 # Transcript parsing — deterministic segmentation by content-block type.
 # ----------------------------------------------------------------------------
 
+# Injected blocks that ride inside a user-role message but are NOT the human's
+# words: <system-reminder> carries the MEMORY.md index + recalled memories, and
+# <relevant-memory> is the auto-recall payload. If we don't strip these, a
+# poisoned/recalled memory re-surfaces here, gets cited as a U# segment, and
+# graduates as `user-direct` — a self-reinforcing injection loop. Mirrors the
+# SYSREMINDER_RE strip in memory_score.human_text().
+INJECTED_BLOCK_RE = re.compile(
+    r"<(system-reminder|relevant-memory)\b[^>]*>.*?</\1\s*>", re.DOTALL | re.IGNORECASE)
+# Any surviving injected tag FRAGMENT (opener or closer, with/without attributes)
+# after stripping means the text was crafted to break the block match (e.g. an
+# extra </system-reminder> to split a real block). Treat the segment as contaminated.
+INJECTED_TAG_RESIDUE = re.compile(
+    r"</?(system-reminder|relevant-memory)\b", re.IGNORECASE)
+
+
+def _strip_injected(text: str) -> str:
+    """Remove injected system-reminder / relevant-memory blocks from user text.
+    Returns "" (segment dropped) if any injected tag fragment remains after the
+    strip — fail-closed against tag-splitting bypasses rather than risk leaking
+    injected text as user-direct."""
+    cleaned = INJECTED_BLOCK_RE.sub("", text or "")
+    if INJECTED_TAG_RESIDUE.search(cleaned):
+        return ""
+    return cleaned.strip()
+
+
 def _blocks(content):
     """Normalise a message `content` into a list of (block_type, text) pairs."""
     out = []
@@ -115,6 +141,11 @@ def segment_events(lines):
             if has_tool_result or not texts:
                 continue
             for t in texts:
+                # Strip injected system-reminder / relevant-memory payloads so
+                # recalled memories can't be re-harvested as user-direct.
+                t = _strip_injected(t)
+                if not t:
+                    continue
                 u += 1
                 segs.append({"id": f"U{u}", "kind": "user-direct", "text": t})
         elif role == "assistant":

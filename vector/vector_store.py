@@ -75,10 +75,13 @@ class EngramVectorStore:
 
     # ---- writes --------------------------------------------------------------
     def upsert(self, *, filename: str, name: str, description: str,
-               mtype: str = "", sha: str = "", vector=None) -> None:
+               mtype: str = "", sha: str = "", body: str = "", vector=None) -> None:
         from qdrant_client import models as qm
         if vector is None:
-            vector = engram_llm.embed(f"{name} {description}".strip(), self.cfg)
+            # Embed name + description + a slice of the BODY. Title-only embedding
+            # (the old behaviour) made "dense semantic search" effectively a title
+            # match; including the body is the single biggest recall-quality lever.
+            vector = engram_llm.embed(f"{name} {description} {body[:1500]}".strip(), self.cfg)
         payload = {"file": filename, "name": name, "description": description,
                    "type": mtype, "slug": slug(), "sha": sha}
         self.client.upsert(

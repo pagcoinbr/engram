@@ -19,6 +19,9 @@ if [[ -z "$CONTENT" ]]; then
     exit 1
 fi
 
+# Secret guard: block before writing locally AND before the GitHub push.
+memory_guard_secret_content "$CONTENT" "save-content" || exit 1
+
 printf '%s\n' "$CONTENT" > "${LOCAL_DIR}/${FILENAME}"
 
 # Push via the shared retry-on-sha-conflict helper (concurrent writers to the
