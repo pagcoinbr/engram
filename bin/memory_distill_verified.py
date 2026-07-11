@@ -32,7 +32,9 @@ import json, re, sys, time, urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path.home() / ".claude"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # find engram_secrets in-repo too
 import memory_ai
+import engram_secrets
 
 MEM = Path.home() / ".claude" / "projects" / (os.environ.get("CLAUDE_MEMORY_SLUG") or str(Path.home()).replace("/", "-")) / "memory"
 
@@ -53,12 +55,20 @@ FACT_STOP = {"0.0", "1.0", "2.0", "3.0"}
 # Secrets / per-run cruft that distillation MUST DROP, never faithfully preserve.
 # (Matches the security-mindset + no-secrets memories: client secrets, session
 # ids, raw API keys, webhook secrets, long base64/hex blobs are not "facts".)
-SECRET_RE = re.compile(
-    r"(?i)(originSessionId|client[_-]?secret|api[_-]?key\s*[:=]|"
-    r"webhook[_-]?secret|password|[0-9a-f]{32,}|[A-Za-z0-9+/]{40,}={0,2})")
+# Secret detection/redaction is centralized in engram_secrets (one shared,
+# tested source across distill / embedding / index / stage-apply). Aggressive by
+# design — masking a stray SHA/UUID from a draft is harmless; the high-precision
+# write-block guard lives separately in memory_lib.sh.
+SECRET_RE = engram_secrets.SECRET_RE
 
 def looks_secret(line: str) -> bool:
-    return bool(SECRET_RE.search(line))
+    return engram_secrets.looks_secret(line)
+
+def redact_secrets(text: str):
+    """Mask secret-looking substrings so they never reach the LLM prompt (which
+    may be a REMOTE backend), the appendix, or the written draft. Returns
+    (text, n_masked)."""
+    return engram_secrets.redact(text)
 
 # A previously auto-generated "## Reference facts (verbatim — auto-preserved …)"
 # trailer must not be re-fed to the model (it bloats the prompt and accretes across
@@ -92,9 +102,12 @@ def extract_facts(text: str):
             norm = tok.lower()
             if len(norm) < 3 or norm in FACT_STOP:
                 continue
-            # find the line for a secrecy check so we never appendix a secret
+            # find the line for a secrecy check so we never appendix a secret.
+            # Any fact whose source line looks like a secret is dropped (not just
+            # commit hashes) — a port/path/env sharing a line with a credential
+            # must not carry that credential into the umbrella note.
             line = next((ln for ln in text.splitlines() if tok in ln), "")
-            if line and looks_secret(line) and kind in ("commit",):
+            if line and looks_secret(line):
                 continue
             seen.setdefault(norm, (tok, kind))
     return seen
@@ -163,17 +176,23 @@ def ollama_stream(prompt, cfg):
                 done = c.get("done_reason")
     return "".join(parts), done, time.time() - t0
 
-def distill_cluster(key, files, cfg=None, verbose=False):
+def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
     """Distill a cluster -> (final_draft_text, report_dict). Importable by
     memory_distill.py / the fixation cron so the verified pipeline is the default.
     final_fact_coverage is ~1.0 by construction (missing facts appended verbatim)."""
     cfg = cfg or memory_ai.load()
     members_text = ""
     facts = {}; fact_src = {}; all_caveats = []
+    sources = {}          # f -> redacted body (for add-only preservation + sentence coverage)
+    n_redacted = 0
     for f in files:
-        body = (MEM / f).read_text(errors="ignore")
+        body, n = redact_secrets((MEM / f).read_text(errors="ignore"))
+        n_redacted += n
+        sources[f] = strip_prior_appendix(body)
         # Feed the model the prose WITHOUT any prior auto-appendix (no re-parroting,
         # no accretion); extract the preservation checklist from the FULL body.
+        # Body is already secret-redacted, so nothing secret reaches the prompt,
+        # the fact/caveat checklist, the appendix source-lines, or the draft.
         members_text += f"### {f}\n{strip_prior_appendix(body)}\n\n---\n\n"
         for norm, (disp, kind) in extract_facts(body).items():
             facts.setdefault(norm, (disp, kind))
@@ -213,14 +232,50 @@ def distill_cluster(key, files, cfg=None, verbose=False):
             appendix += "### Hard facts\n"
             for n in sorted(missing, key=lambda n: facts[n][1]):
                 disp, kind = facts[n]; src = fact_src.get(n, ("?", ""))
-                ctx = f" — {src[1]}" if src[1] and len(src[1]) <= 160 else ""
+                ctx = f" — {src[1]}" if src[1] and len(src[1]) <= 160 and not looks_secret(src[1]) else ""
                 appendix += f"- `{disp}` ({kind}, from {src[0]}){ctx}\n"
         if missing_cav:
             appendix += "\n### Caveats / rules\n"
             for c, f in missing_cav:
                 appendix += f"- {c} (from {f})\n"
 
-    final = out.rstrip() + appendix + "\n"
+    # ADD-ONLY preservation (C8). final_fact_coverage only proves REGEX TOKEN
+    # CLASSES (ports/IPs/paths/env/…) survived — normal PROSE facts can be dropped
+    # while it still reads 1.0. So it must NEVER be the sole authorization for a
+    # destructive merge/delete. Two guards:
+    #  1. sentence_coverage — an HONEST metric: fraction of source sentences whose
+    #     content is represented in the draft. Exposes prose loss the token metric hides.
+    #  2. preserve_sources — when on (MEMORY_DISTILL_PRESERVE_SOURCES=1, or passed
+    #     explicitly by an automated merge), append every source body verbatim so the
+    #     merge is LOSSLESS by construction and safe to auto-apply.
+    def _sentences(t):
+        out_s = []
+        for para in re.split(r"\n\s*\n", t):
+            for s in re.split(r"(?<=[.!?])\s+|\n[-*]\s+", " ".join(para.split())):
+                s = s.strip().lstrip("-*# ").strip()
+                if len(s) >= 25:
+                    out_s.append(s)
+        return out_s
+    src_sentences = [s for b in sources.values() for s in _sentences(b)]
+    def _norm(s): return re.sub(r"[^a-z0-9]", "", s.lower())
+    draft_norm_probe = _norm(out)
+    covered_sent = sum(1 for s in src_sentences
+                       if _norm(s)[:60] and _norm(s)[:60] in draft_norm_probe)
+    sentence_cov = covered_sent / max(1, len(src_sentences))
+
+    if preserve_sources is None:
+        preserve_sources = os.environ.get("MEMORY_DISTILL_PRESERVE_SOURCES", "0") == "1"
+    if preserve_sources:
+        appendix += ("\n\n## Original source notes (verbatim — auto-preserved)\n"
+                     "_Full sources kept so this merge is lossless; safe to remove the "
+                     "source files. Collapse when reviewed._\n")
+        for f, b in sources.items():
+            appendix += f"\n<details><summary>{f}</summary>\n\n{b.strip()}\n\n</details>\n"
+
+    # Defense-in-depth: mask anything secret-looking the model may have echoed
+    # back before the draft is written/applied.
+    final, n_final = redact_secrets(out.rstrip() + appendix + "\n")
+    n_redacted += n_final
     final_low = final.lower()
     final_norm = re.sub(r"[^a-z0-9]", "", final_low)
     final_cov = len([n for n, (disp, kind) in facts.items()
@@ -231,8 +286,12 @@ def distill_cluster(key, files, cfg=None, verbose=False):
         "natural_fact_coverage": round(natural_cov, 4),
         "natural_caveat_coverage": round(len(present_cav) / max(1, len(all_caveats)), 4),
         "final_fact_coverage": round(final_cov, 4),
+        "sentence_coverage": round(sentence_cov, 4),   # HONEST prose metric; token coverage hides prose loss
+        "source_sentences": len(src_sentences),
+        "sources_preserved": bool(preserve_sources),
         "appendix_facts": len(missing), "appendix_caveats": len(missing_cav),
         "possible_hallucinations": invented,
+        "secrets_redacted": n_redacted,
         "draft_chars": len(final), "gen_done": done,
     }
     return final, report

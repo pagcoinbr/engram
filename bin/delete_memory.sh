@@ -35,41 +35,33 @@ else
     echo "[delete-memory] Local file already absent: ${FILENAME}"
 fi
 
-# 2. Delete the remote file (needs its current sha)
-REMOTE_SHA=""
-if RESP=$(gh api "repos/${REPO}/contents/${REMOTE_PATH}/${FILENAME}" 2>/dev/null); then
-    REMOTE_SHA=$(echo "$RESP" | jq -r '.sha // empty')
-fi
-
-if [[ -n "$REMOTE_SHA" ]]; then
-    gh api "repos/${REPO}/contents/${REMOTE_PATH}/${FILENAME}" \
-        --method DELETE \
-        --field message="delete memory: ${FILENAME}" \
-        --field sha="$REMOTE_SHA" > /dev/null
-    echo "[delete-memory] Removed remote ${FILENAME}"
-else
-    echo "[delete-memory] Remote file already absent: ${FILENAME}"
-fi
-
-# 3. Strip the MEMORY.md index line (match the link target exactly)
-MEMORY_MD="${LOCAL_DIR}/MEMORY.md"
-if [[ -f "$MEMORY_MD" ]] && grep -qF "](${FILENAME})" "$MEMORY_MD"; then
-    grep -vF "](${FILENAME})" "$MEMORY_MD" > "${MEMORY_MD}.tmp"
-    mv "${MEMORY_MD}.tmp" "$MEMORY_MD"
-
-    MEMORY_SHA=""
-    if MEM_RESP=$(gh api "repos/${REPO}/contents/${REMOTE_PATH}/MEMORY.md" 2>/dev/null); then
-        MEMORY_SHA=$(echo "$MEM_RESP" | jq -r '.sha // empty')
+# 2. Delete the remote file (needs its current sha) — ONLY if a remote is
+# configured. With no CLAUDE_MEMORY_REPO the unguarded `gh api "repos//contents/…"`
+# PUT/DELETE aborts the whole script under `set -e`, so the index strip + vector
+# cleanup below never run. Local-first: skip cleanly.
+if [[ -n "$REPO" ]]; then
+    REMOTE_SHA=""
+    if RESP=$(gh api "repos/${REPO}/contents/${REMOTE_PATH}/${FILENAME}" 2>/dev/null); then
+        REMOTE_SHA=$(echo "$RESP" | jq -r '.sha // empty')
     fi
-    MEMORY_ENCODED=$(base64 -w 0 < "$MEMORY_MD")
+    if [[ -n "$REMOTE_SHA" ]]; then
+        gh api "repos/${REPO}/contents/${REMOTE_PATH}/${FILENAME}" \
+            --method DELETE \
+            --field message="delete memory: ${FILENAME}" \
+            --field sha="$REMOTE_SHA" > /dev/null
+        echo "[delete-memory] Removed remote ${FILENAME}"
+    else
+        echo "[delete-memory] Remote file already absent: ${FILENAME}"
+    fi
+fi
 
-    gh api "repos/${REPO}/contents/${REMOTE_PATH}/MEMORY.md" \
-        --method PUT \
-        --field message="update MEMORY.md: remove ${FILENAME}" \
-        --field content="$MEMORY_ENCODED" \
-        --field sha="$MEMORY_SHA" \
-        --jq '.content.name' > /dev/null
-
+# 3. Strip the MEMORY.md index line using the LOCKED helper (a raw
+# `grep -v > tmp && mv` here races the pipeline's index writers — the exact
+# clobber memory_lib.sh documents fixing), then push via memory_push_index
+# (which no-ops when no remote is set).
+MEMORY_MD="${LOCAL_DIR}/MEMORY.md"
+if memory_index_remove_line "$MEMORY_MD" "$FILENAME"; then
+    memory_push_index "update MEMORY.md: remove ${FILENAME}"
     echo "[delete-memory] Updated MEMORY.md index"
 else
     echo "[delete-memory] No MEMORY.md index line for ${FILENAME}"

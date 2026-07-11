@@ -178,11 +178,71 @@ memory_index_remove_line() { memory_with_index_lock _memory_index_remove_line_un
 # or update), retrying on sha-conflict. Reads the local index under the lock so
 # it never uploads a half-written file.
 memory_push_index() {
-    local repo remote idx
+    local repo remote idx bad
     repo="$(memory_repo)"; remote="$(memory_remote_path)"; idx="$(memory_index)"
     [[ -n "$repo" ]] || return 0   # local-first: no remote configured -> nothing to push
     [[ -f "$idx" ]] || return 0
+    # Backstop: never publish an index that trips the secret scanner (a secret in
+    # a memory's name/description would otherwise reach GitHub via the index).
+    # Fail closed on the PUSH only — the local index stays usable.
+    if bad=$(memory_scan_secret "$idx"); then
+        echo "[memory] NOT pushing MEMORY.md — possible secret at index line(s): ${bad}. Redact the offending memory's name/description, then re-run memory_reindex.sh --rebuild --apply." >&2
+        return 1
+    fi
     memory_with_index_lock _gh_put_file "$repo" "${remote}/MEMORY.md" "${1:-update MEMORY.md index}" "$idx"
+}
+
+# ---------------------------------------------------------------------------
+# Secret guard — every write path (save_memory.sh, save_memory_content_only.sh,
+# distill output) MUST scan before writing locally AND before the GitHub PUT.
+# Mirrors SECRET_RE in memory_distill_verified.py, plus the bearer / PEM /
+# vendor-token / xprv forms the review flagged. High-precision on purpose so it
+# rarely false-blocks; override a genuine false positive with MEMORY_ALLOW_SECRET=1.
+# ---------------------------------------------------------------------------
+# HIGH-PRECISION only. Generic high-entropy nets (bare 32+ hex, 40+ base64) were
+# tried and rejected: they false-flag git SHAs, session UUIDs, and base64 examples
+# in 60% of legit memories (measured on the live store). A keyless raw-blob secret
+# will therefore pass — that ceiling is accepted; the named/prefixed forms below
+# cover the credentials people actually paste. ponytail: upgrade to an entropy
+# analyzer only if a real keyless-secret leak is observed.
+# A named-credential match needs an ASSIGNMENT and an 8+ char value, so prose like
+# "the DB password lives in Vault" doesn't trip it.
+_MEMORY_SECRET_ERE='((mnemonic|seed[_-]?phrase|recovery[_-]?phrase)[[:space:]]*[:=][[:space:]]*([a-z]+[[:space:],]+){5,}[a-z]+|(client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)[[:space:]]*[:=][[:space:]]*.?[[:alnum:]_/+-]{8,}|BEGIN[[:space:]]+[A-Z ]*PRIVATE KEY|-----BEGIN[[:space:]]|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|xprv[a-zA-Z0-9]{20,}|[5KL][1-9A-HJ-NP-Za-km-z]{50,51}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|[0-9a-f]{80,})'
+
+# memory_scan_secret <file> — echo the offending LINE NUMBERS (never the content,
+# so a secret can't leak into the transcript). Returns 0 if a secret was found,
+# 1 if the file is clean. Respects MEMORY_ALLOW_SECRET=1 (always reports clean).
+memory_scan_secret() {
+    local file="$1" hits
+    [[ "${MEMORY_ALLOW_SECRET:-0}" == "1" ]] && return 1
+    [[ -f "$file" ]] || return 1
+    hits=$(grep -niE "$_MEMORY_SECRET_ERE" "$file" 2>/dev/null | cut -d: -f1 | tr '\n' ' ')
+    if [[ -n "${hits// /}" ]]; then
+        printf '%s' "$hits"
+        return 0
+    fi
+    return 1
+}
+
+# memory_guard_stdin_secret <label> — read stdin into $CONTENT-safe temp, block on
+# secret. Caller uses: CONTENT=$(cat); memory_guard_secret_content "$CONTENT" tag.
+memory_guard_secret_content() {
+    local content="$1" label="${2:-memory}" tmp bad
+    [[ "${MEMORY_ALLOW_SECRET:-0}" == "1" ]] && return 0   # explicit override, short-circuit
+    # Fail CLOSED on scanner setup failure — a full/unwritable tmp must not let an
+    # unscanned save through.
+    tmp=$(mktemp) || { echo "[${label}] BLOCKED: secret-scan setup failed (mktemp)" >&2; return 1; }
+    if ! printf '%s\n' "$content" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; echo "[${label}] BLOCKED: secret-scan temp write failed" >&2; return 1
+    fi
+    if bad=$(memory_scan_secret "$tmp"); then
+        rm -f "$tmp"
+        echo "[${label}] BLOCKED: possible live secret at line(s): ${bad}" >&2
+        echo "[${label}] refusing to write/push. Redact it, or set MEMORY_ALLOW_SECRET=1 to override." >&2
+        return 1
+    fi
+    rm -f "$tmp"
+    return 0
 }
 
 # memory_vector_sync <args...> — fire a best-effort, NON-BLOCKING vector_sync.py

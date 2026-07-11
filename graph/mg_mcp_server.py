@@ -56,6 +56,15 @@ async def _graph_ranked(g, query: str, k: int, mtype: str = "") -> tuple[list, d
         u=list(fact_by_ep.keys()))
     meta = {r["uuid"]: r for r in recs}
     ranked_uuids = sorted(fact_by_ep, key=lambda u: -len(fact_by_ep[u]))
+    # Existence filter: the graph has no delete path, so episodes of deleted/renamed
+    # memories linger forever and would otherwise be recalled (and their stale
+    # cached name/desc shown). Only surface files that still exist on disk; this
+    # also drops raw-uuid pseudo-files (episodes with no fm file).
+    try:
+        import memory_keyword
+        mem_dir = Path(memory_keyword.mem_dir())
+    except Exception:
+        mem_dir = None
     ranked_files, facts, fmeta, seen = [], {}, {}, set()
     for u in ranked_uuids:
         m = meta.get(u, {})
@@ -64,6 +73,8 @@ async def _graph_ranked(g, query: str, k: int, mtype: str = "") -> tuple[list, d
             continue
         if f in seen:                      # collapse multiple episodes of one file
             continue
+        if not str(f).endswith(".md") or (mem_dir and not (mem_dir / f).is_file()):
+            continue                       # deleted/renamed memory or uuid pseudo-file
         seen.add(f)
         ranked_files.append(f)
         facts[f] = fact_by_ep[u]
@@ -72,21 +83,13 @@ async def _graph_ranked(g, query: str, k: int, mtype: str = "") -> tuple[list, d
 
 
 @mcp.tool()
-async def memory_recall(query: str, k: int = 6) -> str:
-    """Recall the most relevant memories for a task/query using hybrid graph+vector
-    search. Returns the top memory names, their descriptions, and the matched facts.
-    Use at the start of work to load only the relevant memories instead of all of them."""
-    g = await _graph()
-    ranked, facts, meta = await _graph_ranked(g, query, k)
-    if not ranked:
-        return f"(no memories matched: {query})"
-    out = [f"Recalled {len(ranked[:k])} memories for: {query}", ""]
-    for f in ranked[:k]:
-        m = meta.get(f, {})
-        out.append(f"- {m.get('name') or f}: {(m.get('desc') or '').strip()}")
-        for fact in facts.get(f, [])[:3]:
-            out.append(f"    - {fact}")
-    return "\n".join(out)
+async def memory_recall(query: str, k: int = 6, type: str = "") -> str:
+    """Recall the most relevant memories for a task/query. Delegates to the fused
+    graph+vector+keyword ranking (`memory_recall_hybrid`) — kept as a stable name
+    for habit/back-compat. The hybrid degrades to graph-only when the vector/keyword
+    legs are unavailable, so this is never worse than the old graph-only recall.
+    Optionally filter by memory `type` (user|feedback|project|reference)."""
+    return await _recall_hybrid(query, k, type)
 
 
 @mcp.tool()
@@ -96,6 +99,12 @@ async def memory_recall_hybrid(query: str, k: int = 6, type: str = "") -> str:
     .md filename. Use at the start of work to load the most relevant memories. Each
     ranker degrades independently — a disabled/down vector store or graph just drops
     out. Optionally filter by memory `type` (user|feedback|project|reference)."""
+    return await _recall_hybrid(query, k, type)
+
+
+async def _recall_hybrid(query: str, k: int = 6, type: str = "") -> str:
+    """Shared implementation for memory_recall + memory_recall_hybrid (a plain
+    callable so neither tool depends on the @mcp.tool decorator's return value)."""
     import asyncio
     import memory_ai
     import memory_fusion

@@ -15,13 +15,30 @@
 set -uo pipefail
 source "${HOME}/.claude/memory_lib.sh"
 
-APPLY=0; PRUNE=0
+APPLY=0; PRUNE=0; REBUILD=0
 for a in "$@"; do
     case "$a" in
         --apply) APPLY=1 ;;
         --prune-orphans) PRUNE=1 ;;
+        --rebuild) REBUILD=1 ;;
     esac
 done
+
+# --rebuild: regenerate the WHOLE index deterministically from frontmatter under
+# a byte budget (memory_index_build.py), instead of incrementally patching drift.
+# This is the durable fix for the flat-index overflow — nothing is ever orphaned
+# and the file stays under the session load limit. Pushes the regenerated index.
+if [[ "$REBUILD" == "1" ]]; then
+    BUILD="${HOME}/.claude/memory_index_build.py"
+    [[ -f "$BUILD" ]] || BUILD="$(dirname "$0")/memory_index_build.py"
+    if [[ "$APPLY" == "1" ]]; then
+        python3 "$BUILD" --write && memory_push_index "rebuild MEMORY.md (deterministic)"
+    else
+        echo "[reindex] --rebuild dry-run (add --apply to write). Preview:" >&2
+        python3 "$BUILD"
+    fi
+    exit $?
+fi
 
 DIR="$(memory_dir)"
 INDEX="$(memory_index)"

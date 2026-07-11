@@ -26,6 +26,19 @@ if [[ "${1:-}" == "--mark-done" ]]; then
     exit 0
 fi
 
+# Surface a SILENTLY-failing harvester (Rel1). The encode stage shells to a
+# backend that can fail every run (GPU box down / claude -p unavailable) with
+# nothing alarming — the store just quietly goes stale. Runs BEFORE the jq/STATE
+# gates so it surfaces even on a store with no curate history yet.
+PIPELOG="${HOME}/.claude/logs/pipeline.log"
+if [[ -f "$PIPELOG" ]]; then
+    recent_err=$(tail -n 12 "$PIPELOG" 2>/dev/null | grep -c '\[harvest\].*ERROR' || true)
+    [[ "$recent_err" =~ ^[0-9]+$ ]] || recent_err=0
+    if (( recent_err >= 5 )); then
+        echo "⚠️  Memory harvester failing: ${recent_err}/12 recent runs errored in ${PIPELOG}. Encoding is stalled (store going stale) — check the backend (LM Studio .107 / claude -p) and tail that log."
+    fi
+fi
+
 # Reminder mode — best-effort, never fail a session start.
 command -v jq >/dev/null 2>&1 || exit 0
 [[ -f "$STATE" ]] || exit 0
