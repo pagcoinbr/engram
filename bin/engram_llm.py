@@ -94,25 +94,75 @@ def model_for(role: str, cfg=None) -> str:
 def fallback(cfg=None) -> str:
     return (_cfg(cfg).get("fallback") or "").strip().lower()
 
+def _ccg_generate(prompt: str, role: str, cfg) -> str:
+    """Generation via cc-gateway (ccg): the Claude Code CLI pointed at the ccg OAuth
+    proxy (ANTHROPIC_BASE_URL) with the ccg client key (ANTHROPIC_API_KEY). ccg swaps
+    the client key for the real Claude.ai OAuth token, so this works HEADLESS (no local
+    OAuth session needed) — unlike raw `claude`. The key is read from an env var
+    (default ENGRAM_CCG_KEY) so it lives in the service EnvironmentFile, never the repo."""
+    gc = cfg.get("ccg", {})
+    base_url = gc.get("base_url") or os.environ.get("ANTHROPIC_BASE_URL")
+    if not base_url:
+        raise RuntimeError("ccg backend: no base_url configured (ccg.base_url or ANTHROPIC_BASE_URL)")
+    # Require the configured key env EXPLICITLY. No implicit ANTHROPIC_API_KEY
+    # fallback: that would ship the REAL Anthropic key to the gateway as the client
+    # key (a compromised gateway could then impersonate/charge the account). An
+    # operator who genuinely wants that must set api_key_env: ANTHROPIC_API_KEY.
+    key_env = gc.get("api_key_env", "ENGRAM_CCG_KEY")
+    key = os.environ.get(key_env)
+    if not key:
+        raise RuntimeError(f"ccg backend: api key env {key_env!r} not set")
+    # ccg reuses the claude CLI path/flags; override model from the ccg block if given.
+    sub = dict(cfg)
+    if gc.get("model") or gc.get("bin") or gc.get("timeout_seconds"):
+        cc = dict(cfg.get("claude", {}))
+        for k in ("model", "bin", "timeout_seconds", "max_turns"):
+            if gc.get(k) is not None:
+                cc[k] = gc[k]
+        sub = {**cfg, "claude": cc}
+    return _claude_generate(prompt, role, sub,
+                            env_extra={"ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_API_KEY": key},
+                            label="ccg")
+
+
 def generate(prompt: str, role: str = "distill", cfg=None) -> str:
     cfg = _cfg(cfg)
     b = backend(cfg)
+    fb = fallback(cfg)
     if b == "claude":
         return _claude_generate(prompt, role, cfg)
+    if b == "ccg":
+        # Route through cc-gateway; fall back to RAW claude (OAuth) ONLY on transport
+        # unavailability (gateway down/unreachable) — NEVER on an auth/policy denial,
+        # which would route the prompt around the gateway's auth/audit/DLP boundary.
+        try:
+            return _ccg_generate(prompt, role, cfg)
+        except BackendAuthError:
+            raise                                   # fail closed
+        except Exception:
+            if fb == "claude":
+                return _claude_generate(prompt, role, cfg)
+            raise
     if b == "llama_cpp":
         try:
             return _llamacpp_generate(prompt, role, cfg)
         except Exception:
-            if fallback(cfg) == "claude":
-                return _claude_generate(prompt, role, cfg)
-            raise
-    # ollama primary; optional claude fallback when the GPU box is unreachable.
+            return _fallback_generate(prompt, role, cfg, fb)
+    # ollama primary; optional ccg/claude fallback when the GPU box is unreachable.
     try:
         return _ollama_generate(prompt, role, cfg)
     except Exception:
-        if fallback(cfg) == "claude":
-            return _claude_generate(prompt, role, cfg)
-        raise
+        return _fallback_generate(prompt, role, cfg, fb)
+
+
+def _fallback_generate(prompt, role, cfg, fb):
+    """Run the configured fallback backend. A ccg auth/policy denial fails closed
+    (propagates) rather than degrading to another path."""
+    if fb == "ccg":
+        return _ccg_generate(prompt, role, cfg)     # BackendAuthError propagates
+    if fb == "claude":
+        return _claude_generate(prompt, role, cfg)
+    raise RuntimeError("primary backend failed and no fallback configured")
 
 
 # Qwen3 and other reasoning models emit <think>...</think> before the answer; with
@@ -176,9 +226,27 @@ def _ollama_generate(prompt: str, role: str, cfg) -> str:
         return json.loads(r.read().decode())["response"]
 
 
-def _claude_generate(prompt: str, role: str, cfg) -> str:
+# A "not authenticated" failure is PERMANENT within a run (expired OAuth with no
+# session to refresh it, or a bad/missing api key) — retrying it 3× just burns time
+# and buries the real cause under empty exit-1s (this is what produced 169k silent
+# "claude -p failed (exit 1)" lines). Detect it and fail fast + clearly.
+_AUTH_FAIL_RE = re.compile(
+    r"not logged in|please run /login|invalid[_ ]?api[_ ]?key|unauthor|authentication|forbidden|"
+    r"\b40[13]\b|policy|blocked",
+    re.IGNORECASE)
+
+
+class BackendAuthError(RuntimeError):
+    """Auth / authorization / policy denial from a backend. Distinct from transport
+    failure: callers must NOT silently fall back to another backend on this, or they
+    route around the gateway's auth/audit/DLP boundary (a data-exfil path)."""
+
+
+def _claude_generate(prompt: str, role: str, cfg, env_extra=None, label="claude -p") -> str:
     """Headless generation via the Claude Code CLI. No tools, single turn — pure text.
-    Flags are configurable (cfg['claude']) since they can vary by CLI version."""
+    Flags are configurable (cfg['claude']) since they can vary by CLI version.
+    `env_extra` injects env vars into the subprocess (used by the ccg backend to set
+    ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY so the call routes through cc-gateway)."""
     cc = cfg.get("claude", {})
     claude_bin = cc.get("bin", "claude")
     timeout = int(cc.get("timeout_seconds", 600))
@@ -189,25 +257,32 @@ def _claude_generate(prompt: str, role: str, cfg) -> str:
     # Restrict tools to nothing — this is pure text generation in an unattended loop.
     if cc.get("allowed_tools_flag", "--allowedTools"):
         cmd += [cc.get("allowed_tools_flag", "--allowedTools"), cc.get("allowed_tools", "")]
+    env = None
+    if env_extra:
+        env = dict(os.environ)
+        env.update({k: v for k, v in env_extra.items() if v is not None})
     # The unattended timer window can hit transient failures (OAuth token refresh,
     # a brief usage cap, a flaky spawn) that surface as exit 1 with empty stderr —
-    # which used to skip the WHOLE week's distillation. Retry a few times with
-    # backoff so one blip doesn't lose the run. FileNotFoundError is NOT retried
-    # (a missing bin won't fix itself).
+    # retry those. But an AUTH failure is permanent within the run: fail fast.
     import time as _time
     attempts = max(1, int(cc.get("retries", 3)))
     backoff = float(cc.get("retry_backoff_seconds", 5))
     last_err = None
     for attempt in range(attempts):
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True)
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                                 check=True, env=env)
             break
         except FileNotFoundError:
             raise RuntimeError(f"claude CLI not found (configured bin: {claude_bin!r})")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            detail = (getattr(e, "stderr", "") or "")[:300]
+            blob = ((getattr(e, "stderr", "") or "") + (getattr(e, "stdout", "") or ""))[:400]
             kind = "timeout" if isinstance(e, subprocess.TimeoutExpired) else f"exit {e.returncode}"
-            last_err = RuntimeError(f"claude -p failed ({kind}): {detail}")
+            if _AUTH_FAIL_RE.search(blob):
+                raise BackendAuthError(
+                    f"{label} auth/policy denied ({blob.strip() or 'no detail'}) — non-retryable; "
+                    f"check credentials. NOT falling back (would bypass the gateway boundary).")
+            last_err = RuntimeError(f"{label} failed ({kind}): {blob.strip()}")
             if attempt < attempts - 1:
                 _time.sleep(backoff * (attempt + 1))
     else:
@@ -302,6 +377,9 @@ def health(cfg=None) -> dict:
             cc = cfg.get("claude", {})
             subprocess.run([cc.get("bin", "claude"), "--version"],
                            capture_output=True, timeout=30, check=True)
+        elif b == "ccg":
+            # real round-trip through the proxy — a --version check wouldn't exercise auth
+            _ccg_generate("reply ok", "triage", cfg)
         elif b == "llama_cpp":
             _llamacpp_generate("reply ok", "triage", cfg)
         else:

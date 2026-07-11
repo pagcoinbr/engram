@@ -161,7 +161,25 @@ def task_vector():
         return
     _run([_vector_python(), str(ENGRAM_VECTOR / "vector_sync.py"), "--insert"])
 
+def _generate_available() -> bool:
+    """Can the configured backend (or its fallback) actually generate right now?
+    Gate the LLM pipeline on this so a down backend DEFERS cleanly (skip + one log
+    line) instead of spraying per-transcript failures and stalling silently."""
+    try:
+        sys.path.insert(0, str(ENGRAM_BIN))
+        import engram_llm
+        return bool(engram_llm.health(cfg()).get("generate"))
+    except Exception:
+        return False
+
 def task_maintenance():
+    # Encode/distill need an LLM. If none can generate (GPU box down AND claude/ccg
+    # unreachable), DEFER: harvest keeps its watermark, nothing is lost, and we log
+    # one line instead of thousands of exit-1s. Deterministic maintenance that needs
+    # no LLM (index/score/reconcile) runs via its own tasks.
+    if not _generate_available():
+        log("maintenance: no generate backend available — deferring LLM pipeline (encode/distill)")
+        return
     sh = _maintenance_script()
     if sh:
         _run(["bash", str(sh)])
