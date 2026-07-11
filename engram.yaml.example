@@ -12,9 +12,11 @@ local_enabled: true              # master switch for ALL automated/local memory 
 #   ollama  — local models on a GPU box (free, private). Pick a `tier` for your VRAM.
 #   claude  — no GPU: shell out to the `claude` CLI headless (cost = Claude usage).
 #             Used by the always-on loop container (daemon/, backend=claude).
-backend: ollama                  # ollama | claude | llama_cpp
-fallback: ""                     # "" | claude — when backend=ollama is unreachable (e.g. GPU box off),
-                                 # fall back to `claude -p` so the 24/7 daemon keeps working. Costs Claude usage.
+backend: ollama                  # ollama | claude | ccg | llama_cpp
+fallback: ""                     # "" | ccg | claude — when the backend is unreachable (e.g. GPU box off),
+                                 # fall back so the 24/7 daemon keeps working.
+                                 #   ccg    — route through cc-gateway (headless-safe; see below)
+                                 #   claude — raw `claude -p` (needs a logged-in OAuth session; costs usage)
 
 # Hardware tier (ollama only) — selects a model preset over the expert ROLES.
 # See engram_llm.TIER_PRESETS. Embeddings are always local (nomic, 768-dim).
@@ -41,6 +43,19 @@ claude:
                                    #  model like "claude-opus-4-8" if you enable memory-nightly-apply)
   timeout_seconds: 600
   max_turns: 1                     # single turn, no tool loop — pure text generation
+
+# cc-gateway backend (backend: ccg). Runs the SAME claude CLI but pointed at the
+# cc-gateway OAuth proxy: it sends a client key as x-api-key and ccg swaps it for the
+# real Claude.ai OAuth token. This is HEADLESS-SAFE — the daemon needs no local logged-in
+# session (raw `claude` fails "Not logged in" under systemd when the OAuth token is
+# expired/absent). The client key is read from an ENV VAR (never the repo): put it in the
+# service EnvironmentFile (~/.config/engram/daemon.env), mode 600. Typical setup:
+#   backend: ccg   fallback: claude   (ccg for hosts behind the proxy; raw claude elsewhere)
+ccg:
+  base_url: "http://100.86.23.68:8443"  # ccg endpoint (ANTHROPIC_BASE_URL). Falls back to $ANTHROPIC_BASE_URL.
+  api_key_env: "ENGRAM_CCG_KEY"         # env var holding the ccg client key (or $ANTHROPIC_API_KEY)
+  model: "claude-opus-4-8"              # model id ccg/Anthropic accepts
+  # bin / timeout_seconds / max_turns inherit from the `claude:` block unless set here
 
 # Daemon task cadences (override engram-daemon.py DEFAULT_INTERVALS, in seconds).
 # COMMENTED OUT so a fresh install keeps the busy defaults (30-min graph/vector).
