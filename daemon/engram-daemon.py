@@ -184,6 +184,11 @@ def task_maintenance():
     sh = _maintenance_script()
     if sh:
         _run(["bash", str(sh)])
+        # Log the run's autonomous activity to Telegram (opt-in: telegram.activity_log).
+        if ((cfg().get("telegram") or {}).get("activity_log")):
+            gate = ENGRAM_BIN / "engram_telegram_gate.py"
+            if gate.exists():
+                _run([sys.executable, str(gate), "--activity"], timeout=30)
     else:
         log("maintenance: no maintenance script found (memory_fixate_cron.sh / memory_pipeline.sh)")
 

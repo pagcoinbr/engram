@@ -402,8 +402,50 @@ def maybe_digest():
     DIGEST_STAMP.write_text(str(_now()))
 
 
+PIPELINE_LOG = HOME / ".claude" / "logs" / "pipeline.log"
+ACTIVITY_STAMP = Q / ".last_activity"
+
+
+def activity_summary():
+    """Summarize the LAST unattended maintenance run (harvest + graduate) from
+    pipeline.log and DM it — so every autonomous memory action is visible on Telegram,
+    not just the ones needing approval. Dedups on the run's start-timestamp."""
+    import re
+    try:
+        text = PIPELINE_LOG.read_text(errors="ignore")
+    except Exception:
+        return
+    starts = [m for m in re.finditer(r"^\[([^\]]+)\] pipeline start", text, re.M)]
+    if not starts:
+        return
+    run = text[starts[-1].start():]
+    run_id = starts[-1].group(1)
+    try:
+        if ACTIVITY_STAMP.read_text().strip() == run_id:
+            return                                   # already notified this run
+    except Exception:
+        pass
+    def grab(rx, default="0"):
+        m = re.search(rx, run)
+        return m.group(1) if m else default
+    transcripts = grab(r"transcripts processed:\s*(\d+)")
+    staged = grab(r"candidates staged:\s*(\d+)")
+    prov = grab(r"by provenance:\s*(\{[^}]*\})", "{}")
+    decisions = grab(r"processed \d+ staged candidate\(s\):\s*(\{[^}]*\})", "{}")
+    errs = len(re.findall(r"\bERROR\b", run))
+    ACTIVITY_STAMP.write_text(run_id)
+    # Log ACTIVITY, not idle proof-of-life: skip a run that did nothing and errored
+    # nothing (avoids 4 empty pings/day). Anything harvested/graduated or any error -> report.
+    if transcripts == "0" and staged == "0" and decisions in ("{}", "0") and errs == 0:
+        return
+    notify(f"🧠 engram run @ {run_id}\nharvested: {transcripts} transcript(s) · staged {staged} {prov}\n"
+           f"graduated/held: {decisions}\nerrors: {errs}")
+
+
 def main():
     a = sys.argv[1:]
+    if "--activity" in a:
+        activity_summary(); return
     if "--digest" in a:
         DIGEST_STAMP.write_text("0"); maybe_digest(); return
     if "--sweep" in a:

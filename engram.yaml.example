@@ -219,3 +219,8 @@ mcp_servers:
 # Scheduling — the installer builds the systemd timer / daemon cadence from these.
 schedule:
   times: ["03:30", "15:30"]
+
+# Telegram activity log — DM a one-line summary of every unattended maintenance
+# run (harvested/staged/graduated), not just approvals. The weekly digest is separate.
+# telegram:
+#   activity_log: true
