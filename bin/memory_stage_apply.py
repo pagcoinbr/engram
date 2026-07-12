@@ -110,22 +110,41 @@ def embed_key(meta, body):
     return f"{nm} {ds} {safe_body}".strip()
 
 
+_EMBED_CACHE = MEM_DIR / ".stage_embed_cache.json"
+
+
 def existing_embeddings(cfg):
-    """Embed live memories for dedup. Uses the SAME name+description+body[:400] key
-    as embed_key() below so a staged candidate is compared like-with-like (R1);
-    a title-only key here would mismatch the candidate's body-inclusive key and
-    weaken dedup. Best-effort."""
-    embs = {}
+    """Embed live memories for dedup, CACHED by file mtime so a frequent (e.g. hourly)
+    run only re-embeds CHANGED memories instead of the whole store each time. Uses the
+    SAME name+description+body[:400] key as embed_key() so a staged candidate is
+    compared like-with-like (R1). Best-effort: any embed failure -> {} (hold, fail-safe)."""
+    try:
+        cache = json.loads(_EMBED_CACHE.read_text())
+    except Exception:
+        cache = {}
+    embs, new_cache, changed = {}, {}, False
     for p in MEM_DIR.glob("*.md"):
         if p.name == "MEMORY.md":
             continue
-        t = p.read_text(errors="ignore")
-        meta, body = parse_frontmatter(t)
-        key = embed_key(meta, body)
+        mkey = f"{int(p.stat().st_mtime)}:{p.stat().st_size}"
+        hit = cache.get(p.name)
+        if hit and hit.get("mkey") == mkey:
+            embs[p.name] = hit["vec"]
+            new_cache[p.name] = hit
+            continue
+        meta, body = parse_frontmatter(p.read_text(errors="ignore"))
         try:
-            embs[p.name] = memory_ai.ollama_embed(key, cfg=cfg)
+            vec = memory_ai.ollama_embed(embed_key(meta, body), cfg=cfg)
         except Exception:
             return {}   # similarity expert down => skip dedup gate entirely (fail-safe: hold)
+        embs[p.name] = vec
+        new_cache[p.name] = {"mkey": mkey, "vec": vec}
+        changed = True
+    if changed or len(new_cache) != len(cache):     # persist (also prunes deleted memories)
+        try:
+            _EMBED_CACHE.write_text(json.dumps(new_cache))
+        except Exception:
+            pass
     return embs
 
 

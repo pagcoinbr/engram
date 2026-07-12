@@ -46,10 +46,15 @@ try:
 except Exception:
     memory_ai = None
 
-DEFAULT_INTERVALS = {"health": 300, "graph": 1800, "vector": 1800,
-                     "maintenance": 21600, "export": 86400, "reconcile": 86400,
-                     "approvals": 300}
-ORDER = ["health", "approvals", "graph", "vector", "maintenance", "export", "reconcile"]
+# Cadences reflect each stage's real time-constant (Fable 2026-07-12):
+#   harvest = ENCODE  -> frequent (watermark makes it delta-cost; idle-grace skips
+#             active chats so it only pays tokens on FINISHED sessions).
+#   maintenance = fixate SCORE + light_pass -> nightly (signals move over days).
+#   distill (LLM) is gated WEEKLY inside memory_fixate_cron.sh.
+DEFAULT_INTERVALS = {"health": 300, "approvals": 300, "harvest": 3600,
+                     "graph": 1800, "vector": 1800,
+                     "maintenance": 86400, "export": 86400, "reconcile": 86400}
+ORDER = ["health", "approvals", "harvest", "graph", "vector", "maintenance", "export", "reconcile"]
 
 
 def cfg():
@@ -173,22 +178,32 @@ def _generate_available() -> bool:
     except Exception:
         return False
 
-def task_maintenance():
-    # Encode/distill need an LLM. If none can generate (GPU box down AND claude/ccg
-    # unreachable), DEFER: harvest keeps its watermark, nothing is lost, and we log
-    # one line instead of thousands of exit-1s. Deterministic maintenance that needs
-    # no LLM (index/score/reconcile) runs via its own tasks.
+def task_harvest():
+    """ENCODE (frequent): harvest just-finished chats -> graduate. The LLM is needed,
+    so DEFER cleanly when no backend can generate (watermark preserved, nothing lost)."""
     if not _generate_available():
-        log("maintenance: no generate backend available — deferring LLM pipeline (encode/distill)")
+        log("harvest: no generate backend — deferring encode (watermark preserved)")
         return
+    pipe = None
+    for c in (ENGRAM_BIN / "memory_pipeline.sh", HERE / "memory_pipeline.sh"):
+        if c.exists():
+            pipe = c; break
+    if not pipe:
+        log("harvest: memory_pipeline.sh not found"); return
+    _run(["bash", str(pipe)])
+    if ((cfg().get("telegram") or {}).get("activity_log")):
+        gate = ENGRAM_BIN / "engram_telegram_gate.py"
+        if gate.exists():
+            _run([sys.executable, str(gate), "--activity"], timeout=30)
+
+
+def task_maintenance():
+    # FIXATE (nightly): score + quarantine + light_pass + weekly-gated distill. Encode
+    # (harvest->graduate) is now its own frequent task, NOT run here. Deterministic
+    # scoring needs no LLM, but distill does — the cron gates that internally.
     sh = _maintenance_script()
     if sh:
-        _run(["bash", str(sh)])
-        # Log the run's autonomous activity to Telegram (opt-in: telegram.activity_log).
-        if ((cfg().get("telegram") or {}).get("activity_log")):
-            gate = ENGRAM_BIN / "engram_telegram_gate.py"
-            if gate.exists():
-                _run([sys.executable, str(gate), "--activity"], timeout=30)
+        _run(["bash", str(sh)])   # activity notify lives in task_harvest (encode is where the news is)
     else:
         log("maintenance: no maintenance script found (memory_fixate_cron.sh / memory_pipeline.sh)")
 
@@ -211,8 +226,8 @@ def task_approvals():
         return
     _run([sys.executable, str(gate), "--poll"], timeout=60)
 
-TASKS = {"health": task_health, "approvals": task_approvals, "graph": task_graph,
-         "vector": task_vector, "maintenance": task_maintenance,
+TASKS = {"health": task_health, "approvals": task_approvals, "harvest": task_harvest,
+         "graph": task_graph, "vector": task_vector, "maintenance": task_maintenance,
          "export": task_export, "reconcile": task_reconcile}
 
 

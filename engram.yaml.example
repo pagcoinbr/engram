@@ -103,7 +103,8 @@ light_pass:
   injection_guard:
     enabled: true
     quarantine_suspects: true      # auto-move suspect memories out of recall (reversible)
-  draft_distill: true              # DRAFT (never apply) cluster merges
+  draft_distill: true
+  distill_every_days: 7            # LLM distillation cadence (weekly — survival passes mint "fixed")              # DRAFT (never apply) cluster merges
   max_items: 60
 
 # ── Unattended pipeline (stages ①→⑤) ────────────────────────────────────────
@@ -113,6 +114,7 @@ light_pass:
 # runs every stage in DRY-RUN so you can watch it before granting unattended writes.
 harvest:
   max_files_per_run: 4
+  idle_minutes: 30              # only harvest a chat idle >= this (finished session); avoids paying tokens on an active chat
 
 auto_graduate:                     # stage ②/④
   enabled: false                   # OFF by default — flip on once you trust the harvester's output
