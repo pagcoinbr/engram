@@ -355,8 +355,37 @@ def _apply_merge(params):
     return True, f"umbrella {umbrella} written; backup in merge-{merge_id} (orig+{moved})"
 
 
+def _apply_suspect_restore(params):
+    """Restore a quarantined injection-suspect back into recall (the human decided
+    it's legit). Failure-atomic: keeps the quarantine copy if the restore fails."""
+    import subprocess
+    name = params["name"]
+    qf = MEM / ".quarantine" / name
+    if not qf.is_file():
+        return False, f"suspect {name} not in quarantine (already restored or purged)"
+    # Freshness: if a memory of this name is already LIVE (re-harvested since quarantine),
+    # a stale RESTORE would overwrite newer content — refuse and keep the quarantine copy.
+    if (MEM / name).is_file():
+        return False, f"a memory named {name} is already live — restore refused (kept in quarantine)"
+    save = lambda n, d, b: subprocess.run(
+        [str(HOME / ".claude" / "save_memory.sh"), n, d], input=b, capture_output=True, text=True)
+    if _restore_from_quarantine(qf, name, save):
+        return True, f"restored {name} to recall"
+    return False, f"restore failed for {name} — kept in quarantine"
+
+
 OPS = {"skill_install": _apply_skill_install, "merge_undo": _apply_merge_undo,
-       "merge_apply": _apply_merge}
+       "merge_apply": _apply_merge, "suspect_restore": _apply_suspect_restore}
+
+
+def notify_suspect(name):
+    """A memory was auto-quarantined as a possible injection suspect. Notify with a
+    one-tap RESTORE — the human never MUST act; the suspect auto-purges after probation
+    if ignored. Replaces the /memory-curate suspect-review step."""
+    return notify_undo("suspect_restore", {"name": name},
+                       f"⚠️ quarantined a possible injection suspect: {name}\n"
+                       f"It's out of recall now. Tap RESTORE if it's legit; otherwise it "
+                       f"auto-purges after probation.")
 
 
 PROBATION_DAYS = int(os.environ.get("ENGRAM_PROBATION_DAYS", "30"))
@@ -375,6 +404,13 @@ def sweep():
     for d in quar.glob("merge-*"):
         if d.is_dir() and d.stat().st_mtime < cutoff:
             shutil.move(str(d), str(trash / f"{d.name}-{_now()}"))
+            purged += 1
+    # loose quarantined SUSPECTS (injection): graduate to .trash after probation too,
+    # so a suspect the human never restored eventually purges (was: sat forever).
+    for f in quar.glob("*.md"):
+        if f.stat().st_mtime < cutoff:
+            shutil.move(str(f), str(trash / f"{f.name}-{_now()}"))
+            (quar / f"{f.name}.merged-into").unlink(missing_ok=True)
             purged += 1
     for u in _dir("undo").glob("*.json"):              # undo window closes with probation
         if u.stat().st_mtime < cutoff:
@@ -444,6 +480,8 @@ def activity_summary():
 
 def main():
     a = sys.argv[1:]
+    if "--notify-suspect" in a:
+        notify_suspect(a[a.index("--notify-suspect") + 1]); return
     if "--activity" in a:
         activity_summary(); return
     if "--digest" in a:
