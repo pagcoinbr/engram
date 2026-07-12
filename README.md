@@ -84,6 +84,35 @@ daemon. Restart Claude Code afterward so it loads the new commands.
 > **Trying it without touching an existing `~/.claude`?** Install into a sandbox:
 > `ENGRAM_CLAUDE_HOME=~/engram-sandbox/.claude ./install.sh --yes`
 
+## Updating an existing install
+
+`install.sh` is **idempotent — re-running it is the updater.** It refreshes the code
+in `~/.claude`, **preserves your `engram.yaml` and your `daemon.env` secrets** (the ccg
+key, the Telegram token), and re-registers the MCP servers without duplicating them.
+
+```bash
+cd engram && git pull            # get the new code
+./install.sh                     # re-run: refreshes ~/.claude, keeps your config + secrets
+systemctl --user restart engram.timer   # (systemd daemon) pick up the new code
+# then restart Claude Code so it reloads the commands + MCP servers
+```
+
+Two things to do by hand after an update:
+
+1. **New config keys.** Because your `engram.yaml` is preserved, keys added since you
+   installed are *not* injected — they fall back to safe code defaults, but you won't
+   get new features/cadences until you opt in. The installer prints which top-level keys
+   are new; diff `engram.yaml.example` against your `~/.claude/engram.yaml` and add the
+   blocks you want (e.g. `auto_curate`, `telegram`, `review_gate`, `harvest.idle_minutes`,
+   `daemon.intervals`). See **AUTONOMY.md** for what each does.
+2. **Vector re-index (only if crossing the body-embedding change).** Older installs
+   embedded titles only; run once so recall uses full-body vectors:
+   `~/.claude/vector/venv/bin/python ~/.claude/vector/vector_sync.py --rebuild`.
+
+Nothing destructive turns on from an update: the risky autonomy flags
+(`auto_graduate`, `auto_curate`, `skill_autoinstall`) stay at whatever you had, and
+ship **off** by default.
+
 ## How Claude uses it
 
 ### Commands

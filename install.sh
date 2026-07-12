@@ -73,6 +73,17 @@ say "engine installed into $CLAUDE (GUI: run engram-ui.sh)"
 # ---- engram.yaml ----
 if [[ -f "$CLAUDE/engram.yaml" ]]; then
   say "engram.yaml exists — preserving it (edit by hand to change backend/tier)"
+  # UPDATE aid: surface top-level config keys that exist in the shipped example but
+  # NOT in the user's config, so they can opt into new features after an update.
+  # (Non-destructive — we never edit their file; missing keys fall back to code defaults.)
+  NEWKEYS=""
+  for k in $(grep -oE '^[a-z_]+:' "$REPO/engram.yaml.example" | tr -d ':' | sort -u); do
+    grep -qE "^${k}:" "$CLAUDE/engram.yaml" || NEWKEYS="$NEWKEYS $k"
+  done
+  if [[ -n "$NEWKEYS" ]]; then
+    warn "new config keys available since your engram.yaml was written:${NEWKEYS}"
+    warn "  -> compare $REPO/engram.yaml.example and add the blocks you want (e.g. auto_curate, telegram)."
+  fi
 else
   sed -e "s|^backend: .*|backend: $BACKEND|" \
       -e "s|^tier: .*|tier: $TIER|" \
