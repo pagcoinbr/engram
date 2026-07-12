@@ -47,8 +47,9 @@ except Exception:
     memory_ai = None
 
 DEFAULT_INTERVALS = {"health": 300, "graph": 1800, "vector": 1800,
-                     "maintenance": 21600, "export": 86400, "reconcile": 86400}
-ORDER = ["health", "graph", "vector", "maintenance", "export", "reconcile"]
+                     "maintenance": 21600, "export": 86400, "reconcile": 86400,
+                     "approvals": 300}
+ORDER = ["health", "approvals", "graph", "vector", "maintenance", "export", "reconcile"]
 
 
 def cfg():
@@ -196,8 +197,18 @@ def task_reconcile():
         return
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--reconcile"])
 
-TASKS = {"health": task_health, "graph": task_graph, "vector": task_vector,
-         "maintenance": task_maintenance, "export": task_export, "reconcile": task_reconcile}
+def task_approvals():
+    """Process the async human-approval queue: consume Telegram callbacks, expire
+    stale proposals (drop), apply approved ops. No-op (cheap) when the queue is
+    empty or no Telegram token is set."""
+    gate = ENGRAM_BIN / "engram_telegram_gate.py"
+    if not gate.exists():
+        return
+    _run([sys.executable, str(gate), "--poll"], timeout=60)
+
+TASKS = {"health": task_health, "approvals": task_approvals, "graph": task_graph,
+         "vector": task_vector, "maintenance": task_maintenance,
+         "export": task_export, "reconcile": task_reconcile}
 
 
 def tick(force=None):
