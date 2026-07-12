@@ -424,6 +424,15 @@ def main():
     else:
         targets = sorted(PROJ_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
 
+    # Idle-grace: only harvest a FINISHED chat. A transcript still being written
+    # (active session) keeps gaining bytes, so harvesting it on a schedule would pay
+    # tokens on the growing tail of an in-progress conversation, repeatedly. Skip any
+    # transcript touched within `idle_minutes` — harvest it once it has settled.
+    idle_min = float((cfg.get("harvest") or {}).get("idle_minutes", 30))
+    if "--idle-minutes" in args:
+        idle_min = float(args[args.index("--idle-minutes") + 1])
+    now_ts = datetime.datetime.now().timestamp()
+
     state = load_state()
     summary = []
     processed = 0
@@ -433,6 +442,8 @@ def main():
             continue
         # Cheap skip for fully-harvested transcripts (don't count against the cap).
         if use_watermark:
+            if idle_min > 0 and (now_ts - t.stat().st_mtime) < idle_min * 60:
+                continue                      # still active — wait until the chat finishes
             off = int(state["files"].get(t.name, {}).get("offset", 0))
             if off >= t.stat().st_size:
                 continue

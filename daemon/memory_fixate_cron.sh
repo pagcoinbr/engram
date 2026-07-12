@@ -131,25 +131,25 @@ ln -sfn "$OUTDIR" "${LOGROOT}/latest"
 printf '%s\n' "$REPORT" > "${LOGROOT}/.unread"
 echo "[$(date -Iseconds)] report surfaced -> $REPORT"
 
-# 4. heavy, best-effort, bounded: draft cluster distillations (appended)
-if [[ "$(python3 "$AI" --get light_pass.draft_distill 2>/dev/null)" == "true" ]]; then
-    { echo; echo "## Proposed distillations (drafts — NOT applied; run /memory-fixate apply to act)"; echo; } >> "$REPORT"
+# 4. heavy, best-effort: draft cluster distillations — gated WEEKLY. Distillation is
+# the LLM-costed stage, and survival-passes are the clock that mints "fixed"
+# (survival>=3): distilling nightly would let a memory reach "fixed" in ~3 days,
+# defeating "earns trust over time". Weekly makes survival>=3 mean ~3 weeks survived.
+DISTILL_STAMP="${LOGROOT}/.last_distill"
+DISTILL_EVERY_DAYS="$(python3 "$AI" --get light_pass.distill_every_days 2>/dev/null || echo 7)"
+[[ "$DISTILL_EVERY_DAYS" =~ ^[0-9]+$ ]] || DISTILL_EVERY_DAYS=7
+_last_distill=0; [[ -f "$DISTILL_STAMP" ]] && _last_distill="$(cat "$DISTILL_STAMP" 2>/dev/null || echo 0)"
+_age_days=$(( ( $(date +%s) - _last_distill ) / 86400 ))
+if [[ "$(python3 "$AI" --get light_pass.draft_distill 2>/dev/null)" == "true" ]] && (( _age_days >= DISTILL_EVERY_DAYS )); then
+    { echo; echo "## Proposed distillations (drafts — NOT applied; weekly)"; echo; } >> "$REPORT"
     "$PYBIN" "${HOME}/.claude/memory_distill.py" >> "$REPORT" 2>>"${LOGROOT}/cron.log" \
         || echo "_distill drafting errored — see cron.log_" >> "$REPORT"
+    date +%s > "$DISTILL_STAMP"
+else
+    echo "_distill skipped (weekly cadence: ${_age_days}d/${DISTILL_EVERY_DAYS}d since last)_" >> "$REPORT"
 fi
-echo "[$(date -Iseconds)] maintenance done -> $REPORT"
+echo "[$(date -Iseconds)] fixate/maintenance done -> $REPORT"
 
-# 5. Unattended PIPELINE (stages ①→⑤): harvest transcripts -> stage -> graduate
-# -> guarded skill auto-install. Self-gated by memory_ai.yaml (auto_graduate /
-# skill_autoinstall default OFF, so this harvests + dry-runs until enabled).
-# Appended to its own pipeline.log; a one-line pointer goes into the report.
-{
-    echo
-    echo "## Unattended pipeline (harvest → graduate → skill auto-install)"
-    echo "_See ~/.claude/logs/pipeline.log for stage detail. Lights-out switches:"
-    echo "auto_graduate.enabled=$(python3 "$AI" --get auto_graduate.enabled 2>/dev/null) · "
-    echo "skill_autoinstall.enabled=$(python3 "$AI" --get skill_autoinstall.enabled 2>/dev/null)._"
-} >> "$REPORT"
-bash "${HOME}/.claude/memory_pipeline.sh" >>"${LOGROOT}/cron.log" 2>&1 \
-    || echo "_pipeline errored — see pipeline.log_" >> "$REPORT"
-echo "[$(date -Iseconds)] pipeline done"
+# NOTE: the unattended harvest->graduate->skill pipeline is NO LONGER run here — it
+# is its own frequent daemon task (task_harvest, hourly) so encoding stays fresh while
+# fixation runs nightly. See engram-daemon.py.
