@@ -7,6 +7,13 @@ You are running as the memory **CURATOR** — a periodic consolidation pass over
 
 The goal of the memory collection is a **library of class-level facts and experiential knowledge**. A collection of dozens of narrow entries where each captures one session's specific detail is a *failure* of the library, not a feature. Recall matches on `description`, not on exact filename — so one broad umbrella memory with labeled subsections beats five narrow siblings for discoverability.
 
+**Under autonomy (see AUTONOMY.md):** fixation scoring/tiering and near-duplicate
+merges now run automatically in the daemon, and `/memory-fixate` is retired. This
+command is the human console for the JUDGMENT residue that autonomy deliberately does
+NOT do unattended: prune stale **orphans** (no merge target), **fact-check** stale
+values, consolidate **non-duplicate** clusters, and **review/delete quarantined
+injection-suspects** (auto-quarantine is reversible; permanent deletion is human-only).
+
 This command complements the others:
 - `/memory-checkpoint` *appends* new facts.
 - `/memory-clean-review` walks files one-by-one for *manual* keep/edit/delete.
