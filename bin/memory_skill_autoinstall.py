@@ -343,7 +343,7 @@ def main():
         # draft entirely for runbooks that are inherently privileged/secret-bearing.
         src_hits = static_scan(body)
         if src_hits:
-            rec.update(decision="pending", reason=f"source-memory denylist hit: {src_hits} (held for manual /memory-to-skill)",
+            rec.update(decision="pending", reason=f"source-memory denylist hit: {src_hits} (held in .pending — not auto-promoted; a privileged runbook stays a memory)",
                        static_hits=src_hits)
             results.append(rec); continue
 
