@@ -109,6 +109,9 @@ if [[ "$(python3 "$AI" --get light_pass.injection_guard.quarantine_suspects 2>/d
                 fi
                 echo "- \`${f}\` → moved to .quarantine/, de-indexed" >> "$REPORT"
                 echo "[$(date -Iseconds)] quarantined $f"
+                # Telegram RESTORE notification (zero-command: replaces the /memory-curate
+                # suspect-review step). No-op without a token; auto-purges after probation.
+                python3 "${HOME}/.claude/engram_telegram_gate.py" --notify-suspect "$f" >/dev/null 2>&1 || true
             fi
         done <<< "$SUSPECTS"
         command -v memory_push_index >/dev/null 2>&1 && memory_push_index "fixation: quarantine suspects" 2>/dev/null || true
