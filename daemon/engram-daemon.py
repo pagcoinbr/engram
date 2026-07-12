@@ -52,9 +52,10 @@ except Exception:
 #   maintenance = fixate SCORE + light_pass -> nightly (signals move over days).
 #   distill (LLM) is gated WEEKLY inside memory_fixate_cron.sh.
 DEFAULT_INTERVALS = {"health": 300, "approvals": 300, "harvest": 3600,
-                     "graph": 1800, "vector": 1800,
-                     "maintenance": 86400, "export": 86400, "reconcile": 86400}
-ORDER = ["health", "approvals", "harvest", "graph", "vector", "maintenance", "export", "reconcile"]
+                     "graph": 1800, "vector": 1800, "maintenance": 86400,
+                     "curate": 604800, "export": 86400, "reconcile": 86400}
+ORDER = ["health", "approvals", "harvest", "graph", "vector", "maintenance",
+         "curate", "export", "reconcile"]
 
 
 def cfg():
@@ -207,6 +208,21 @@ def task_maintenance():
     else:
         log("maintenance: no maintenance script found (memory_fixate_cron.sh / memory_pipeline.sh)")
 
+def task_curate():
+    """CONSOLIDATE (weekly): auto-merge near-duplicate memories. Same slow time-constant
+    as distill — near-dups accrue as new memories graduate over days, and each merge is
+    Codex-reviewed (needs generate) + reversible. No-op unless auto_curate.enabled=true.
+    Uses the vector venv (qdrant-client) for the ANN clustering."""
+    if not (cfg().get("auto_curate") or {}).get("enabled"):
+        return
+    if not _generate_available():
+        log("curate: no generate backend — deferring auto-consolidation")
+        return
+    ac = ENGRAM_BIN / "memory_auto_curate.py"
+    if ac.exists():
+        _run([_vector_python(), str(ac), "--apply"])
+
+
 def task_export():
     if not _neo4j_up():
         return
@@ -228,7 +244,7 @@ def task_approvals():
 
 TASKS = {"health": task_health, "approvals": task_approvals, "harvest": task_harvest,
          "graph": task_graph, "vector": task_vector, "maintenance": task_maintenance,
-         "export": task_export, "reconcile": task_reconcile}
+         "curate": task_curate, "export": task_export, "reconcile": task_reconcile}
 
 
 def tick(force=None):
