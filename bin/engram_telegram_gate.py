@@ -374,8 +374,20 @@ def _apply_suspect_restore(params):
     return False, f"restore failed for {name} — kept in quarantine"
 
 
+def _apply_orphan_prune(params):
+    """Prune a stale orphan memory the human approved -> delete_memory.sh, which snapshots
+    to .trash/ (90-day recoverable). Never destroys the only copy immediately."""
+    import subprocess
+    name = params["name"]
+    if not (MEM / name).is_file():
+        return False, f"{name} already gone"
+    subprocess.run([str(HOME / ".claude" / "delete_memory.sh"), name], capture_output=True, text=True)
+    return True, f"pruned {name} -> .trash (recoverable)"
+
+
 OPS = {"skill_install": _apply_skill_install, "merge_undo": _apply_merge_undo,
-       "merge_apply": _apply_merge, "suspect_restore": _apply_suspect_restore}
+       "merge_apply": _apply_merge, "suspect_restore": _apply_suspect_restore,
+       "orphan_prune": _apply_orphan_prune}
 
 
 def notify_suspect(name):
