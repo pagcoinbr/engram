@@ -52,6 +52,12 @@ AC_DEFAULTS = {
     # There is intentionally no "no reviewer, just auto-apply" mode — a compressed merge
     # always gets either Codex or a human before it touches the store.
     "review_gate": "auto",
+    # Orphan pruning: PROPOSE (never auto) stale memories with no merge target for a
+    # one-tap Telegram prune. frequency==0 means "never discussed", NOT "worthless" (a
+    # disaster-recovery runbook is freq-0 for a year), so this is human-gated by design.
+    "prune_orphans": True,
+    "orphan_age_days": 90,
+    "max_prunes_per_run": 5,
     # When Codex DOES review: auto-apply only a near-LOSSLESS merge (a fact outside
     # Codex's slice could be dropped otherwise); everything lossy -> the human queue.
     "min_auto_coverage": 0.90,
@@ -211,7 +217,56 @@ def main():
             gate.propose("merge_apply", params, f"Needs approval — {why}. {preview}",
                          files=files, codex_verdict=verdict)
             print(f"  QUEUED for human approval ({why})"); queued += 1
-    print(f"\napplied {done}, queued {queued}." if apply else "\n(dry-run — set auto_curate.enabled + --apply)")
+
+    pruned = _orphan_prune_pass(cfg, ac, store, gate, apply) if ac.get("prune_orphans") else 0
+    print(f"\napplied {done}, queued {queued}, orphan-prune proposed {pruned}."
+          if apply else "\n(dry-run — set auto_curate.enabled + --apply)")
+
+
+def _orphan_prune_pass(cfg, ac, store, gate, apply) -> int:
+    """PROPOSE stale orphans for a one-tap Telegram prune (never auto). An orphan is:
+    type∈{project,reference}, age>=orphan_age_days, frequency==0 (never discussed), NO
+    close neighbor (no merge target), not a suspect, and not a skill source."""
+    try:
+        r = subprocess.run([sys.executable, str(HOME / ".claude" / "memory_score.py"), "--json"],
+                           capture_output=True, text=True, timeout=300)
+        scored = json.loads(r.stdout).get("memories", [])
+    except Exception as e:
+        print(f"[orphan-prune] scorer unavailable ({e}) — skipping"); return 0
+    # set of files that HAVE a merge target (close neighbor >= 0.80) — those are not orphans
+    close = set()
+    try:
+        for _s, a, b in store.find_duplicates(threshold=0.80, max_pairs=2000):
+            close.add(a); close.add(b)
+    except Exception:
+        pass
+    age_min = float(ac.get("orphan_age_days", 90))
+    prunable = []
+    for m in scored:
+        name = m.get("name", "")
+        if m.get("type") not in ("project", "reference"):     # never user/feedback
+            continue
+        if float(m.get("age_days", 0)) < age_min or m.get("frequency", 1) != 0 or m.get("suspicion"):
+            continue
+        if name in close:                                     # has a merge target -> not an orphan
+            continue
+        try:
+            if "Promoted to skill:" in (MEM / name).read_text(errors="ignore"):
+                continue                                      # skill sources are load-bearing
+        except Exception:
+            continue
+        prunable.append(name)
+    n = 0
+    for name in prunable[:int(ac.get("max_prunes_per_run", 5))]:
+        preview = f"Prune stale orphan {name}: aged ≥{int(age_min)}d, never recalled, no merge target. → .trash (recoverable)."
+        if apply:
+            gate.propose("orphan_prune", {"name": name}, preview, files=[name])
+        else:
+            print(f"  would propose prune: {name}")
+        n += 1
+    if prunable:
+        print(f"[orphan-prune] {len(prunable)} orphan(s); proposed {n} (cap {ac.get('max_prunes_per_run', 5)})")
+    return n
 
 
 def _codex_verdict(umbrella_doc, source_files) -> str:
