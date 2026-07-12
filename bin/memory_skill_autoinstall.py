@@ -242,6 +242,35 @@ def append_manifest(entry: dict):
         fh.write(json.dumps(entry) + "\n")
 
 
+def stage_and_propose_skill(skill_name: str, skill_md: str, source_memory: str, verdict: str) -> bool:
+    """Stage a fully-vetted skill to skills/auto/.pending/<name>/ and PROPOSE it via
+    the approval gate. The gate's one-tap approval moves it live (skills/auto/<name>).
+    Returns True if proposed, False if the gate is unavailable (skill stays staged)."""
+    import hashlib
+    # Stage in the INERT flat shape (skills/.pending/<name>.SKILL.md), OUTSIDE the
+    # active skills/auto/ tree — a file named "<name>.SKILL.md" is NOT a discoverable
+    # skill (discovery looks for <dir>/SKILL.md), so an unapproved skill can never go
+    # live before the human tap. The gate materializes the real package on approval.
+    PENDING.mkdir(parents=True, exist_ok=True)
+    staged = PENDING / f"{skill_name}.SKILL.md"
+    staged.write_text(skill_md, encoding="utf-8")
+    # Bind the approval to THIS exact reviewed artifact: tamper between propose and
+    # approve -> sha mismatch -> the gate refuses to install it.
+    artifact_sha = hashlib.sha256(skill_md.encode()).hexdigest()
+    try:
+        sys.path.insert(0, str(HERE))
+        import engram_telegram_gate as gate
+        preview = (f"Install skill auto/{skill_name} (from memory {source_memory}). "
+                   f"Passed provenance+static+syntax+adversarial({verdict}).")
+        gate.propose("skill_install",
+                     {"name": skill_name, "source_memory": source_memory, "artifact_sha": artifact_sha},
+                     preview, files=[source_memory], codex_verdict=verdict)
+        return True
+    except Exception as e:
+        sys.stderr.write(f"[skill] gate propose failed ({e}) — staged, awaiting manual install\n")
+        return False
+
+
 def install_skill(skill_name: str, skill_md: str, source_memory: str, store: Path):
     d = SKILLS_AUTO / skill_name
     d.mkdir(parents=True, exist_ok=True)
@@ -299,9 +328,13 @@ def main():
             results.append(rec); continue
         rec["provenance"] = why
 
-        # Skip re-drafting a candidate we already drafted to .pending/ (awaiting human).
-        if (PENDING / f"{skill_name}.SKILL.md").exists():
-            rec.update(decision="pending", reason="already in .pending/ (awaiting human) — not re-drafted")
+        # Skip re-drafting a candidate already awaiting a human: the gate-failed
+        # bucket (.pending/<name>.SKILL.md) OR already staged+proposed to the gate
+        # (skills/auto/.pending/<name>/) OR already installed. Avoids a costly
+        # re-draft (and a duplicate proposal) every run.
+        if ((PENDING / f"{skill_name}.SKILL.md").exists()
+                or (SKILLS_AUTO / skill_name / "SKILL.md").exists()):
+            rec.update(decision="pending", reason="already staged/proposed/installed — not re-drafted")
             results.append(rec); continue
 
         # Gate 3a (cheap, NO LLM): scan the SOURCE memory itself before spending a
@@ -352,13 +385,19 @@ def main():
                 rec.update(decision="pending", reason=f"adversarial verdict={v} (statically clean, held for human)")
                 results.append(rec); continue
 
-        # All gates passed.
+        # All gates passed → do NOT auto-install. A skill is a BEHAVIORAL change
+        # (it acts on future sessions before anyone reviews it), so it is the one
+        # op that always needs a human even when everything else is auto: stage it
+        # and PROPOSE for one-tap approval via the gate (Fable autonomy design).
         if apply:
-            path = install_skill(skill_name, skill_md, name, store)
-            rec.update(decision="installed", reason=f"all gates passed -> {path}")
+            proposed = stage_and_propose_skill(skill_name, skill_md, name,
+                                               rec.get("adversarial") or "n/a")
+            rec.update(decision="proposed" if proposed else "staged",
+                       reason="all gates passed -> proposed for approval via gate"
+                              if proposed else "all gates passed -> staged (gate unavailable, awaiting manual install)")
             installed += 1
         else:
-            rec.update(decision="would-install", reason="all gates passed (dry-run)")
+            rec.update(decision="would-propose", reason="all gates passed (dry-run)")
         results.append(rec)
 
     if as_json:
