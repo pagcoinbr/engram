@@ -60,9 +60,12 @@ if [[ -n "$last" ]]; then
     fi
 fi
 
-if (( due )); then
-    echo "🧠 Memory consolidation due (${reason}). Run /memory-curate to review and merge — dry-run by default, nothing changes without your approval."
-fi
+# Consolidation is now AUTOMATIC (the daemon's weekly auto-curate merges near-dups and
+# proposes prunes via the approval gate) — no slash command to nudge toward. Kept the
+# `due` computation for the state file, but a session-start nudge would just be noise.
+# To consolidate on demand, ask in plain language ("tidy my memories") — the memory-tidy
+# skill triggers the pass. The harvest-failure alarm below still fires.
+: "${due:-0}"
 
 # Surface an unread weekly fixation report from the cron timer, if any.
 UNREAD="${HOME}/.claude/logs/fixation/.unread"

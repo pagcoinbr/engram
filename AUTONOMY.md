@@ -62,10 +62,10 @@ with `engram_telegram_gate.py --approve <id>`.
 - **Auto-apply + one-tap UNDO** (reversible judgment): near-lossless consolidations —
   sources go to `.quarantine/` (30-day probation, restorable), you get an Undo button.
 - **Async APPROVE required** (irreversible/behavioral, 72h→drop): **skill installs**,
-  **lossy/Codex-deferred merges**, permanent deletes, index rewrites.
-- **Terminal-only** (never proposed remotely): `/memory-curate` (prune orphans,
-  fact-check, non-dup distills), `/memory-clean-review`, and any change to the gates
-  or thresholds themselves.
+  **lossy/Codex-deferred merges**, **orphan prunes**, **suspect restores**, index rewrites.
+- **Terminal-only** (never proposed remotely): changes to the gates or thresholds
+  themselves (the system must never propose loosening its own leash), and anything
+  touching secrets / `daemon.env`.
 
 ## 5. Trust, safety, and kill-switches
 
@@ -83,18 +83,26 @@ with `engram_telegram_gate.py --approve <id>`.
   `touch ~/.claude/skills/auto/.disabled` to freeze skill installs;
   `systemctl --user stop engram.timer` to pause the daemon entirely.
 
-## 6. The slash commands under autonomy
+## 6. Zero-command — you never *need* a slash command
 
-Harvesting, scoring, and near-dup merges are automatic — you don't run commands for
-them. The `/memory-*` commands remain as the **manual console for the judgment ops
-autonomy deliberately won't do unattended**:
+Everything the old `/memory-curate` and `/memory-to-skill` commands did now happens
+automatically (or via one Telegram tap), so **both are retired.** You don't need to know
+any command exists:
 
-- `/memory-curate` — prune stale orphans, fact-check corrections, non-duplicate
-  consolidations, review/delete quarantined suspects. **Keep this.**
-- `/memory-clean-review` — periodic one-by-one human audit.
-- `/memory-checkpoint` — capture the *current* session now (and assistant-provenance
-  facts auto-graduate won't take).
-- `/memory-to-skill` — manual skill promotion (the gate handles the auto path).
+- **Consolidation** (near-dup merges) → weekly auto-curate.
+- **Skill promotion** → matured procedure memories auto-propose; or just say *"make this a
+  skill"* in chat and harvest tags it for promotion on the next tick.
+- **Orphan pruning** → weekly proposal, one Telegram tap.
+- **Suspect review** → auto-quarantine + a Telegram RESTORE button; auto-purges if ignored.
+- **Fact-check of remote reality** → *dropped* (an unattended agent with fleet creds
+  steered by memory content is an injection→lateral-movement risk); stale facts self-heal
+  when you correct them in normal chat and auto-curate merges the correction.
 
-`/memory-fixate` is **retired** — its scoring is now automatic and its consolidation is
-handled by auto-curate + `/memory-curate`.
+If you *want* to trigger a pass on demand, **ask in plain language** — the natural-language
+skills pick it up:
+- *"tidy / clean up / consolidate my memories"* → **memory-tidy** runs the curate pass now.
+- *"make this a skill / save this procedure"* → handled at harvest (or **memory-promote**).
+
+Still shipped (rarely needed): `/memory-checkpoint` (capture the current session now) and
+`/memory-clean-review` (a one-by-one human audit). `/memory-curate`, `/memory-to-skill`,
+and `/memory-fixate` are **removed.**
