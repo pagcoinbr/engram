@@ -72,8 +72,13 @@ with `engram_telegram_gate.py --approve <id>`.
 - **Weekly digest** on Telegram: what the daemon did autonomously, and what's pending.
 - **Recoverability**: deletes → `.trash/` (90 days); merges → `.quarantine/` (30-day
   probation) then `.trash/`. Nothing is destroyed without a long undo window.
-- **Codex** reviews every risky op before it applies; only what Codex can't clear
-  reaches your phone.
+- **Codex** reviews risky ops before they apply, but it's **optional** — most users
+  run only Claude. For auto-curate, `auto_curate.review_gate` controls it:
+  - `auto` (default) — use Codex **if installed**, else fall back to a **human Telegram
+    approval** for every merge. So without Codex you still get a safe reviewer (you,
+    one tap), never an unreviewed auto-merge.
+  - `codex` — force Codex; `human` — force the Telegram gate for every merge.
+  Skill installs never needed Codex — they always require your approval.
 - **Kill-switches**: set any `*.enabled: false` (takes effect next tick);
   `touch ~/.claude/skills/auto/.disabled` to freeze skill installs;
   `systemctl --user stop engram.timer` to pause the daemon entirely.

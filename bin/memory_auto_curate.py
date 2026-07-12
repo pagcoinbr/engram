@@ -42,13 +42,31 @@ AC_DEFAULTS = {
     "enabled": False,
     "merge_threshold": 0.92,      # cosine >= this to auto-merge (stricter than the 0.86 finder)
     "max_merges_per_run": 2,
-    "codex_gate": True,           # Codex reviews each merge before auto-apply
-    # A LOSSY (compressed) merge is NEVER auto-applied: a fact outside Codex's review
-    # slice could be dropped while the source leaves recall. Auto-apply ONLY when the
-    # compression preserved nearly all source sentences (full-source metric,
-    # deterministic) AND Codex is clean; everything else -> the human approval queue.
+    # Who reviews a merge before it can auto-apply:
+    #   auto   (default) — use Codex if it's installed; otherwise fall back to HUMAN
+    #                      (every merge -> Telegram approval queue). Best for portability:
+    #                      most users have Claude but NOT Codex.
+    #   codex  — force Codex review (near-lossless+clean auto-applies, else human queue).
+    #   human  — NO Codex; EVERY merge goes to the human Telegram queue (nothing auto-
+    #            applies). Safe default when you have only one agent.
+    # There is intentionally no "no reviewer, just auto-apply" mode — a compressed merge
+    # always gets either Codex or a human before it touches the store.
+    "review_gate": "auto",
+    # When Codex DOES review: auto-apply only a near-LOSSLESS merge (a fact outside
+    # Codex's slice could be dropped otherwise); everything lossy -> the human queue.
     "min_auto_coverage": 0.90,
 }
+
+
+def _resolve_gate(ac) -> str:
+    """codex | human. 'auto' -> codex iff the advisor script AND the codex CLI are both
+    present; else human (Telegram approval). So a user without Codex still gets a safe
+    reviewer (themselves, one tap) instead of unreviewed auto-merges."""
+    import shutil
+    g = (ac.get("review_gate") or "auto").lower()
+    if g in ("codex", "human"):
+        return g
+    return "codex" if (ADVISOR.exists() and shutil.which("codex")) else "human"
 
 ADVISOR = HOME / ".claude" / "skills" / "code-advisor" / "scripts" / "code_advisor.py"
 
@@ -135,8 +153,9 @@ def main():
             print(f"[auto-curate] skip mixed-type cluster {files}")
     typed = typed[:ac["max_merges_per_run"]]
 
+    gate_mode = _resolve_gate(ac)     # "codex" or "human"
     print(f"# memory_auto_curate — apply={apply} enabled={ac['enabled']} "
-          f"threshold={ac['merge_threshold']} cap={ac['max_merges_per_run']} codex_gate={ac['codex_gate']}")
+          f"threshold={ac['merge_threshold']} cap={ac['max_merges_per_run']} review_gate={gate_mode}")
     print(f"near-dup clusters this run: {len(typed)}")
     import engram_telegram_gate as gate
     done = queued = 0
@@ -169,10 +188,15 @@ def main():
         if not apply:
             print(f"  would: {preview}"); continue
         cov = report.get("sentence_coverage", 0.0)
-        verdict = _codex_verdict(doc, files) if ac["codex_gate"] else "APPROVE"
-        # AUTO-APPLY only a near-LOSSLESS + Codex-clean merge; a lossy compression
-        # (the common case) is a JUDGMENT call -> route to the human queue, never
-        # auto-applied. coverage is measured on the FULL sources (not Codex's slice).
+        # HUMAN gate (no Codex): every merge goes to the Telegram approval queue.
+        if gate_mode == "human":
+            gate.propose("merge_apply", params, f"Needs your approval (no Codex). {preview}",
+                         files=files, codex_verdict="human-gate")
+            print("  QUEUED for human approval (human gate — no Codex)"); queued += 1
+            continue
+        # CODEX gate: auto-apply only a near-LOSSLESS + clean merge; lossy or non-clean
+        # -> human queue. coverage is on the FULL sources (not Codex's truncated slice).
+        verdict = _codex_verdict(doc, files)
         if cov >= ac["min_auto_coverage"] and verdict == "APPROVE":
             ok, detail = gate._apply_merge(params)
             print(f"  AUTO-APPLIED (near-lossless cov={cov}; {detail})")
