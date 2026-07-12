@@ -134,7 +134,10 @@ auto_curate:
   enabled: false
   merge_threshold: 0.92            # cosine >= this to auto-merge (high = only true near-dups)
   max_merges_per_run: 2
-  codex_gate: true                 # Codex triages each merge; defers route to the human queue
+  review_gate: auto                # auto | codex | human. 'auto' uses Codex if installed, ELSE falls
+                                   # back to a HUMAN Telegram approval for every merge. Most users have
+                                   # only Claude (no Codex) -> 'auto' = human-gated, safely. 'human' forces
+                                   # it; 'codex' forces Codex. There is no unreviewed auto-apply mode.
 
 # Async human-approval gate (Telegram). For the irreversible/behavioral ops: skill
 # installs (always), Codex-deferred merges, purges. Long-poll (no webhook). Put the
