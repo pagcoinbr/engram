@@ -256,7 +256,17 @@ def _safe_name(name):
     return s or "untitled"
 
 
-def write_candidate(cand, provenance, session_id, valid_ids):
+# Explicit skill-promotion intent in the USER's own words. When present in the session,
+# a user-direct procedure memory is stamped `promote: requested` so it skips the ~3-week
+# maturity wait (keeping every safety gate + the Telegram approval) — replacing the
+# on-demand /memory-to-skill command.
+PROMOTE_INTENT_RE = re.compile(
+    r"\bmake (this|that|it) (a |into a )?skill\b|\bturn (this|that|it) into a skill\b|"
+    r"\bsave (this|that|it) as a (skill|procedure|runbook)\b|\bremember .{0,40}as a (skill|procedure)\b|"
+    r"\bso you can (do|run|use|repeat) (this|that|it)\b", re.IGNORECASE)
+
+
+def write_candidate(cand, provenance, session_id, valid_ids, promote=False):
     typ = cand.get("type") if cand.get("type") in VALID_TYPES else "reference"
     base = _safe_name(cand.get("name"))
     fname = f"{typ}_{base}.md"
@@ -282,6 +292,7 @@ harvest:
   cites: {json.dumps(cites)}
   confidence: {float(cand.get('confidence') or 0.0):.2f}
   harvested_at: {now}
+  promote: {"requested" if promote else "no"}
 ---
 
 {body}
@@ -363,6 +374,12 @@ def harvest_transcript(path: Path, role: str, max_chars: int, state: dict,
         return {"file": fkey, "segments": len(segs),
                 "error": "empty/garbage LLM response — watermark held", "candidates": []}
 
+    # Did the user explicitly ask to make something a skill this session? (transcript-
+    # level; the downstream procedure-density gate + Telegram approval ensure only a real
+    # runbook actually becomes a skill, so a transcript-wide flag is safe.)
+    wants_skill = any(PROMOTE_INTENT_RE.search(s["text"])
+                      for s in segs if s["kind"] == "user-direct")
+
     results = []
     for c in cands:
         if not isinstance(c, dict) or not c.get("body"):
@@ -371,15 +388,17 @@ def harvest_transcript(path: Path, role: str, max_chars: int, state: dict,
         if memory_ai.is_transient_fact(c.get("name", ""), c.get("description", "")):
             continue
         prov = classify_provenance(c.get("cites"), valid_ids, seg_kind)
+        promote = wants_skill and prov == "user-direct"
         out = {
             "name": c.get("name"),
             "type": c.get("type"),
             "provenance": prov,
             "cites": [x for x in (c.get("cites") or []) if x in valid_ids],
             "confidence": c.get("confidence"),
+            "promote": promote,
         }
         if not dry_run:
-            out["path"] = str(write_candidate(c, prov, session_id, valid_ids))
+            out["path"] = str(write_candidate(c, prov, session_id, valid_ids, promote=promote))
         results.append(out)
 
     if use_watermark and not dry_run:

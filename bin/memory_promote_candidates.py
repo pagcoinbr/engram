@@ -164,11 +164,17 @@ def evaluate(mem: dict, store: Path, freq_min: int, proc_min: float) -> dict:
     proc = procedure_score(sig)
     promoted = already_promoted(body, skill_name)
 
+    # Explicit on-demand promotion: the user asked for this in plain chat ("make this a
+    # skill"), stamped as `promote: requested` at harvest. Bypass ONLY the maturity gate
+    # (status + frequency) — the runbook-density gate + already-promoted still apply, so a
+    # fact with no runnable steps still can't become a skill. Replaces /memory-to-skill.
+    requested = bool(re.search(r"^\s*promote:\s*requested\b", body, re.M))
     reasons = []
-    if mem["status"] not in ELIGIBLE_STATUS:
-        reasons.append(f"status={mem['status']} (need corroborated/fixed)")
-    if mem["frequency"] < freq_min:
-        reasons.append(f"freq={mem['frequency']} < {freq_min}")
+    if not requested:
+        if mem["status"] not in ELIGIBLE_STATUS:
+            reasons.append(f"status={mem['status']} (need corroborated/fixed)")
+        if mem["frequency"] < freq_min:
+            reasons.append(f"freq={mem['frequency']} < {freq_min}")
     if proc < proc_min:
         reasons.append(f"procedure_score={proc} < {proc_min} (too little runbook signal)")
     if promoted:

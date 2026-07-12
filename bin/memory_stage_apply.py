@@ -218,11 +218,14 @@ def canonical_content(meta, body, provenance, sid):
     extra = ""
     if typ in ("feedback", "project"):
         extra = "\n**Why:** harvested from real session usage.\n**How to apply:** treat as a durable preference/state fact.\n"
+    # Carry the explicit skill-promotion request through graduation so the promoter
+    # sees it on the live memory (bypasses the maturity wait; keeps the runbook gate).
+    promote_line = "\npromote: requested" if ((meta.get("harvest") or {}).get("promote") == "requested") else ""
     return f"""---
 name: {name}
 description: {desc}
 metadata:
-  type: {typ}
+  type: {typ}{promote_line}
 ---
 
 ## Summary
