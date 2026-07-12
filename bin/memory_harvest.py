@@ -119,7 +119,7 @@ def segment_events(lines):
     """
     segs = []
     u = a = 0
-    for line in lines:
+    for line_idx, line in enumerate(lines):
         line = line.strip()
         if not line:
             continue
@@ -147,11 +147,11 @@ def segment_events(lines):
                 if not t:
                     continue
                 u += 1
-                segs.append({"id": f"U{u}", "kind": "user-direct", "text": t})
+                segs.append({"id": f"U{u}", "kind": "user-direct", "text": t, "line_idx": line_idx})
         elif role == "assistant":
             for t in texts:
                 a += 1
-                segs.append({"id": f"A{a}", "kind": "assistant", "text": t})
+                segs.append({"id": f"A{a}", "kind": "assistant", "text": t, "line_idx": line_idx})
     return segs
 
 
@@ -194,18 +194,22 @@ SEGMENTS:
 
 
 def _render_segments(segs, max_chars):
-    """Render newest-first up to a char budget, then restore chronological order."""
-    rendered, total, kept = [], 0, []
-    for s in reversed(segs):
+    """Render OLDEST-first up to a char budget. Oldest-first (was newest-first) so
+    the watermark can advance monotonically to the last rendered segment and the
+    UN-rendered remainder is picked up next run — instead of being silently dropped
+    when a dense session exceeds the budget. Returns (text, valid_ids, kept_count):
+    kept_count lets the caller advance the watermark only past what was harvested."""
+    kept, total = [], 0
+    for s in segs:
         line = f"[{s['id']}] {s['text']}"
         if len(line) > 2000:
             line = line[:2000] + " …"
-        if total + len(line) > max_chars:
+        if kept and total + len(line) > max_chars:   # always keep at least one (progress)
             break
         kept.append(s)
         total += len(line)
-    kept.reverse()
-    return "\n".join(f"[{s['id']}] {s['text'][:2000]}" for s in kept), {s["id"] for s in kept}
+    return ("\n".join(f"[{s['id']}] {s['text'][:2000]}" for s in kept),
+            {s["id"] for s in kept}, len(kept))
 
 
 def _parse_json_array(raw):
@@ -315,10 +319,23 @@ def harvest_transcript(path: Path, role: str, max_chars: int, state: dict,
     if use_watermark and offset >= size:
         return {"file": fkey, "skipped": "no new bytes", "candidates": []}
 
-    with path.open("r", errors="ignore") as fh:
+    # Read in BYTES for exact per-line offsets, so the watermark can advance to a
+    # precise line boundary (never mid-line, never past un-harvested content).
+    with path.open("rb") as fh:
         fh.seek(offset)
-        new_lines = fh.readlines()
-        new_offset = fh.tell()
+        blob = fh.read()
+    blines = blob.splitlines(keepends=True)
+    # 1c: a live transcript can be mid-append — a final line without a trailing
+    # newline is incomplete; drop it and stop the watermark before it so both halves
+    # of that event are re-read next run.
+    if blines and not blines[-1].endswith((b"\n", b"\r")):
+        blines = blines[:-1]
+    new_lines, line_end_off, pos = [], [], offset
+    for bl in blines:
+        pos += len(bl)
+        new_lines.append(bl.decode("utf-8", "ignore"))
+        line_end_off.append(pos)          # byte offset just AFTER this line
+    new_offset = pos
 
     segs = segment_events(new_lines)
     if not segs:
@@ -326,13 +343,25 @@ def harvest_transcript(path: Path, role: str, max_chars: int, state: dict,
             state["files"][fkey] = {"offset": new_offset}
         return {"file": fkey, "segments": 0, "candidates": []}
 
-    rendered, valid_ids = _render_segments(segs, max_chars)
+    rendered, valid_ids, kept_n = _render_segments(segs, max_chars)
+    # 1a: advance the watermark only past the segments actually rendered/harvested.
+    # If some were dropped (budget), the remainder is re-read next run (not lost).
+    if kept_n < len(segs):
+        watermark_off = line_end_off[segs[kept_n - 1]["line_idx"]]
+    else:
+        watermark_off = new_offset
     seg_kind = {s["id"]: s["kind"] for s in segs}
     session_id = path.stem
 
     prompt = EXTRACT_PROMPT.format(segments=rendered)
     raw = memory_ai.ollama_generate(prompt, role=role)
     cands = _parse_json_array(raw)
+    # 1b: the LLM returned nothing usable AND didn't legitimately say "empty" — treat
+    # as a transient failure and DON'T advance the watermark, so the window is retried
+    # instead of silently discarded (truncated/garbage response, gateway hiccup).
+    if not cands and "[]" not in (raw or ""):
+        return {"file": fkey, "segments": len(segs),
+                "error": "empty/garbage LLM response — watermark held", "candidates": []}
 
     results = []
     for c in cands:
@@ -354,8 +383,8 @@ def harvest_transcript(path: Path, role: str, max_chars: int, state: dict,
         results.append(out)
 
     if use_watermark and not dry_run:
-        state["files"][fkey] = {"offset": new_offset}
-    return {"file": fkey, "segments": len(segs),
+        state["files"][fkey] = {"offset": watermark_off}   # only past harvested segments (1a)
+    return {"file": fkey, "segments": len(segs), "rendered": kept_n,
             "user_direct_segs": sum(1 for s in segs if s["kind"] == "user-direct"),
             "candidates": results}
 

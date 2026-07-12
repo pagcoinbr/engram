@@ -367,8 +367,18 @@ def _ollama_host(cfg) -> str:
 def _timeout(cfg) -> int:
     return int(cfg.get("ollama", {}).get("timeout_seconds", 600))
 
-def health(cfg=None) -> dict:
-    """Reachability of the active generation backend + the embedding path. For the daemon/GUI."""
+_HEALTH_CACHE = {"t": 0.0, "result": None}
+_HEALTH_TTL = int(os.environ.get("ENGRAM_HEALTH_TTL", "600"))   # seconds
+
+def health(cfg=None, force=False) -> dict:
+    """Reachability of the active generation backend + the embedding path. For the
+    daemon/GUI. CACHED for _HEALTH_TTL so a `ccg`/`claude` probe isn't a real LLM
+    round-trip on every 30-min tick (each burns OAuth quota and can hang) — and so
+    task_maintenance's _generate_available() check reuses the tick's probe."""
+    import time as _time
+    if not force and _HEALTH_CACHE["result"] is not None \
+            and (_time.time() - _HEALTH_CACHE["t"]) < _HEALTH_TTL:
+        return _HEALTH_CACHE["result"]
     cfg = _cfg(cfg)
     b = backend(cfg)
     out = {"backend": b, "tier": tier(cfg), "generate": False, "embed": False, "detail": ""}
@@ -393,6 +403,7 @@ def health(cfg=None) -> dict:
         out["embed_dim"] = len(v)
     except Exception as ex:
         out["detail"] = (out["detail"] + f"; embed: {ex}").strip("; ")
+    _HEALTH_CACHE["t"] = _time.time(); _HEALTH_CACHE["result"] = out
     return out
 
 

@@ -453,7 +453,12 @@ def main():
         f = freq.get(name, 0)
         body = mem_text[name]
         persist = bool(PERSIST_RE.search(body))
-        suspicion = persist and survival == 0 and f <= 1 and age_days <= SUSPECT_AGE_DAYS
+        # Exempt freshly AUTO-GRADUATED memories: they already cleared the graduation
+        # injection denylist + LLM verdict, so a legit "Persistent=true" (systemd) or
+        # "persistent volume" mention must not trip a re-quarantine → re-harvest loop.
+        auto_graduated = "auto-graduated" in body.lower()
+        suspicion = (persist and not auto_graduated
+                     and survival == 0 and f <= 1 and age_days <= SUSPECT_AGE_DAYS)
         conf, status, review, parts = score_memory(age_days, f, survival, suspicion, freq_norm)
         st_mem["last_status"] = status
         st_mem["last_score"] = conf

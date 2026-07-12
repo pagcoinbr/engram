@@ -147,6 +147,9 @@ INJECTION_DENYLIST = [
     (r"\byou (must|must always|should always|are required to)\b", "instruction-planting"),
     (r"\b(always (run|execute)|from now on|on every (session|startup|prompt))\b", "persist-instruction"),
     (r"\bsystem prompt\b", "system-prompt-ref"),
+    # Anti-injection of the LLM judge itself: a genuine durable fact never contains
+    # the verdict token the injection expert is asked to emit.
+    (r"VERDICT:\s*(SAFE|SUSPECT)", "verdict-injection"),
 ]
 _DENY_COMPILED = [(re.compile(p, re.I), tag) for p, tag in INJECTION_DENYLIST]
 
@@ -248,16 +251,28 @@ def main():
         return
 
     # Prune stale staged candidates so held (never-graduating) items can't pile up.
+    # RENAME to .staging/.expired/ (not unlink) so a starved/never-evaluated
+    # user-direct candidate isn't silently destroyed — it's recoverable + auditable.
     pruned = 0
     ttl_days = int(ag.get("staging_ttl_days", 14))
     if ttl_days > 0 and apply:
+        expired = STAGING / ".expired"
         cutoff = datetime.datetime.now().timestamp() - ttl_days * 86400
         for p in STAGING.glob("*.md"):
             if p.stat().st_mtime < cutoff:
-                p.unlink(missing_ok=True)
+                expired.mkdir(exist_ok=True)
+                p.rename(expired / p.name)
                 pruned += 1
 
-    cands = sorted(STAGING.glob("*.md"))[:max_per]
+    def _prov(p):
+        m = re.search(r"^\s*provenance:\s*(\S+)", p.read_text(errors="ignore"), re.M)
+        return m.group(1) if m else "unverified"
+    # Process allow_provenance candidates FIRST so a pile of never-graduating holds
+    # (assistant/unverified) can't starve fresh user-direct candidates out of the
+    # per-run window (they'd otherwise sit unevaluated until the TTL deletes them).
+    allow = set(ag["allow_provenance"])
+    cands = sorted(STAGING.glob("*.md"),
+                   key=lambda p: (0 if _prov(p) in allow else 1, p.name))[:max_per]
     decisions = []
     embs = existing_embeddings(cfg) if cands else {}
 
@@ -326,11 +341,28 @@ def main():
                     p.rename(QUAR / p.name)
                 d.update(action="quarantine", reason=f"injection verdict={v}")
                 decisions.append(d); continue
+        # Gate 5: strong secret scan (engram_secrets.SECRET_RE — the AGGRESSIVE
+        # variant: 32+ hex, 40+ base64, mnemonics, WIF/xprv). save_memory.sh only
+        # applies the high-precision block ERE, which misses a bare 64-hex EVM key
+        # or a base64 macaroon a user pasted into chat. Quarantine (reviewable)
+        # rather than write a secret into the store.
+        if engram_secrets.looks_secret(f"{desc}\n{body}"):
+            if apply:
+                QUAR.mkdir(parents=True, exist_ok=True)
+                p.rename(QUAR / p.name)
+            d.update(action="quarantine", reason="secret-scan: possible credential in body")
+            decisions.append(d); continue
         # All gates passed → graduate
         content = canonical_content(meta, body, prov, sid)
         status = graduate(p.name, content, desc or p.stem, apply)
-        if status in ("graduated",):
+        if status == "graduated":
             p.unlink(missing_ok=True)
+        elif apply and status.startswith("save-failed"):
+            # e.g. the writer's secret guard blocked it — don't re-run gates + a
+            # fresh ccg injection call every 6h for 14 days; quarantine for review.
+            QUAR.mkdir(parents=True, exist_ok=True)
+            p.rename(QUAR / p.name)
+            d.update(action="quarantine", reason=status); decisions.append(d); continue
         d.update(action=status, reason="all gates passed")
         decisions.append(d)
 
