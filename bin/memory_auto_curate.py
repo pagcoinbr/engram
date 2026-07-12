@@ -42,8 +42,15 @@ AC_DEFAULTS = {
     "enabled": False,
     "merge_threshold": 0.92,      # cosine >= this to auto-merge (stricter than the 0.86 finder)
     "max_merges_per_run": 2,
-    "min_sentence_coverage": 0.98,  # refuse to apply a merge that would drop prose
+    "codex_gate": True,           # Codex reviews each merge before auto-apply
+    # A LOSSY (compressed) merge is NEVER auto-applied: a fact outside Codex's review
+    # slice could be dropped while the source leaves recall. Auto-apply ONLY when the
+    # compression preserved nearly all source sentences (full-source metric,
+    # deterministic) AND Codex is clean; everything else -> the human approval queue.
+    "min_auto_coverage": 0.90,
 }
+
+ADVISOR = HOME / ".claude" / "skills" / "code-advisor" / "scripts" / "code_advisor.py"
 
 
 def ac_cfg(cfg):
@@ -129,38 +136,93 @@ def main():
     typed = typed[:ac["max_merges_per_run"]]
 
     print(f"# memory_auto_curate — apply={apply} enabled={ac['enabled']} "
-          f"threshold={ac['merge_threshold']} cap={ac['max_merges_per_run']}")
+          f"threshold={ac['merge_threshold']} cap={ac['max_merges_per_run']} codex_gate={ac['codex_gate']}")
     print(f"near-dup clusters this run: {len(typed)}")
-    done = 0
+    import engram_telegram_gate as gate
+    done = queued = 0
     for files in typed:
         paths = [MEM / f for f in files]
         umbrella = max(paths, key=lambda p: _score(p, scores))   # keep the highest-trust member's name
         name, desc, typ = _fm(umbrella)
-        key = umbrella.stem
-        final, report = mdv.distill_cluster(key, files, cfg=cfg, preserve_sources=True)
-        cov = report.get("sentence_coverage", 0.0)
-        print(f"\n· cluster {files}  -> umbrella {umbrella.name}  sentence_cov={cov}")
-        if cov < ac["min_sentence_coverage"]:
-            print(f"  HOLD: sentence_coverage {cov} < {ac['min_sentence_coverage']} — not lossless, skipping")
-            continue
+        # COMPRESS for real (no preserve_sources) — the umbrella is a tight consolidation.
+        # Losslessness is provided by REVERSIBILITY (sources -> quarantine), not by
+        # appending everything. sentence_coverage is recorded, not gated.
+        final, report = mdv.distill_cluster(umbrella.stem, files, cfg=cfg, preserve_sources=False)
         body = _body_of(final)
-        if engram_secrets.looks_secret(body):
-            print("  HOLD: umbrella tripped secret scan — skipping")
-            continue
+        # Secret-scan desc+body AND every source: if any holds a credential, do NOT
+        # consolidate (leave as-is) — never route secret-bearing text onward.
+        if (not body.strip() or engram_secrets.looks_secret(f"{desc}\n{body}")
+                or any(engram_secrets.looks_secret((MEM/f).read_text(errors="ignore")) for f in files)):
+            print(f"· {files}: HOLD (empty umbrella or secret in cluster) — skipping"); continue
         doc = f"---\nname: {umbrella.stem}\ndescription: {desc}\nmetadata:\n  type: {typ}\n---\n\n{body}"
         absorbed = [f for f in files if f != umbrella.name]
+        # transaction id so a second merge on the same umbrella can't clobber the
+        # first merge's backup (each merge's originals live under their own dir)
+        import hashlib as _hl
+        merge_id = _hl.sha256((umbrella.name + "".join(sorted(absorbed)) + doc).encode()).hexdigest()[:10]
+        params = {"umbrella": umbrella.name, "umbrella_content": doc, "desc": desc,
+                  "absorbed": absorbed, "merge_id": merge_id}
+        preview = (f"Merge {len(files)} near-dups → {umbrella.name} (compressed "
+                   f"{report.get('draft_chars')} chars, prose-cov {report.get('sentence_coverage')}). "
+                   f"Absorbed→quarantine: {', '.join(absorbed)}")
+        print(f"\n· {files} -> {umbrella.name}")
         if not apply:
-            print(f"  would WRITE umbrella {umbrella.name} + TRASH {absorbed}")
-            continue
-        r = subprocess.run([str(SAVE), umbrella.name, desc or umbrella.stem],
-                           input=doc, capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"  ERROR writing umbrella: {r.stderr.strip()[:120]} — NOT deleting sources"); continue
-        for a in absorbed:                    # only after the umbrella is safely written
-            subprocess.run([str(DELETE), a], capture_output=True, text=True)
-        print(f"  MERGED: wrote {umbrella.name}, trashed {absorbed} (recoverable in .trash/)")
-        done += 1
-    print(f"\napplied {done} merge(s)." if apply else "\n(dry-run — set auto_curate.enabled + --apply)")
+            print(f"  would: {preview}"); continue
+        cov = report.get("sentence_coverage", 0.0)
+        verdict = _codex_verdict(doc, files) if ac["codex_gate"] else "APPROVE"
+        # AUTO-APPLY only a near-LOSSLESS + Codex-clean merge; a lossy compression
+        # (the common case) is a JUDGMENT call -> route to the human queue, never
+        # auto-applied. coverage is measured on the FULL sources (not Codex's slice).
+        if cov >= ac["min_auto_coverage"] and verdict == "APPROVE":
+            ok, detail = gate._apply_merge(params)
+            print(f"  AUTO-APPLIED (near-lossless cov={cov}; {detail})")
+            if ok:
+                gate.notify_undo("merge_undo",
+                                 {"umbrella": umbrella.name, "absorbed": absorbed, "merge_id": merge_id},
+                                 f"🧠 auto-merged (near-lossless): {preview}\nTap UNDO to reverse.")
+                done += 1
+        else:
+            why = (f"lossy compression (cov={cov} < {ac['min_auto_coverage']})"
+                   if cov < ac["min_auto_coverage"] else f"Codex {verdict}")
+            gate.propose("merge_apply", params, f"Needs approval — {why}. {preview}",
+                         files=files, codex_verdict=verdict)
+            print(f"  QUEUED for human approval ({why})"); queued += 1
+    print(f"\napplied {done}, queued {queued}." if apply else "\n(dry-run — set auto_curate.enabled + --apply)")
+
+
+def _codex_verdict(umbrella_doc, source_files) -> str:
+    """Ask the Codex advisor whether the compressed umbrella loses information vs its
+    sources or introduces a secret. Returns APPROVE only on an explicit clean verdict;
+    DEFER on anything else (fail-closed → routes to the human queue)."""
+    if not ADVISOR.exists():
+        return "DEFER-no-advisor"
+    # Redact EVERYTHING before it reaches the advisor subprocess/backend/logs — the
+    # whole umbrella doc (its frontmatter description may hold a secret) AND every
+    # source. A scanner-missed credential in a legacy memory must not leak.
+    safe_umbrella = engram_secrets.redact(umbrella_doc)[0]
+    srcs = "\n\n".join(f"### {f}\n{engram_secrets.redact((MEM/f).read_text(errors='ignore')[:2000])[0]}"
+                       for f in source_files)
+    blob = f"PROPOSED UMBRELLA:\n{safe_umbrella[:4000]}\n\nSOURCES IT REPLACES:\n{srcs[:6000]}"
+    try:
+        r = subprocess.run(
+            [sys.executable, str(ADVISOR), "--mode", "review", "--stdin",
+             "--task", ("Does this umbrella drop any durable fact from the sources, or add a secret/"
+                        "hallucination? Reply a final line exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT'.")],
+            input=blob, capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        return f"DEFER-{type(e).__name__}"
+    if r.returncode != 0:
+        return "DEFER-advisor-rc"
+    import re as _re
+    # Injected source text could try to surface a spoofed verdict token. Require:
+    # exactly ONE verdict anywhere, it is APPROVE, and it is on the LAST non-empty
+    # line. Anything else -> DEFER to the human queue (fail-closed).
+    verdicts = _re.findall(r"VERDICT:\s*(APPROVE|REJECT)", r.stdout or "", _re.I)
+    lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    last = lines[-1].upper() if lines else ""
+    if len(verdicts) == 1 and verdicts[0].upper() == "APPROVE" and last == "VERDICT: APPROVE":
+        return "APPROVE"
+    return "REJECT" if verdicts else "DEFER-no-verdict"
 
 
 if __name__ == "__main__":

@@ -123,6 +123,24 @@ auto_graduate:                     # stage ②/④
   staging_ttl_days: 14
   max_per_run: 8
 
+# Deterministic auto-consolidation (compress-then-quarantine). Merges near-duplicate
+# memories (Qdrant ANN cosine >= merge_threshold, SAME type) into a compressed umbrella;
+# sources go to .quarantine/ (30-day probation, restorable) NOT trashed. Each merge is
+# reviewed by Codex: clean -> auto-apply + a one-tap UNDO on Telegram; deferred -> the
+# approval queue. OFF by default. Needs the vector store + (ideally) the Telegram gate.
+auto_curate:
+  enabled: false
+  merge_threshold: 0.92            # cosine >= this to auto-merge (high = only true near-dups)
+  max_merges_per_run: 2
+  codex_gate: true                 # Codex triages each merge; defers route to the human queue
+
+# Async human-approval gate (Telegram). For the irreversible/behavioral ops: skill
+# installs (always), Codex-deferred merges, purges. Long-poll (no webhook). Put the
+# bot token + your chat id in ~/.config/engram/daemon.env (mode 600), never here:
+#   TELEGRAM_BOT_TOKEN=...   TELEGRAM_CHAT_ID=...
+# 72h TTL then DROP (never default-apply). Works headless without a token (local
+# `engram_telegram_gate.py --approve <id>`).
+
 skill_autoinstall:                 # stage ⑤
   enabled: false                   # OFF by default (kill-switch: touch ~/.claude/skills/auto/.disabled)
   require_user_direct: true        # only user-direct memories are skill-eligible
