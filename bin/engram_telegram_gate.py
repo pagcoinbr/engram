@@ -218,6 +218,11 @@ def poll_once():
         p.unlink(missing_ok=True)
         applied.append((prop["id"], ok, detail))
         notify(f"{'✅ applied' if ok else '⚠️ apply failed'}: {prop['op']} — {detail}")
+    # 4. housekeeping: probation sweep + weekly digest (both cheap / rate-limited)
+    try:
+        sweep(); maybe_digest()
+    except Exception as e:
+        sys.stderr.write(f"[gate] housekeeping error: {e}\n")
     return applied
 
 
@@ -354,8 +359,55 @@ OPS = {"skill_install": _apply_skill_install, "merge_undo": _apply_merge_undo,
        "merge_apply": _apply_merge}
 
 
+PROBATION_DAYS = int(os.environ.get("ENGRAM_PROBATION_DAYS", "30"))
+DIGEST_STAMP = Q / ".last_digest"
+
+
+def sweep():
+    """Probation: quarantined merge backups older than PROBATION_DAYS graduate to
+    .trash/ (the point of no return, +90 more days there) — so quarantine can't grow
+    forever. Also expire undo records past the window. Cheap mtime scan."""
+    import shutil
+    quar = MEM / ".quarantine"
+    cutoff = _now() - PROBATION_DAYS * 86400
+    purged = 0
+    trash = MEM / ".trash"; trash.mkdir(parents=True, exist_ok=True)
+    for d in quar.glob("merge-*"):
+        if d.is_dir() and d.stat().st_mtime < cutoff:
+            shutil.move(str(d), str(trash / f"{d.name}-{_now()}"))
+            purged += 1
+    for u in _dir("undo").glob("*.json"):              # undo window closes with probation
+        if u.stat().st_mtime < cutoff:
+            u.rename(_dir("undone") / u.name)
+    return purged
+
+
+def maybe_digest():
+    """Weekly trust-calibration digest: what the daemon did autonomously, undo any."""
+    try:
+        last = int(DIGEST_STAMP.read_text())
+    except Exception:
+        last = 0
+    if _now() - last < 7 * 86400:
+        return
+    applied = list(_dir("applied").glob("*.json"))
+    recent = [json.loads(p.read_text()) for p in applied if p.stat().st_mtime > _now() - 7 * 86400]
+    merges = sum(1 for r in recent if r["op"] in ("merge_apply",))
+    skills = sum(1 for r in recent if r["op"] == "skill_install")
+    pend = len(list(_dir("pending").glob("*.json")))
+    exp = len([1 for p in _dir("expired").glob("*.json") if p.stat().st_mtime > _now() - 7 * 86400])
+    notify(f"🧠 engram weekly digest\napplied: {len(recent)} ops ({merges} merges, {skills} skills)\n"
+           f"pending your approval: {pend}\nexpired/dropped: {exp}\n"
+           f"quarantine backups: {len(list((MEM/'.quarantine').glob('merge-*')))}")
+    DIGEST_STAMP.write_text(str(_now()))
+
+
 def main():
     a = sys.argv[1:]
+    if "--digest" in a:
+        DIGEST_STAMP.write_text("0"); maybe_digest(); return
+    if "--sweep" in a:
+        print(f"probation purged {sweep()} merge backup(s) to .trash"); return
     if "--notify" in a:
         notify(a[a.index("--notify") + 1]); return
     if "--approve" in a:
