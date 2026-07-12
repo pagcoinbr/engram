@@ -180,9 +180,32 @@ fi
 case "$DAEMON" in
   systemd)
     mkdir -p "$HOME/.config/systemd/user" "$HOME/.config/engram"
+    DAEMON_ENV="$HOME/.config/engram/daemon.env"
+    # PRESERVE operator secrets across re-installs (do NOT clobber them): the ccg key
+    # and the Telegram approval-gate token/chat id live here and must survive.
+    PRESERVED="$(grep -E '^(ENGRAM_CCG_KEY|ANTHROPIC_BASE_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)=' "$DAEMON_ENV" 2>/dev/null || true)"
     { echo "ENGRAM_BIN=$CLAUDE"; echo "ENGRAM_GRAPH=$CLAUDE/graph"; echo "ENGRAM_CONFIG=$CLAUDE/engram.yaml"; echo "ENGRAM_LOG_DIR=$CLAUDE/logs";
       [[ -x "$CLAUDE/graph/venv/bin/python" ]] && echo "ENGRAM_GRAPH_PYTHON=$CLAUDE/graph/venv/bin/python";
-      [[ -x "$CLAUDE/vector/venv/bin/python" ]] && echo "ENGRAM_VECTOR_PYTHON=$CLAUDE/vector/venv/bin/python"; } > "$HOME/.config/engram/daemon.env"
+      [[ -x "$CLAUDE/vector/venv/bin/python" ]] && echo "ENGRAM_VECTOR_PYTHON=$CLAUDE/vector/venv/bin/python"; } > "$DAEMON_ENV"
+    if [[ -n "$PRESERVED" ]]; then
+      printf '%s\n' "$PRESERVED" >> "$DAEMON_ENV"
+    else
+      cat >> "$DAEMON_ENV" <<'DENV'
+
+# ── Async approval gate (Telegram) — for the RISKY autonomous ops (skill installs,
+#    Codex-deferred / lossy merges, purges). Optional but recommended.
+#    1) Telegram: message @BotFather -> /newbot -> copy the token.
+#    2) Uncomment + set below (message your bot once so it can learn your chat id;
+#       engram_telegram_gate.py --poll will pick up the first message's chat id, or
+#       set TELEGRAM_CHAT_ID explicitly). Keep this file mode 600.
+# TELEGRAM_BOT_TOKEN=123456:AA...
+# TELEGRAM_CHAT_ID=123456789
+#
+# ── cc-gateway backend key (only if engram.yaml has `backend: ccg`) ──
+# ENGRAM_CCG_KEY=...
+DENV
+    fi
+    chmod 600 "$DAEMON_ENV"
     sed "s|^ExecStart=.*|ExecStart=$(command -v python3) $CLAUDE/engram-daemon.py --once|" "$REPO/daemon/engram.service" > "$HOME/.config/systemd/user/engram.service"
     cp "$REPO/daemon/engram.timer" "$HOME/.config/systemd/user/engram.timer"
     # Optional nightly Codex-gated curate+fixate APPLY (headless Claude). ExecStart is
@@ -222,3 +245,5 @@ case "$DAEMON" in
 esac
 
 say "done. Restart Claude Code so it loads the new commands + MCP server."
+say "To run engram AUTONOMOUSLY (unattended harvest/graduate/curate + Telegram approvals),"
+say "see AUTONOMY.md — set the backend, the auto_* flags in engram.yaml, and the Telegram token in $HOME/.config/engram/daemon.env."
