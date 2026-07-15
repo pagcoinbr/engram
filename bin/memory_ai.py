@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """memory_ai.py — local-AI config + routing for the memory system.
 
-Reads ~/.claude/memory_ai.yaml: the local on/off switch, the Ollama endpoint,
+Reads ~/.claude/engram.yaml (override: $ENGRAM_CONFIG): the local on/off switch, the Ollama endpoint,
 the mixture-of-experts (role -> model) map, light-pass settings, and declared
 local MCP servers. Other scripts (memory_distill.py, memory_light_curate.py,
 the fixation cron) import these helpers so model/endpoint choices live in ONE

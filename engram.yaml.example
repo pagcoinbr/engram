@@ -118,8 +118,9 @@ harvest:
 
 auto_graduate:                     # stage ②/④
   enabled: false                   # OFF by default — flip on once you trust the harvester's output
-  allow_provenance: ["user-direct"]
-  min_confidence: 0.6
+  allow_provenance: ["user-direct"]   # add "assistant" to also graduate passive assistant-authored memories (injection+secret+dedup screened)
+  min_confidence: 0.6                # bar for user-direct
+  assistant_min_confidence: 0.75     # HIGHER bar applied when "assistant" is in allow_provenance
   dedup_threshold: 0.86
   injection_check: true
   staging_ttl_days: 14

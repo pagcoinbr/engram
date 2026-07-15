@@ -17,7 +17,7 @@ Graduation writes via save_memory.sh (GitHub + MEMORY.md) and removes the staged
 file. Everything else stays in .staging/ with a recorded reason.
 
 SAFETY: dry-run by default. Real mutation needs BOTH `--apply` AND
-auto_graduate.enabled=true in memory_ai.yaml (the lights-out switch, OFF until
+auto_graduate.enabled=true in engram.yaml (the lights-out switch, OFF until
 the operator has watched the harvester's output on real transcripts).
 
 CLI:
@@ -54,7 +54,7 @@ STAGING = MEM_DIR / ".staging"
 QUAR = MEM_DIR / ".quarantine"
 SAVE_SH = HOME / ".claude" / "save_memory.sh"
 
-# Config defaults (overridable under `auto_graduate:` in memory_ai.yaml).
+# Config defaults (overridable under `auto_graduate:` in engram.yaml).
 AG_DEFAULTS = {
     "enabled": False,                       # lights-out master switch (OFF until proven)
     "allow_provenance": ["user-direct"],    # which provenance classes may auto-graduate
@@ -264,7 +264,7 @@ def main():
 
     # Hard gate: real mutation requires BOTH the flag and the config switch.
     if apply and not ag["enabled"]:
-        print("[stage-apply] --apply ignored: auto_graduate.enabled is false in memory_ai.yaml "
+        print("[stage-apply] --apply ignored: auto_graduate.enabled is false in engram.yaml "
               "(lights-out switch OFF). Running dry.", file=sys.stderr)
         apply = False
 
