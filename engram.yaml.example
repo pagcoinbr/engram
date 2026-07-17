@@ -58,14 +58,15 @@ ccg:
   # bin / timeout_seconds / max_turns inherit from the `claude:` block unless set here
 
 # Daemon task cadences (override engram-daemon.py DEFAULT_INTERVALS, in seconds).
-# COMMENTED OUT so a fresh install keeps the busy defaults (30-min graph/vector).
-# Uncomment for a "quiet fleet": reconcile graph + vector ONCE A DAY and disable
-# the in-daemon maintenance pipeline (use the nightly apply job / manual /memory-*).
-# daemon:
-#   intervals:
-#     graph: 86400        # graph_sync.py --insert cadence
-#     vector: 86400       # vector_sync.py --insert cadence
-#     maintenance: 315360000   # ~off — fixate/curate stay human-gated or nightly-only
+# Default "quiet fleet" cadence: every heavy memory task runs ONCE A DAY. The 30-min
+# systemd timer still ticks so the cheap probes (health, approvals) stay responsive —
+# only the DUE heavy tasks below fire per their interval. Raise/lower per-host as needed.
+daemon:
+  intervals:
+    harvest: 86400      # encode finished chats -> staging  (once/day)
+    graph: 86400        # graph_sync.py --insert            (once/day)
+    vector: 86400       # vector_sync.py --insert           (once/day)
+    maintenance: 86400  # nightly fixate + light-pass pipeline (distill gated inside the cron)
 
 # OpenAI-compatible llama.cpp server (llama-server /v1). Used when backend: llama_cpp.
 # Generation routes to {url}/chat/completions; <think>…</think> reasoning is stripped.
