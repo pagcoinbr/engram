@@ -3,7 +3,10 @@ Description=engram memory daemon timer (fires engram-daemon.py --once; per-task 
 
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=30min
+# Wall-clock anchored, NOT OnUnitActiveSec: the latter schedules the next run
+# relative to the service's last activation, so a single missed/failed activation
+# leaves the timer elapsed with no next trigger ("Trigger: n/a") until reboot.
+OnCalendar=*:0/30
 Persistent=true
 
 [Install]

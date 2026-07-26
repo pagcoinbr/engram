@@ -157,7 +157,7 @@ def task_health():
 def task_graph():
     if not _neo4j_up():
         log("graph: Neo4j down — skipping insert")
-        return
+        return False
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--insert"])
 
 def task_vector():
@@ -165,7 +165,7 @@ def task_vector():
         return  # optional + off -> pure-markdown; nothing to do
     if not _qdrant_up():
         log("vector: Qdrant down — skipping insert")
-        return
+        return False
     _run([_vector_python(), str(ENGRAM_VECTOR / "vector_sync.py"), "--insert"])
 
 def _generate_available() -> bool:
@@ -184,13 +184,13 @@ def task_harvest():
     so DEFER cleanly when no backend can generate (watermark preserved, nothing lost)."""
     if not _generate_available():
         log("harvest: no generate backend — deferring encode (watermark preserved)")
-        return
+        return False
     pipe = None
     for c in (ENGRAM_BIN / "memory_pipeline.sh", HERE / "memory_pipeline.sh"):
         if c.exists():
             pipe = c; break
     if not pipe:
-        log("harvest: memory_pipeline.sh not found"); return
+        log("harvest: memory_pipeline.sh not found"); return False
     _run(["bash", str(pipe)])
     if ((cfg().get("telegram") or {}).get("activity_log")):
         gate = ENGRAM_BIN / "engram_telegram_gate.py"
@@ -207,6 +207,7 @@ def task_maintenance():
         _run(["bash", str(sh)])   # activity notify lives in task_harvest (encode is where the news is)
     else:
         log("maintenance: no maintenance script found (memory_fixate_cron.sh / memory_pipeline.sh)")
+        return False
 
 def task_curate():
     """CONSOLIDATE (weekly): auto-merge near-duplicate memories. Same slow time-constant
@@ -217,7 +218,7 @@ def task_curate():
         return
     if not _generate_available():
         log("curate: no generate backend — deferring auto-consolidation")
-        return
+        return False
     ac = ENGRAM_BIN / "memory_auto_curate.py"
     if ac.exists():
         _run([_vector_python(), str(ac), "--apply"])
@@ -225,12 +226,12 @@ def task_curate():
 
 def task_export():
     if not _neo4j_up():
-        return
+        return False
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--export", "--verify"])
 
 def task_reconcile():
     if not _neo4j_up():
-        return
+        return False
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--reconcile"])
 
 def task_approvals():
@@ -263,8 +264,13 @@ def tick(force=None):
             log(f"unknown task: {t}")
             continue
         if force or (now - st.get(t, 0)) >= iv[t]:
-            fn()
-            st[t] = now
+            # A task returns False when it DEFERRED — a dependency was down (Neo4j,
+            # Qdrant, generate backend) so it did no work. Don't stamp those: the
+            # stamp means "this ran", and stamping a no-op makes a transient outage
+            # cost a full interval (a daily task skipped at 21:04 with Qdrant down
+            # would not retry until 21:04 tomorrow). Anything else stamps as before.
+            if fn() is not False:
+                st[t] = now
     save_state(st)
 
 
