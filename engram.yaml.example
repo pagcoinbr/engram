@@ -31,6 +31,9 @@ ollama:
   timeout_seconds: 1200            # raise for big models on slow hardware (30b on an 8GB host ~2400)
   num_ctx: 16384                   # distill prompts run ~6-8k tokens; below this Ollama silently truncates
   num_predict: 8000                # reasoning models spend output tokens on hidden CoT first; keep headroom
+  think: false                     # ollama thinking toggle. reasoning_effort is a NO-OP while this is
+                                   # false. CoT is stripped before the text reaches JSON-expecting
+                                   # callers, so turning it on is safe — it just costs output tokens.
   reasoning_effort: "low"          # for harmony/reasoning models: keep CoT short so the answer comes through
   keep_alive: "30m"                # hold the model resident so sequential stages skip cold reloads
 
