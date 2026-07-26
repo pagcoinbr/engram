@@ -105,14 +105,38 @@ else
 fi
 
 # ---- storage env (opt-in GitHub sync) ----
+# engram.env is sourced by memory_lib.sh, so it's where operators put pins —
+# notably CLAUDE_MEMORY_SLUG (canonical store) and CLAUDE_MEMORY_USERNAME. We own
+# only the CLAUDE_MEMORY_REPO line: PRESERVE every other line, because a re-install
+# used to truncate the file (`>`) or delete it outright, silently dropping pins.
+ENVF="$CLAUDE/engram.env"
+PRESERVED_ENV="$(grep -vE '^[[:space:]]*export[[:space:]]+CLAUDE_MEMORY_REPO=' "$ENVF" 2>/dev/null || true)"
 if [[ "$STORAGE" == github && -n "$REPO_REMOTE" ]]; then
-  printf 'export CLAUDE_MEMORY_REPO=%q\n' "$REPO_REMOTE" > "$CLAUDE/engram.env"
+  { printf 'export CLAUDE_MEMORY_REPO=%q\n' "$REPO_REMOTE"
+    [[ -n "$PRESERVED_ENV" ]] && printf '%s\n' "$PRESERVED_ENV"; } > "$ENVF"
   say "GitHub sync -> $REPO_REMOTE (wrote $CLAUDE/engram.env; add the same export to your shell profile for interactive use)"
   command -v gh >/dev/null || warn "gh CLI not found — needed for GitHub sync"
+elif [[ -n "$PRESERVED_ENV" ]]; then
+  printf '%s\n' "$PRESERVED_ENV" > "$ENVF"      # drop only the remote, keep the pins
+  say "storage: local-only (no remote sync; kept your other engram.env pins)"
 else
-  rm -f "$CLAUDE/engram.env" 2>/dev/null || true
+  rm -f "$ENVF" 2>/dev/null || true
   say "storage: local-only (no remote sync)"
 fi
+
+# ---- canonical store slug ----
+# Resolve ONCE, up here, so every later step targets the SAME store. This used to
+# be computed far below (just before seeding), which meant the vector rebuild
+# ran against whatever slug the child process defaulted to — on any install whose
+# memories don't live under the $HOME-derived slug, that silently built a
+# near-empty index and reported success.
+# Precedence matches memory_lib.sh: operator pin (engram.env, sourced above via
+# PRESERVED_ENV) > $CLAUDE_MEMORY_SLUG > $HOME-derived default.
+[[ -f "$ENVF" ]] && source "$ENVF"
+SLUG="${CLAUDE_MEMORY_SLUG:-$(printf '%s' "$HOME" | sed 's|/|-|g')}"
+STORE="$CLAUDE/projects/$SLUG/memory"; mkdir -p "$STORE"
+export CLAUDE_MEMORY_SLUG="$SLUG"   # child processes (vector_sync) must agree
+say "memory store: $STORE"
 
 # ---- python deps (engine) ----
 if ! python3 -c "import yaml" 2>/dev/null; then
@@ -167,8 +191,19 @@ if [[ "$WANT_VECTOR" == yes ]]; then
       || warn "could not add qdrant-client to graph venv (hybrid will fall back to graph+keyword)"
   fi
   say "start Qdrant: cd $CLAUDE/vector && docker compose up -d"
-  # Seed the index from any memories already on disk (best-effort; no-op if Qdrant is down).
-  [[ -x "$VVENV/bin/python" ]] && "$VVENV/bin/python" "$CLAUDE/vector/vector_sync.py" --rebuild 2>/dev/null || true
+  # Seed the index from any memories already on disk (best-effort; no-op if Qdrant
+  # is down). Output is REPORTED, not swallowed: `2>/dev/null || true` hid both a
+  # dead Qdrant and an empty-store rebuild, so a broken index looked like success.
+  if [[ -x "$VVENV/bin/python" ]]; then
+    if VOUT="$("$VVENV/bin/python" "$CLAUDE/vector/vector_sync.py" --rebuild 2>&1)"; then
+      say "vector rebuild: ${VOUT##*$'\n'}"
+      ONDISK="$(find "$STORE" -maxdepth 1 -name '*.md' ! -name 'MEMORY.md' 2>/dev/null | wc -l)"
+      [[ "$ONDISK" -gt 0 && "$VOUT" != *"$ONDISK memory"* ]] && \
+        warn "store has $ONDISK memories but the rebuild indexed a different count — check CLAUDE_MEMORY_SLUG (currently $SLUG)"
+    else
+      warn "vector rebuild failed (Qdrant not up yet?) — start it, then: CLAUDE_MEMORY_SLUG=$SLUG $VVENV/bin/python $CLAUDE/vector/vector_sync.py --rebuild"
+    fi
+  fi
 fi
 
 # ---- hooks ----
@@ -185,8 +220,7 @@ if command -v jq >/dev/null; then
 fi
 
 # ---- seed synthetic examples (only if store empty) ----
-SLUG="${CLAUDE_MEMORY_SLUG:-$(printf '%s' "$HOME" | sed 's|/|-|g')}"
-STORE="$CLAUDE/projects/$SLUG/memory"; mkdir -p "$STORE"
+# SLUG/STORE resolved above, before the vector rebuild that depends on them.
 if ! ls "$STORE"/*.md >/dev/null 2>&1; then
   if ls "$REPO"/examples/memory/*.md >/dev/null 2>&1; then
     cp "$REPO"/examples/memory/*.md "$STORE"/; say "seeded ${STORE} with synthetic examples"
