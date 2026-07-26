@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -54,6 +55,62 @@ def _dir(state):
 
 
 def _now(): return int(time.time())
+
+
+# ── memory document validation ──────────────────────────────────────────────
+# save_memory.sh writes stdin VERBATIM and documents that the caller owns structural
+# validity, so this is the last line of defence before a malformed memory hits the
+# store. Observed failure: an LLM wrapped its umbrella in a ```markdown fence, the
+# fence survived frontmatter stripping, and a second frontmatter block got prepended
+# on top — a one-tap approval would have written a double-frontmatter file.
+_FM_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.S)
+_FENCE_RE = re.compile(r"\A\s*```[a-zA-Z]*[ \t]*\r?\n(.*?)\r?\n```[ \t]*\s*\Z", re.S)
+
+
+def unwrap_code_fence(text: str) -> str:
+    """Strip ONE outer ```/```markdown fence wrapping the whole response.
+
+    Only unwraps when a single fence encloses the ENTIRE text, so a legitimate code
+    block inside a memory body is never touched. Also drops a UTF-8 BOM.
+    """
+    t = (text or "").lstrip("﻿")
+    m = _FENCE_RE.match(t)
+    return m.group(1) if m else t
+
+
+def validate_memory_doc(doc: str):
+    """(ok, reason) — structural invariants for anything about to be written as a memory.
+
+    Rejects the malformed shapes an LLM actually produces: a surviving outer fence, a
+    body that opens with a SECOND frontmatter block, and unparseable/non-mapping YAML.
+    """
+    if not (doc or "").strip():
+        return False, "empty document"
+    if doc.lstrip().startswith("```"):
+        return False, "document is wrapped in a code fence"
+    m = _FM_RE.match(doc)
+    if not m:
+        return False, "missing leading frontmatter block"
+    try:
+        import yaml
+        fm = yaml.safe_load(m.group(1))
+    except Exception as e:
+        return False, f"unparseable frontmatter: {type(e).__name__}"
+    if not isinstance(fm, dict):
+        return False, "frontmatter is not a mapping"
+    body = doc[m.end():]
+    # Nested-document detection has to survive a fence that only OPENS the body. The
+    # payload actually observed was: frontmatter + ```markdown + a SECOND complete
+    # document + ``` + a mechanically appended "Hard facts" section — so the fence
+    # closes mid-body and a whole-body unwrap never matches it.
+    opened = re.sub(r"\A\s*```[a-zA-Z]*[ \t]*\r?\n", "", body)
+    if any(_FM_RE.match(t.lstrip("\n")) for t in (body, unwrap_code_fence(body), opened)):
+        return False, "body starts with a SECOND frontmatter block (nested document)"
+    if body.lstrip().startswith("```") and _FENCE_RE.match(body.strip()):
+        return False, "body is entirely a code fence"
+    if not body.strip():
+        return False, "empty body"
+    return True, "ok"
 
 
 def _id(op, params):
@@ -319,14 +376,63 @@ def _apply_merge(params):
     merge_id = params.get("merge_id", "x")
     save = HOME / ".claude" / "save_memory.sh"
     quar = MEM / ".quarantine"
+    # Validate HERE, not only at proposal time: a proposal may have been queued by an
+    # older build (or a future caller of merge_apply), and save_memory.sh writes stdin
+    # verbatim. Refuse before anything is backed up or moved.
+    ok, why = validate_memory_doc(content)
+    if not ok:
+        return False, f"refusing malformed umbrella document ({why}) — nothing changed"
+    # FRESHNESS: the identity/coverage analysis was done against a specific snapshot of
+    # these files. A proposal can sit in the approval queue for hours, and harvest or a
+    # save hook can rewrite a source in the meantime — so re-verify before mutating.
+    # Otherwise a fact added after the analysis gets quarantined, or a just-updated
+    # keeper is overwritten with stale content, while the run reports success.
+    #
+    # KNOWN RESIDUAL RACE (accepted, not fixed here): this is a check, not a lock. A
+    # writer that lands between this verification and the writes below is still not
+    # serialized. Closing it properly needs a per-memory lock honoured by EVERY writer
+    # (save_memory.sh, delete_memory.sh, the harvest hooks, this function) — a
+    # cross-cutting protocol, not a local change. The check narrows the window from
+    # hours (queued proposal) to milliseconds, which is the large part of the risk;
+    # the lock protocol is follow-up work.
+    # FAIL CLOSED. A proposal queued before src_sha existed has no snapshot at all, and
+    # an empty dict would make the loop below a no-op — silently applying stale content.
+    # The key set must also cover exactly the files this merge touches, so a truncated
+    # snapshot cannot leave one source unchecked.
+    src_sha = params.get("src_sha")
+    if not isinstance(src_sha, dict) or set(src_sha) != {umbrella, *absorbed}:
+        return False, ("proposal carries no complete source snapshot (pre-dates freshness "
+                       "checking, or is truncated) — refusing; re-run curate to recompute")
+    stale = []
+    for f, want in src_sha.items():
+        p = MEM / f
+        cur = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else ""
+        if cur != want:
+            stale.append(f if cur else f"{f}(missing)")
+    if stale:
+        return False, (f"source(s) changed since this merge was computed ({stale}) — "
+                       f"refusing; re-run curate to recompute")
     # PER-MERGE transaction dir so a second merge on the same umbrella can't overwrite
     # the first merge's backup (which would make the earlier undo unrecoverable).
     txn = quar / f"merge-{merge_id}"
-    # refuse if this umbrella has an unresolved backup from a prior, un-undone merge
+    # Refuse if ANY participating file — umbrella or absorbed — is already referenced by
+    # an un-undone merge. Checking only the umbrella let a file be absorbed by one merge
+    # and act as umbrella in another; undoing those out of order restores an intermediate
+    # version over the original and drops the remaining backup.
     for d in quar.glob("merge-*"):
-        if d != txn and (d / f"{umbrella}.orig").is_file():
-            return False, f"umbrella {umbrella} has an outstanding merge backup ({d.name}) — undo it first"
-    txn.mkdir(parents=True, exist_ok=True)
+        if d == txn:
+            continue
+        for f in {umbrella, *absorbed}:
+            if (d / f"{f}.orig").is_file() or (d / f).is_file():
+                return False, (f"{f} is referenced by an outstanding merge backup "
+                               f"({d.name}) — undo that first; nothing changed")
+    # EXCLUSIVE: never reuse a transaction dir. merge_id is content-derived, so an
+    # existing one means an unresolved backup from a previous merge — writing into it
+    # would overwrite that .orig and destroy the earlier undo.
+    if txn.exists():
+        return False, (f"transaction dir {txn.name} already exists (unresolved prior merge) "
+                       f"— undo or clear it first; nothing changed")
+    txn.mkdir(parents=True, exist_ok=False)
     had_orig = (MEM / umbrella).is_file()
     if had_orig:                                       # 1. back up umbrella ORIGINAL
         (txn / f"{umbrella}.orig").write_bytes((MEM / umbrella).read_bytes())
@@ -344,15 +450,31 @@ def _apply_merge(params):
     # record the post-merge umbrella hash so undo can refuse if it was edited since
     if (MEM / umbrella).is_file():
         (txn / ".post_sha").write_text(hashlib.sha256((MEM / umbrella).read_bytes()).hexdigest())
-    moved = []
+    moved, deindex_failed = [], []
     for f in absorbed:                                 # 3. absorbed -> txn dir + de-index
         src = MEM / f
         if src.is_file():
             src.rename(txn / f)
             (txn / f"{f}.merged-into").write_text(f"{umbrella}\t{_now()}\n")
-            subprocess.run([str(HOME / ".claude" / "delete_memory.sh"), f], capture_output=True, text=True)
+            # delete_memory.sh strips the MEMORY.md line + de-indexes (vector/remote).
+            # The file itself is already safe in the txn dir, so a failure here is not
+            # data loss — but it DOES leave a dangling index entry, so surface it
+            # instead of reporting unqualified success.
+            d = subprocess.run([str(HOME / ".claude" / "delete_memory.sh"), f],
+                               capture_output=True, text=True)
+            if d.returncode != 0:
+                deindex_failed.append(f"{f}({d.stderr.strip()[:60]})")
             moved.append(f)
-    return True, f"umbrella {umbrella} written; backup in merge-{merge_id} (orig+{moved})"
+    detail = f"umbrella {umbrella} written; backup in merge-{merge_id} (orig+{moved})"
+    if deindex_failed:
+        # SUCCESS-WITH-WARNING, deliberately not False: by this point the umbrella is
+        # overwritten and the sources are moved. Returning False would make callers skip
+        # notify_undo, leaving committed destructive changes with no advertised undo —
+        # and the quarantined originals would eventually expire. A stale MEMORY.md or
+        # vector entry is the lesser failure, so surface it and keep the undo path.
+        detail += (f"; WARNING de-index failed for {deindex_failed} — "
+                   f"MEMORY.md/vector may be stale (undo still available)")
+    return True, detail
 
 
 def _apply_suspect_restore(params):

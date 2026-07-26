@@ -4,11 +4,19 @@
 The interactive /memory-curate uses LLM JUDGMENT + a human gate to decide what to
 merge. This is the unattended sibling: it merges only what is DETERMINISTICALLY a
 near-duplicate (Qdrant ANN cosine >= a high threshold, SAME type), so no judgment
-call is delegated to a model. The merge is:
-  * LOSSLESS   — distilled with preserve_sources=True (every source body appended
-                 verbatim), and only applied if sentence_coverage proves no prose loss.
-  * RECOVERABLE — source files are removed via delete_memory.sh, which snapshots to
-                 .trash/ (90-day undo) first.
+call is delegated to a model. Two different operations come out of that:
+  * SUPERSEDE  — the members are canonically IDENTICAL copies (same body after
+                 whitespace/boilerplate normalization, same description and type).
+                 Genuinely lossless: the keeper is written back byte-for-byte and no
+                 model is invoked. Auto-applies. Containment alone is NOT enough —
+                 see _supersede_keeper.
+  * COMPRESS   — members say the same thing differently, so an umbrella is generated.
+                 This IS lossy; `sentence_coverage` is a rejection heuristic, NOT proof
+                 of losslessness (it is lexical prefix matching, so two rewordings of
+                 one fact never "cover" each other). Safety here comes from the Codex/
+                 human gate plus REVERSIBILITY, not from the score.
+  * RECOVERABLE — absorbed sources go to .quarantine/ (undo) and are de-indexed via
+                 delete_memory.sh, which snapshots to .trash/ (90-day undo) first.
   * BOUNDED    — at most `max_merges_per_run` clusters per run.
 Everything a model can't make safe (pruning distinct memories, deleting suspects)
 stays in the human-gated /memory-curate. This never deletes a memory that isn't
@@ -81,40 +89,168 @@ def ac_cfg(cfg):
     out = dict(AC_DEFAULTS); out.update((cfg.get("auto_curate") or {})); return out
 
 
+_FM_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.S)
+
+
 def _fm(p: Path):
+    """(name, description, type) from an ANCHORED frontmatter block.
+
+    Previously this regex-searched the WHOLE file, so body prose containing a line
+    like `type: project` could spoof a memory's type — and two malformed files both
+    yielding "" counted as the same type, clearing the same-type merge guard.
+    """
     t = p.read_text(errors="ignore")
-    def g(k):
-        m = re.search(rf"^\s*{k}:\s*(.+)$", t, re.M)
-        return m.group(1).strip().strip('"\'') if m else ""
-    return g("name") or p.stem, g("description"), g("type")
+    m = _FM_RE.match(t)
+    if not m:
+        return p.stem, "", ""
+    try:
+        import yaml
+        fm = yaml.safe_load(m.group(1))
+    except Exception:
+        fm = None
+    if not isinstance(fm, dict):
+        return p.stem, "", ""
+    meta = fm.get("metadata") if isinstance(fm.get("metadata"), dict) else {}
+    return (str(fm.get("name") or p.stem).strip(),
+            str(fm.get("description") or "").strip(),
+            str(fm.get("type") or meta.get("type") or "").strip())
+
+
+def _fm_raw(p: Path) -> dict:
+    """The whole parsed frontmatter mapping ({} when absent/unparseable)."""
+    m = _FM_RE.match(p.read_text(errors="ignore"))
+    if not m:
+        return {}
+    try:
+        import yaml
+        fm = yaml.safe_load(m.group(1))
+    except Exception:
+        return {}
+    return fm if isinstance(fm, dict) else {}
 
 
 def _clusters(pairs, threshold):
-    """Union-find over (score, a, b) pairs above threshold -> list of file-name sets."""
-    parent = {}
-    def find(x):
-        parent.setdefault(x, x)
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]; x = parent[x]
-        return x
-    def union(a, b):
-        parent[find(a)] = find(b)
-    for score, a, b in pairs:
-        if score >= threshold:
-            union(a, b)
-    groups = {}
-    for x in list(parent):
-        groups.setdefault(find(x), set()).add(x)
-    return [g for g in groups.values() if len(g) >= 2]
+    """Above-threshold pairs -> CLIQUES (every member similar to every other member).
+
+    This used to be union-find, whose transitive closure merges A-B-C whenever A≈B and
+    B≈C — even when A and C are materially different. For an operation that deletes
+    files that is not safe, so a component is only kept whole when it is complete;
+    otherwise it degrades to its individual pairs.
+    """
+    edges = {(a, b) if a < b else (b, a) for score, a, b in pairs if score >= threshold}
+    adj = {}
+    for a, b in edges:
+        adj.setdefault(a, set()).add(b); adj.setdefault(b, set()).add(a)
+    seen, used, out = set(), set(), []
+    for node in sorted(adj):                       # connected components
+        if node in seen:
+            continue
+        comp, stack = set(), [node]
+        while stack:
+            x = stack.pop()
+            if x in comp:
+                continue
+            comp.add(x); stack.extend(adj[x] - comp)
+        seen |= comp
+        n = len(comp)
+        if n >= 2 and not (comp & used) and all(
+                (a, b) in edges for i, a in enumerate(sorted(comp))
+                for b in sorted(comp)[i + 1:]):
+            out.append(comp); used |= comp         # complete -> safe as one cluster
+        else:
+            # Degrade to pairs, but keep the output a DISJOINT matching: a file may
+            # take part in at most one merge per run. Overlapping pairs (A-B and B-C)
+            # would merge B into A and then into C, and undoing them out of order
+            # restores an intermediate B over the original and drops the last backup.
+            for a, b in sorted(edges):
+                if a in comp and b in comp and a not in used and b not in used:
+                    out.append({a, b}); used |= {a, b}
+    return out
 
 
 def _body_of(distilled: str) -> str:
-    """Strip a leading frontmatter block from the distilled text, keep the body."""
-    if distilled.startswith("---"):
-        end = distilled.find("\n---", 3)
-        if end != -1:
-            return distilled[end + 4:].lstrip("\n")
-    return distilled
+    """Strip an outer code fence, then a leading frontmatter block; keep the body."""
+    import engram_telegram_gate as _gate
+    distilled = _gate.unwrap_code_fence(distilled)
+    m = _FM_RE.match(distilled)
+    return distilled[m.end():].lstrip("\n") if m else distilled
+
+
+def _src_sha(files) -> dict:
+    """sha256 of every participating file, captured at ANALYSIS time.
+
+    _apply_merge re-checks these before it mutates anything. Without it the whole
+    analysis is time-of-check/time-of-use: a concurrent save (harvest, a hook, the
+    user) between the containment test and the write could let a newly added fact be
+    quarantined, or overwrite a just-updated keeper with stale content — while the run
+    still reports "lossless". Queued proposals make the window hours long, not ms.
+    """
+    import hashlib
+    return {f: (hashlib.sha256((MEM / f).read_bytes()).hexdigest()
+                if (MEM / f).is_file() else "") for f in files}
+
+
+# ── supersede: the lossless path ────────────────────────────────────────────
+# Per-file harvest boilerplate: the ONLY lines allowed to differ between two copies,
+# because the harvester stamps them per file. Matched as WHOLE LINES, anchored, with
+# no DOTALL: an earlier version used `_Provenance:.*?_` under re.S, whose non-greedy
+# run to the next underscore could swallow real body text across many lines — so two
+# memories with genuinely different content could canonicalize to the same string and
+# one would be quarantined unread. A line-anchored pattern cannot span body content.
+_BOILER_LINE_RE = re.compile(
+    r"(?:_Provenance:[^\n_]*_|<!--\s*staged by memory_harvest\b[^\n]*-->)\Z")
+
+
+def _canonical_body(text: str) -> str:
+    """Body for the identity test: frontmatter and per-file harvest boilerplate lines
+    removed, line endings and trailing whitespace normalized, blank lines dropped.
+    Everything semantic — case, punctuation, operators, numbers — survives verbatim."""
+    m = _FM_RE.match(text)
+    body = text[m.end():] if m else text
+    out = []
+    for ln in body.replace("\r\n", "\n").split("\n"):
+        ln = ln.rstrip()
+        if ln.strip() and not _BOILER_LINE_RE.match(ln.strip()):
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _supersede_keeper(files):
+    """The keeper when the members are CANONICALLY IDENTICAL duplicates, else None.
+
+    Ungated supersede deletes a file with no model and no human in the loop, so the
+    only thing it may act on is a true copy: identical canonical body AND identical
+    description and type.
+
+    Containment is deliberately NOT enough, even at 100%. Containment proves the text
+    is present in the keeper, not that it still MEANS the same thing there — a larger
+    stale document that quotes a current rule in order to call it obsolete contains
+    every shingle of the smaller authoritative one, would be picked as keeper (it is
+    longer), and would silently quarantine the authority. No lexical test can tell
+    those apart, so anything short of identity goes to the review path, where a model
+    or a human reads it. Cosine cannot help either: it is symmetric.
+
+    Consequence, stated plainly: this fires only on genuine double-harvests and copies
+    left by a store merge. Reworded duplicates, supersets, and near-misses all still
+    cost a review — that is the intended trade.
+    """
+    canon = {f: _canonical_body((MEM / f).read_text(errors="ignore")) for f in files}
+    if any(not c.strip() for c in canon.values()):
+        return None
+    if len({c for c in canon.values()}) != 1:          # not a true copy -> review
+        return None
+    # The ENTIRE frontmatter must match, not just description+type. _canonical_body
+    # strips frontmatter, so without this two memories with identical generic bodies
+    # but different scope — "Ethereum treasury rule" vs "Bitcoin treasury rule", which
+    # differ only in `name` — would look like copies and one would be quarantined
+    # unread. Real duplicate-harvest copies match here exactly: when a store merge
+    # suffixes a colliding FILENAME the frontmatter (name, description, metadata,
+    # originSessionId) is carried over untouched, so nothing legitimate is lost.
+    fms = [json.dumps(_fm_raw(MEM / f), sort_keys=True, default=str) for f in files]
+    if len(set(fms)) != 1:
+        return None
+    # Bodies are identical, so any member is a valid keeper; pick deterministically.
+    return max(sorted(files), key=lambda f: len((MEM / f).read_text(errors="ignore")))
 
 
 def _score(p: Path, scores) -> float:
@@ -167,6 +303,50 @@ def main():
     done = queued = 0
     for files in typed:
         paths = [MEM / f for f in files]
+        # Snapshot BEFORE any analysis. Hashing after the containment test (or after a
+        # minutes-long distillation) would record whatever a concurrent writer had just
+        # produced, so _apply_merge would wave through an umbrella computed from the OLD
+        # bytes while a newly added fact sat unread in the source.
+        sha0 = _src_sha(files)
+        # ── SUPERSEDE first: if the members are identical copies, this is not a
+        # compression problem at all. Keep one BYTE-FOR-BYTE and quarantine the rest —
+        # no LLM, no coverage score, nothing generated that could be lossy or malformed.
+        # Without this path an exact duplicate goes through umbrella generation, scores
+        # ~0.5 coverage (the gate is lexical, so two copies of one fact never "cover"
+        # each other), and lands in the human queue for no reason.
+        keeper = _supersede_keeper(files)
+        if keeper:
+            absorbed = [f for f in files if f != keeper]
+            content = (MEM / keeper).read_text(errors="ignore")
+            kname, kdesc, _kt = _fm(MEM / keeper)
+            # merge_id must depend on CONTENT, not just filenames: a later merge that
+            # recreates the same filenames would otherwise reuse this transaction dir
+            # and overwrite an unresolved backup, destroying the earlier undo.
+            merge_id = __import__("hashlib").sha256(
+                (keeper + "".join(sorted(absorbed)) + json.dumps(sha0, sort_keys=True)
+                 + "supersede").encode()).hexdigest()[:10]
+            params = {"umbrella": keeper, "umbrella_content": content, "desc": kdesc,
+                      "absorbed": absorbed, "merge_id": merge_id,
+                      "src_sha": sha0}
+            preview = (f"Supersede: {absorbed} are canonically IDENTICAL copies of "
+                       f"{keeper}. Keeper unchanged; absorbed→quarantine.")
+            print(f"\n· {files} -> {keeper}  [SUPERSEDE — lossless]")
+            if not apply:
+                print(f"  would: {preview}"); continue
+            if gate_mode == "human":                   # respect an explicit no-auto policy
+                gate.propose("merge_apply", params, f"Supersede (lossless). {preview}",
+                             files=files, codex_verdict="supersede-deterministic")
+                print("  QUEUED (human gate)"); queued += 1
+                continue
+            ok, detail = gate._apply_merge(params)
+            if ok:
+                gate.notify_undo("merge_undo",
+                                 {"umbrella": keeper, "absorbed": absorbed, "merge_id": merge_id},
+                                 f"🧠 superseded (lossless): {preview}\nTap UNDO to reverse.")
+                print(f"  APPLIED ({detail})"); done += 1
+            else:
+                print(f"  FAILED ({detail})")
+            continue
         umbrella = max(paths, key=lambda p: _score(p, scores))   # keep the highest-trust member's name
         name, desc, typ = _fm(umbrella)
         # COMPRESS for real (no preserve_sources) — the umbrella is a tight consolidation.
@@ -180,13 +360,17 @@ def main():
                 or any(engram_secrets.looks_secret((MEM/f).read_text(errors="ignore")) for f in files)):
             print(f"· {files}: HOLD (empty umbrella or secret in cluster) — skipping"); continue
         doc = f"---\nname: {umbrella.stem}\ndescription: {desc}\nmetadata:\n  type: {typ}\n---\n\n{body}"
+        okdoc, whydoc = gate.validate_memory_doc(doc)
+        if not okdoc:
+            print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping"); continue
         absorbed = [f for f in files if f != umbrella.name]
         # transaction id so a second merge on the same umbrella can't clobber the
         # first merge's backup (each merge's originals live under their own dir)
         import hashlib as _hl
-        merge_id = _hl.sha256((umbrella.name + "".join(sorted(absorbed)) + doc).encode()).hexdigest()[:10]
+        merge_id = _hl.sha256((umbrella.name + "".join(sorted(absorbed)) + doc
+                               + json.dumps(sha0, sort_keys=True)).encode()).hexdigest()[:10]
         params = {"umbrella": umbrella.name, "umbrella_content": doc, "desc": desc,
-                  "absorbed": absorbed, "merge_id": merge_id}
+                  "absorbed": absorbed, "merge_id": merge_id, "src_sha": sha0}
         preview = (f"Merge {len(files)} near-dups → {umbrella.name} (compressed "
                    f"{report.get('draft_chars')} chars, prose-cov {report.get('sentence_coverage')}). "
                    f"Absorbed→quarantine: {', '.join(absorbed)}")
@@ -205,7 +389,9 @@ def main():
         verdict = _codex_verdict(doc, files)
         if cov >= ac["min_auto_coverage"] and verdict == "APPROVE":
             ok, detail = gate._apply_merge(params)
-            print(f"  AUTO-APPLIED (near-lossless cov={cov}; {detail})")
+            # Report the ACTUAL outcome — this used to print AUTO-APPLIED before
+            # checking ok, so a refused or partial merge still read as success.
+            print(f"  {'AUTO-APPLIED' if ok else 'FAILED'} (cov={cov}; {detail})")
             if ok:
                 gate.notify_undo("merge_undo",
                                  {"umbrella": umbrella.name, "absorbed": absorbed, "merge_id": merge_id},
