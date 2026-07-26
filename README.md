@@ -132,6 +132,8 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 - **Hybrid recall** (`memory_recall_hybrid`, on `engram-graph`): the best single recall — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename. Each ranker degrades independently; optional `type` filter.
 - **Vector recall** (the optional `engram-vector` MCP): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search via Qdrant. Plus `memory_recall_fused` (vector+keyword) for no-graph installs. Off by default; enable with `./install.sh --vector`.
 
+- **Local-LLM recall** (`hermes`): if the `hermes` CLI is on `PATH`, the installer also registers the same MCP servers with it, so a **local Ollama model** can recall your memories from the terminal — `hermes -z "recall what you know about X"`. Auto-detected; skip it with `./install.sh --no-hermes`. (Plain `ollama run`/`ollama agent` can't do this — ollama has no MCP client.)
+
 ### Automatic
 A Stop hook harvests new facts each session; the daemon consolidates / fixates / syncs the graph (and the vector index, if enabled) on a cadence — all dry-run + human-approved.
 

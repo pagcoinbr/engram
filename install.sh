@@ -7,6 +7,7 @@
 #   --daemon none|systemd|docker
 #   --graph | --no-graph        (build the Neo4j graph venv + register the MCP server)
 #   --vector | --no-vector      (build the Qdrant vector venv + register the MCP server)
+#   --hermes | --no-hermes      (also register the MCP servers with hermes; default: auto)
 #   --yes                       (accept defaults, no prompts)
 #
 # What it does: copies the engine into ~/.claude, writes engram.yaml, merges the
@@ -21,6 +22,7 @@ SETTINGS="$CLAUDE/settings.json"
 
 BACKEND=""; TIER="small"; OLLAMA_HOST="http://localhost:11434"
 STORAGE="local"; REPO_REMOTE=""; DAEMON="none"; YES=0; WANT_GRAPH="auto"; WANT_VECTOR="auto"
+WANT_HERMES="auto"   # auto = register only if the hermes CLI is on PATH
 
 while [[ $# -gt 0 ]]; do case "$1" in
   --backend) BACKEND="$2"; shift 2;;
@@ -33,14 +35,40 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --no-graph) WANT_GRAPH="no"; shift;;
   --vector) WANT_VECTOR="yes"; shift;;
   --no-vector) WANT_VECTOR="no"; shift;;
+  --hermes) WANT_HERMES="yes"; shift;;
+  --no-hermes) WANT_HERMES="no"; shift;;
   --yes|-y) YES=1; shift;;
-  -h|--help) sed -n '2,18p' "$0"; exit 0;;
+  -h|--help) sed -n '2,17p' "$0"; exit 0;;
   *) echo "unknown arg: $1" >&2; exit 2;;
 esac; done
 
 say()  { printf '\033[1;36m[engram]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[engram] warning:\033[0m %s\n' "$*"; }
 ask()  { local __v="$1" __p="$2" __d="$3" __a; if [[ "$YES" == 1 || ! -t 0 ]]; then printf -v "$__v" '%s' "${!__v:-$__d}"; return; fi; read -r -p "$__p [$__d]: " __a || true; printf -v "$__v" '%s' "${__a:-${!__v:-$__d}}"; }
+
+# hermes_register <server-name> <python> <server.py> — also expose an engram MCP
+# server to hermes, an MCP client that drives a LOCAL Ollama model, so the local
+# LLM gets the same recall tools Claude Code has. No-op when hermes isn't installed.
+# Two non-obvious constraints, both load-bearing:
+#   * hermes sanitizes the child env down to PATH/HOME/USER/LANG/LC_ALL/TERM/SHELL/
+#     TMPDIR/XDG_*, so CLAUDE_MEMORY_SLUG must travel in the entry's OWN env map —
+#     exporting it here would NOT reach the server, and a wrong slug silently
+#     recalls from the wrong store.
+#   * `hermes mcp add --args` is argparse.REMAINDER: it must be the LAST flag.
+hermes_register() {
+  [[ "$WANT_HERMES" == no ]] && return 0
+  if ! command -v hermes >/dev/null; then
+    [[ "$WANT_HERMES" == yes ]] && warn "hermes not found on PATH — skipping $1"
+    return 0
+  fi
+  [[ -x "$2" ]] || return 0
+  if hermes mcp list 2>/dev/null | grep -q "$1"; then say "$1 already registered with hermes"; return 0; fi
+  if hermes mcp add "$1" --env "CLAUDE_MEMORY_SLUG=$SLUG" --command "$2" --args "$3" >/dev/null 2>&1; then
+    say "registered $1 with hermes (local LLM gets recall too)"
+  else
+    warn "hermes mcp add $1 failed — add it under mcp_servers: in ~/.hermes/config.yaml manually"
+  fi
+}
 
 # ---- prereqs ----
 command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
@@ -57,7 +85,7 @@ ask STORAGE "Storage (local / github)" "$STORAGE"
 ask DAEMON "24h daemon (none / systemd / docker)" "$DAEMON"
 if [[ "$WANT_GRAPH" == auto ]]; then WANT_GRAPH="yes"; ask WANT_GRAPH "Build the Neo4j graph (yes/no)" "yes"; fi
 if [[ "$WANT_VECTOR" == auto ]]; then WANT_VECTOR="no"; ask WANT_VECTOR "Build the Qdrant vector index (yes/no)" "no"; fi
-say "backend=$BACKEND tier=$TIER storage=$STORAGE daemon=$DAEMON graph=$WANT_GRAPH vector=$WANT_VECTOR"
+say "backend=$BACKEND tier=$TIER storage=$STORAGE daemon=$DAEMON graph=$WANT_GRAPH vector=$WANT_VECTOR hermes=$WANT_HERMES"
 
 # ---- place files ----
 mkdir -p "$CLAUDE/commands" "$CLAUDE/graph" "$CLAUDE/vector" "$CLAUDE/logs"
@@ -149,19 +177,28 @@ if [[ "$WANT_GRAPH" == yes ]]; then
   if [[ ! -x "$VENV/bin/python" ]]; then
     say "building graph venv (graphiti-core, neo4j, fastembed)... this can take a few minutes"
     if python3 -m venv "$VENV" && "$VENV/bin/pip" install -q --upgrade pip && \
-       "$VENV/bin/pip" install -q graphiti-core neo4j fastembed pyyaml; then
+       "$VENV/bin/pip" install -q "mcp[cli]" graphiti-core neo4j fastembed pyyaml; then
       say "graph venv ready"
     else
       warn "graph venv build failed — install graphiti-core/neo4j/fastembed manually into $VENV"
     fi
   fi
   [[ -f "$CLAUDE/graph/.env" ]] || { printf 'NEO4J_PASSWORD=%s\n' "$(openssl rand -hex 24 2>/dev/null || date +%s)" > "$CLAUDE/graph/.env"; chmod 600 "$CLAUDE/graph/.env"; say "generated graph/.env (Neo4j password)"; }
+  # mg_mcp_server.py imports mcp at line 26. Venvs built before that dep was listed
+  # here have graphiti-core but no mcp, so the server dies at import and engram-graph
+  # is SILENTLY absent from every client. Heal them (no-op once satisfied).
+  if [[ -x "$VENV/bin/python" ]] && ! "$VENV/bin/python" -c "import mcp" 2>/dev/null; then
+    "$VENV/bin/pip" install -q "mcp[cli]" \
+      && say "added mcp to graph venv (engram-graph could not start without it)" \
+      || warn "could not install mcp into graph venv — engram-graph will not start"
+  fi
   if command -v claude >/dev/null && [[ -x "$VENV/bin/python" ]]; then
     if ! claude mcp list 2>/dev/null | grep -q engram-graph; then
       claude mcp add --scope user engram-graph "$VENV/bin/python" "$CLAUDE/graph/mg_mcp_server.py" \
         && say "registered engram-graph MCP server" || warn "claude mcp add failed (register manually later)"
     else say "engram-graph MCP already registered"; fi
   else warn "claude CLI or graph venv missing — skipping MCP registration (run 'claude mcp add' later)"; fi
+  hermes_register engram-graph "$VENV/bin/python" "$CLAUDE/graph/mg_mcp_server.py"
   say "start Neo4j: cd $CLAUDE/graph && NEO4J_PASSWORD=\$(grep -oP 'NEO4J_PASSWORD=\\K.*' .env) docker compose up -d"
 fi
 
@@ -183,6 +220,7 @@ if [[ "$WANT_VECTOR" == yes ]]; then
         && say "registered engram-vector MCP server" || warn "claude mcp add failed (register manually later)"
     else say "engram-vector MCP already registered"; fi
   else warn "claude CLI or vector venv missing — skipping MCP registration (run 'claude mcp add' later)"; fi
+  hermes_register engram-vector "$VVENV/bin/python" "$CLAUDE/vector/vector_mcp_server.py"
   # Hybrid recall: the warm engram-graph server queries Qdrant in-process, so the
   # GRAPH venv needs qdrant-client too. Idempotent; harmless if graph isn't built.
   if [[ -x "$CLAUDE/graph/venv/bin/python" ]]; then
