@@ -29,7 +29,9 @@ def _load(experts, env):
 
     # graphiti + neo4j imports are heavy and irrelevant here; exec only the model
     # resolution block and read the constants the bootstrap actually consumes.
-    src = MG.read_text().split("OLLAMA_BASE", 1)[1].split("def _neo4j_uri")[0]
+    txt = MG.read_text()
+    src = txt.split("OLLAMA_BASE", 1)[1].split("def _neo4j_uri")[0]
+    src += "\n" + txt.split("def _llm_timeout")[1].split("def build_graphiti")[0].join(["def _llm_timeout",""])
     src = "OLLAMA_BASE" + src
     ns = {"os": os, "engram_llm": ell}
     exec(compile(src, str(MG), "exec"), ns)
@@ -57,5 +59,14 @@ def test_reasoning_off_by_default():
     print("ok — reasoning_effort opt-in via MG_REASONING_EFFORT")
 
 
+def test_llm_timeout_honours_config():
+    """The openai SDK default (600s read, 2 retries) silently drops a memory whose
+    extraction legitimately runs longer on a CPU-offloaded local model."""
+    ns = _load({"distill": {"model": "m"}}, {"MG_LLM_TIMEOUT": "12345"})
+    assert ns["_llm_timeout"]() == 12345.0, "MG_LLM_TIMEOUT ignored"
+    print("ok — graph LLM timeout is configurable (not the 600s SDK default)")
+
+
 if __name__ == "__main__":
     test_experts_pin_wins_over_preset(); test_env_override_wins(); test_reasoning_off_by_default()
+    test_llm_timeout_honours_config()
