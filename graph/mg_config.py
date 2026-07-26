@@ -28,6 +28,11 @@ import engram_llm  # provider abstraction (ollama | claude); embed() = ollama no
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 LLM_MODEL = os.environ.get("MG_LLM_MODEL", "llama3.1:8b")
 SMALL_MODEL = os.environ.get("MG_SMALL_MODEL", "llama3.1:8b")
+# Thinking budget for extraction. Graphiti's OpenAIGenericClient never sends
+# reasoning_effort and Ollama rejects `PARAMETER think` in a Modelfile, so the
+# only place left to inject it is the request body (see _inject_reasoning).
+# Empty string disables the injection entirely (non-reasoning models).
+REASONING_EFFORT = os.environ.get("MG_REASONING_EFFORT", "")
 
 
 def _neo4j_uri() -> str:
@@ -96,10 +101,28 @@ class EngramReranker(CrossEncoderClient):
         return scored
 
 
+def _inject_reasoning(llm) -> None:
+    """Add reasoning_effort to every chat completion graphiti sends.
+
+    Ollama's /v1 honors reasoning_effort and returns the CoT in a separate
+    `reasoning` field, leaving `content` as clean JSON — but graphiti's client
+    builds the request itself and has no hook for extra params, so wrap create().
+    """
+    create = llm.client.chat.completions.create
+
+    async def _create(**kw):
+        kw.setdefault("extra_body", {})["reasoning_effort"] = REASONING_EFFORT
+        return await create(**kw)
+
+    llm.client.chat.completions.create = _create
+
+
 def build_graphiti() -> Graphiti:
     llm = OpenAIGenericClient(
         config=LLMConfig(api_key="ollama", model=LLM_MODEL, small_model=SMALL_MODEL,
                          base_url=OLLAMA_BASE, temperature=0.0, max_tokens=8192))
+    if REASONING_EFFORT:
+        _inject_reasoning(llm)
     driver = Neo4jDriver(uri=NEO4J_URI, user=NEO4J_USER, password=neo4j_password())
     return Graphiti(graph_driver=driver, llm_client=llm,
                     embedder=EngramEmbedder(), cross_encoder=EngramReranker())
