@@ -133,8 +133,35 @@ def _inject_reasoning(llm) -> None:
     llm.client.chat.completions.create = _create
 
 
+def _llm_timeout() -> float:
+    """Per-request timeout for graph extraction, honouring ollama.timeout_seconds.
+
+    The openai SDK defaults to read=600s with max_retries=2, and graphiti constructs
+    its AsyncOpenAI with neither overridden. On a CPU-offloaded local model a single
+    extraction can legitimately exceed 10 minutes, so the call fails after ~41 min
+    (3 attempts + backoff), the episode is logged as an error, and — because it never
+    reaches the state file — the memory is SILENTLY ABSENT from the graph. Observed on
+    3 of the first 50 memories. engram.yaml's ollama.timeout_seconds does not apply
+    here: that governs engram_llm's /api/generate path, a different client.
+    """
+    if os.environ.get("MG_LLM_TIMEOUT"):
+        return float(os.environ["MG_LLM_TIMEOUT"])
+    try:
+        import memory_ai
+        return float((memory_ai.load().get("ollama") or {}).get("timeout_seconds") or 600)
+    except Exception:
+        return 600.0
+
+
 def build_graphiti() -> Graphiti:
+    # Explicit client so the timeout above actually applies. max_retries=0 on purpose:
+    # with a long timeout a retry burns hours, and the bootstrap's own resume loop is
+    # the better retry — it is idempotent and skips everything already done.
+    from openai import AsyncOpenAI
+    http = AsyncOpenAI(api_key="ollama", base_url=OLLAMA_BASE,
+                       timeout=_llm_timeout(), max_retries=0)
     llm = OpenAIGenericClient(
+        client=http,
         config=LLMConfig(api_key="ollama", model=LLM_MODEL, small_model=SMALL_MODEL,
                          base_url=OLLAMA_BASE, temperature=0.0, max_tokens=8192))
     if REASONING_EFFORT:
