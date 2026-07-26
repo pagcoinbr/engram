@@ -26,8 +26,24 @@ import engram_llm  # provider abstraction (ollama | claude); embed() = ollama no
 # LLM is only used by the (retired) Graphiti add_episode bootstrap path — insert/recall
 # do not call it, so constructing it never reaches out. Kept for the bootstrap option.
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-LLM_MODEL = os.environ.get("MG_LLM_MODEL", "llama3.1:8b")
-SMALL_MODEL = os.environ.get("MG_SMALL_MODEL", "llama3.1:8b")
+
+
+def _configured_model(role: str) -> str:
+    """Resolve the extraction model the way every other engram component does:
+    `experts` override > tier preset. These used to default to the literal
+    "llama3.1:8b" — a frozen copy of the tier-small preset that ignored the
+    resolution chain, so an operator who pinned `experts:` to their own model
+    (and pruned the presets) got a 404 on every extraction call."""
+    try:
+        return engram_llm.model_for(role)
+    except Exception:
+        return "llama3.1:8b"
+
+
+# MG_LLM_MODEL wins when set — that's the hook for a num_ctx-tuned Modelfile
+# variant (see graph/make_graph_model.sh), which /v1 cannot configure per-request.
+LLM_MODEL = os.environ.get("MG_LLM_MODEL") or _configured_model("distill")
+SMALL_MODEL = os.environ.get("MG_SMALL_MODEL") or _configured_model("triage")
 # Thinking budget for extraction. Graphiti's OpenAIGenericClient never sends
 # reasoning_effort and Ollama rejects `PARAMETER think` in a Modelfile, so the
 # only place left to inject it is the request body (see _inject_reasoning).
