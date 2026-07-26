@@ -171,11 +171,17 @@ _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.S | re.I)
 
 def _strip_think(text: str) -> str:
     t = _THINK_RE.sub("", text or "")
-    # tolerate an unclosed <think> (truncated CoT): drop everything up to the last </think>,
-    # else if it opens and never closes, drop from the opener.
-    if "<think>" in t.lower():
-        i = t.lower().rfind("</think>")
-        t = t[i + len("</think>"):] if i != -1 else t[: t.lower().find("<think>")]
+    # A DANGLING </think> with no opener is the common ollama case: the chat
+    # template emits the opening tag itself, so `response` starts mid-CoT and ends
+    # with just the closer. Neither the regex nor the unclosed-opener branch below
+    # catches that, which let whole reasoning blocks through. Cut at the LAST
+    # closer whenever one is present, regardless of an opener.
+    low = t.lower()
+    if "</think>" in low:
+        t = t[low.rfind("</think>") + len("</think>"):]
+    # tolerate an unclosed <think> (truncated CoT): drop from the opener.
+    elif "<think>" in low:
+        t = t[: low.find("<think>")]
     return t.strip()
 
 
@@ -213,8 +219,11 @@ def _ollama_generate(prompt: str, role: str, cfg) -> str:
         "num_ctx": int(oc.get("num_ctx", 16384)),
         "num_predict": int(oc.get("num_predict", 8000)),
     }
+    # think: ollama's thinking toggle, config-driven (default False, unchanged).
+    # reasoning_effort below is a NO-OP while think is False, so pinning a
+    # reasoning model to "medium" previously did nothing at all.
     body = {"model": model_for(role, cfg), "prompt": prompt, "stream": False,
-            "think": False, "options": options}  # think=False: standing convention
+            "think": bool(oc.get("think", False)), "options": options}
     if oc.get("keep_alive"):
         body["keep_alive"] = oc["keep_alive"]
     if oc.get("reasoning_effort"):
@@ -223,7 +232,10 @@ def _ollama_generate(prompt: str, role: str, cfg) -> str:
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=_timeout(cfg)) as r:
-        return json.loads(r.read().decode())["response"]
+        # Strip CoT here too. The llama.cpp path already did this; ollama did not,
+        # so a reasoning model's <think> block leaked into JSON-expecting callers
+        # (harvest/distill) — which is why `think` was pinned False upstream.
+        return _strip_think(json.loads(r.read().decode())["response"])
 
 
 # A "not authenticated" failure is PERMANENT within a run (expired OAuth with no
