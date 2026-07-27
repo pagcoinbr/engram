@@ -128,7 +128,19 @@ def _inject_reasoning(llm) -> None:
 
     async def _create(**kw):
         kw.setdefault("extra_body", {})["reasoning_effort"] = REASONING_EFFORT
-        return await create(**kw)
+        r = await create(**kw)
+        # A long memory at high effort can spend the ENTIRE max_tokens budget on hidden
+        # CoT and return finish_reason=length with empty content. Graphiti's tenacity
+        # wrapper then retries the same call 4x (~12 min each here) and the memory ends
+        # up absent from the graph. Degrade the thinking budget instead of re-losing it.
+        # "none" and not "low": measured on Qwen3.6 via ollama 0.32 /v1, high and low
+        # return byte-identical CoT (493 chars on the same probe) — the effort levels are
+        # a no-op here. "none" is the only value that actually stops the thinking.
+        c = r.choices[0]
+        if c.finish_reason == "length" and not (c.message.content or ""):
+            kw["extra_body"]["reasoning_effort"] = "none"
+            r = await create(**kw)
+        return r
 
     llm.client.chat.completions.create = _create
 
