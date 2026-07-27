@@ -34,7 +34,9 @@ ollama:
   think: false                     # ollama thinking toggle. reasoning_effort is a NO-OP while this is
                                    # false. CoT is stripped before the text reaches JSON-expecting
                                    # callers, so turning it on is safe — it just costs output tokens.
-  reasoning_effort: "low"          # for harmony/reasoning models: keep CoT short so the answer comes through
+  reasoning_effort: "low"          # for harmony/reasoning models. ⚠ VERIFY this bites on YOUR model before
+                                   # relying on it: on Qwen3.6 via ollama 0.32 /v1, "high" and "low" returned
+                                   # byte-identical CoT — only "none" actually stops the thinking.
   keep_alive: "30m"                # hold the model resident so sequential stages skip cold reloads
 
 # Claude-only backend (when backend: claude). Flags are configurable since the
@@ -55,7 +57,7 @@ claude:
 # service EnvironmentFile (~/.config/engram/daemon.env), mode 600. Typical setup:
 #   backend: ccg   fallback: claude   (ccg for hosts behind the proxy; raw claude elsewhere)
 ccg:
-  base_url: "http://100.86.23.68:8443"  # ccg endpoint (ANTHROPIC_BASE_URL). Falls back to $ANTHROPIC_BASE_URL.
+  base_url: "http://10.0.0.2:8443"      # ccg endpoint (ANTHROPIC_BASE_URL). Falls back to $ANTHROPIC_BASE_URL.
   api_key_env: "ENGRAM_CCG_KEY"         # env var holding the ccg client key (or $ANTHROPIC_API_KEY)
   model: "claude-opus-4-8"              # model id ccg/Anthropic accepts
   # bin / timeout_seconds / max_turns inherit from the `claude:` block unless set here
