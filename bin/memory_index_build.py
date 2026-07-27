@@ -14,8 +14,9 @@ No LLM. Pure function of the files on disk + .fixation_state.json.
 
 Ranking:
   * `user` and `feedback` memories are ALWAYS included (identity + rules).
-  * `project` / `reference` are ranked by fixation last_score, then mtime, and
-    filled until the byte budget is hit; the remainder collapse to one line.
+  * `project` / `reference` / `snippet` are ranked by fixation last_score, then
+    mtime, and filled until the byte budget is hit; the remainder collapse to one
+    line.
 
 Usage:
   memory_index_build.py                 # print generated index to stdout (dry-run)
@@ -54,6 +55,7 @@ SECTIONS = [
     ("feedback",  "How to work (feedback)", True, 1),
     ("project",   "Projects",          False, 2),
     ("reference", "References",         False, 3),
+    ("snippet",   "Snippets (code that worked)", False, 4),
 ]
 
 

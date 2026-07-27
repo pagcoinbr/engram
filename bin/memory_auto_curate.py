@@ -289,7 +289,12 @@ def main():
         if len(files) < 2:
             continue
         types = {_fm(MEM / f)[2] for f in files}
-        if len(types) == 1:
+        if "snippet" in types:
+            # NEVER merge snippets. Two scripts that differ only in chain id, host,
+            # or decimals embed ~identically, and a merged "umbrella snippet" is a
+            # plausible-looking hybrid that runs against the wrong target.
+            print(f"[auto-curate] skip snippet cluster {files}")
+        elif len(types) == 1:
             typed.append(sorted(files))
         else:
             print(f"[auto-curate] skip mixed-type cluster {files}")

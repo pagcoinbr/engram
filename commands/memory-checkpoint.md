@@ -23,6 +23,7 @@ Save only:
 - New infrastructure (scripts, crons, systemd units, hooks) and where to find them.
 - User feedback and preferences (corrections, validated non-obvious choices).
 - Non-obvious facts about the deployed environment that future sessions can't derive from code (perms, chain, runtime paths).
+- **Working code** (`type: snippet`) — an operational script that you RAN in this session and SAW succeed: the shell/SSH/Docker pipeline, the on-chain send, the recovery query. Save the runner and the gotchas, not just the payload. Only save code whose success you observed; "this should work" is not a snippet.
 
 Never save:
 - Temporary debugging steps or WIP.
@@ -41,7 +42,7 @@ cat <<'EOF' | ~/.claude/save_memory.sh <filename>.md "<one-line description for 
 ---
 name: <short human name>
 description: <one-line relevance hint for future-you>
-type: <user|feedback|project|reference>
+type: <user|feedback|project|reference|snippet>
 ---
 
 ## Summary
@@ -59,7 +60,20 @@ type: <user|feedback|project|reference>
 EOF
 ```
 
-Filename conventions: `<type>_<topic>.md` (e.g. `project_wizard_flow.md`, `feedback_no_trailing_summaries.md`, `reference_grafana_dashboard.md`).
+Filename conventions: `<type>_<topic>.md` (e.g. `project_wizard_flow.md`, `feedback_no_trailing_summaries.md`, `reference_grafana_dashboard.md`, `snippet_evm_native_sweep.md`).
+
+A `snippet` memory carries two extra frontmatter fields, and its body leads with the runnable code:
+
+```yaml
+metadata:
+  type: snippet
+  risk: read | write | money     # read = agent may just run it; write = show the resolved command
+                                 # first; money = bind host/chain/sender/destination/amount and
+                                 # get explicit confirmation before it runs
+  verified_on: 2026-07-27        # when it was last SEEN to work, + on what (host/chain/version)
+```
+
+Keep secrets out — reference `SOME_PRIVATE_KEY` by variable NAME, never by value. Record what proves it worked (tx hash, exit status, row count) so a future session can tell a snippet that ran from a snippet that merely looked right.
 
 ## Step 4 — report
 

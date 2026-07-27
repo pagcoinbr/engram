@@ -57,7 +57,7 @@ def _filters(cfg, mtype: str = "") -> dict | None:
 def memory_vector_recall(query: str, k: int = 6, type: str = "") -> str:
     """Recall the most relevant memories for a task/query by dense semantic search
     over the Qdrant index. Returns memory names, descriptions, and similarity scores.
-    Optionally filter by memory `type` (user|feedback|project|reference). Use at the
+    Optionally filter by memory `type` (user|feedback|project|reference|snippet). Use at the
     start of work to load only the relevant memories instead of all of them.
     (Optional vector store — falls back to a notice if disabled/unreachable.)"""
     try:
@@ -134,6 +134,53 @@ def memory_recall_fused(query: str, k: int = 6, type: str = "") -> str:
         nm, desc = names[d["file"]]
         out.append(f"- {nm or d['file']} [{'+'.join(d['sources'])}]: {(desc or '').strip()}")
     return "\n".join(out)
+
+
+@mcp.tool()
+def memory_snippet_lookup_nograph(task: str, k: int = 2) -> str:
+    """Graphless twin of engram-graph's `memory_snippet_lookup` — prefer that one when
+    the Neo4j graph is installed; use this on vector-only installs. Checks the snippet
+    shelf BEFORE writing operational code (shell/SSH/Docker, on-chain sends, deploy or
+    recovery scripts) and returns scripts that ALREADY ran successfully here, so proven
+    code is reused or adapted instead of regenerated.
+
+    Fuses vector + keyword over `type=snippet` only, and abstains unless both agree —
+    "(no snippet matched)" is a normal answer. Returns pointers, never code: read the
+    returned .md for the script, its `risk:` tag, and its gotchas."""
+    import memory_keyword
+    import memory_fusion
+    cfg = memory_ai.load()
+    rc = memory_ai.recall_cfg(cfg).get("hybrid", {})
+    want = max(k * 4, 12)
+
+    rankings, names = {}, {}
+    try:
+        store = _get_store()
+        vhits = store.search(task, k=want, filters=_filters(store.cfg, "snippet"))
+        rankings["vector"] = [h["file"] for h in vhits]
+        for h in vhits:
+            names.setdefault(h["file"], (h["name"], h["description"]))
+    except vc.VectorUnavailable:
+        pass                      # keyword-only -> hits come back unconfirmed
+    except Exception as e:
+        return f"(snippet lookup: vector leg failed: {e})"
+    try:
+        rankings["keyword"] = [f for f, _ in memory_keyword.rank(task, want, "snippet")]
+    except Exception:
+        pass
+
+    live = sum(1 for v in rankings.values() if v)
+    fused = memory_fusion.fuse(rankings, k_rrf=int(rc.get("k_rrf", 60)),
+                               weights=rc.get("weights"))
+    picked = memory_fusion.select_snippets(fused, live_rankers=live, k=k)
+
+    def _meta(f):
+        if f not in names:
+            nm, desc, _t = memory_keyword.meta(f)
+            names[f] = (nm, desc)
+        return names[f]
+
+    return memory_fusion.format_snippet_hits(task, picked, _meta)
 
 
 @mcp.tool()

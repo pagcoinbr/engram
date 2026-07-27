@@ -92,7 +92,7 @@ mkdir -p "$CLAUDE/commands" "$CLAUDE/graph" "$CLAUDE/vector" "$CLAUDE/logs"
 install -m 0755 "$REPO"/bin/*.sh "$CLAUDE"/ 2>/dev/null || true
 install -m 0755 "$REPO"/bin/*.py "$CLAUDE"/ 2>/dev/null || true
 install -m 0644 "$REPO"/commands/*.md "$CLAUDE"/commands/ 2>/dev/null || true
-# natural-language skills (memory-tidy / memory-promote) — the zero-command entry points
+# natural-language skills (memory-tidy / memory-promote / snippet-shelf) — the zero-command entry points
 for skdir in "$REPO"/skills/*/; do
   [[ -f "$skdir/SKILL.md" ]] || continue
   sk="$(basename "$skdir")"; mkdir -p "$CLAUDE/skills/$sk"

@@ -88,7 +88,7 @@ async def memory_recall(query: str, k: int = 6, type: str = "") -> str:
     graph+vector+keyword ranking (`memory_recall_hybrid`) — kept as a stable name
     for habit/back-compat. The hybrid degrades to graph-only when the vector/keyword
     legs are unavailable, so this is never worse than the old graph-only recall.
-    Optionally filter by memory `type` (user|feedback|project|reference)."""
+    Optionally filter by memory `type` (user|feedback|project|reference|snippet)."""
     return await _recall_hybrid(query, k, type)
 
 
@@ -98,22 +98,22 @@ async def memory_recall_hybrid(query: str, k: int = 6, type: str = "") -> str:
     keyword (BM25 lexical) into one ranking via Reciprocal Rank Fusion, keyed by the
     .md filename. Use at the start of work to load the most relevant memories. Each
     ranker degrades independently — a disabled/down vector store or graph just drops
-    out. Optionally filter by memory `type` (user|feedback|project|reference)."""
+    out. Optionally filter by memory `type` (user|feedback|project|reference|snippet).
+    For reusable CODE specifically, prefer `memory_snippet_lookup`."""
     return await _recall_hybrid(query, k, type)
 
 
-async def _recall_hybrid(query: str, k: int = 6, type: str = "") -> str:
-    """Shared implementation for memory_recall + memory_recall_hybrid (a plain
-    callable so neither tool depends on the @mcp.tool decorator's return value)."""
+async def _rankings(query: str, want: int, mtype: str = "") -> tuple[dict, dict, dict]:
+    """Run all three recall legs and return (rankings, names, facts) for fusion.
+
+    Each leg is independently try/excepted: a dead Neo4j or a disabled vector store
+    just drops out of `rankings` instead of failing the call. Shared by hybrid recall
+    and snippet lookup so there is exactly ONE retrieval path, not two."""
     import asyncio
     import memory_ai
-    import memory_fusion
     import memory_keyword
 
     cfg = memory_ai.load()
-    rc = memory_ai.recall_cfg(cfg).get("hybrid", {})
-    mtype = type or ""
-    want = max(k * 2, 10)
     rankings, names, facts = {}, {}, {}
 
     # graph leg
@@ -153,6 +153,19 @@ async def _recall_hybrid(query: str, k: int = 6, type: str = "") -> str:
     except Exception:
         pass
 
+    return rankings, names, facts
+
+
+async def _recall_hybrid(query: str, k: int = 6, type: str = "") -> str:
+    """Shared implementation for memory_recall + memory_recall_hybrid (a plain
+    callable so neither tool depends on the @mcp.tool decorator's return value)."""
+    import memory_ai
+    import memory_fusion
+    import memory_keyword
+
+    rc = memory_ai.recall_cfg(memory_ai.load()).get("hybrid", {})
+    rankings, names, facts = await _rankings(query, max(k * 2, 10), type or "")
+
     fused = memory_fusion.fuse(rankings, k_rrf=int(rc.get("k_rrf", 60)),
                                weights=rc.get("weights"))[:k]
     if not fused:
@@ -167,6 +180,37 @@ async def _recall_hybrid(query: str, k: int = 6, type: str = "") -> str:
         for fact in facts.get(d["file"], [])[:2]:
             out.append(f"    - {fact}")
     return "\n".join(out)
+
+
+@mcp.tool()
+async def memory_snippet_lookup(task: str, k: int = 2) -> str:
+    """Check the snippet shelf BEFORE writing operational code — shell/SSH/Docker
+    pipelines, on-chain sends, deploy or recovery scripts, API probes. Returns code
+    that has ALREADY been run successfully on this fleet, so a proven script gets
+    reused (or diffed and adapted) instead of regenerated from scratch.
+
+    Searches `type=snippet` memories only, and ABSTAINS unless two independent
+    rankers agree — "(no snippet matched)" is a normal, useful answer, not a
+    failure. Returns pointers, never code: read the returned .md file to get the
+    script, its `risk:` tag, and its gotchas before running anything."""
+    import memory_ai
+    import memory_fusion
+    import memory_keyword
+
+    rc = memory_ai.recall_cfg(memory_ai.load()).get("hybrid", {})
+    rankings, names, _ = await _rankings(task, max(k * 4, 12), "snippet")
+    live = sum(1 for v in rankings.values() if v)
+    fused = memory_fusion.fuse(rankings, k_rrf=int(rc.get("k_rrf", 60)),
+                               weights=rc.get("weights"))
+    picked = memory_fusion.select_snippets(fused, live_rankers=live, k=k)
+
+    def _meta(f):
+        if f not in names:
+            nm, desc, _t = memory_keyword.meta(f)
+            names[f] = (nm, desc)
+        return names[f]
+
+    return memory_fusion.format_snippet_hits(task, picked, _meta)
 
 
 @mcp.tool()
