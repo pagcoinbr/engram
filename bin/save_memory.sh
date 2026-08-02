@@ -24,9 +24,24 @@ MEMORY_MD="$(memory_index)"
 
 mkdir -p "$LOCAL_DIR"
 
+# Hold this memory's own lock for the WHOLE mutation (existence check + write +
+# push + index), so a concurrent writer to the same filename cannot interleave.
+# Released on any exit path. Lock order: file lock OUTER, index lock INNER.
+memory_file_lock_acquire "$FILENAME" || exit 1   # fail-closed: never mutate unlocked
+trap 'memory_file_lock_release' EXIT
+
 # Track whether this is a brand-new memory (drives the consolidation counter).
 WAS_NEW=0
 [[ -f "${LOCAL_DIR}/${FILENAME}" ]] || WAS_NEW=1
+
+# MEMORY_NOCLOBBER=1 — create-only. An overwrite gets no .trash snapshot, so a
+# caller that means "this must be a NEW memory" (e.g. /memory-cluster writing a
+# merged file) can demand it. Checked UNDER the lock, so it is atomic against
+# another writer creating the same name.
+if [[ "${MEMORY_NOCLOBBER:-0}" == "1" && "$WAS_NEW" != "1" ]]; then
+    echo "[save-memory] REFUSING: ${FILENAME} exists and MEMORY_NOCLOBBER=1 (an overwrite has no .trash snapshot)" >&2
+    exit 1
+fi
 
 # Read content from stdin
 CONTENT=$(cat)

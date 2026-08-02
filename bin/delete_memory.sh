@@ -14,7 +14,55 @@ REPO="$(memory_repo)"
 REMOTE_PATH="$(memory_remote_path)"
 LOCAL_DIR="$(memory_dir)"
 
-# 0. Local recoverability snapshot. Remote deletes are git-recoverable ONLY when
+# Hold this memory's own lock for the WHOLE deletion (CAS check + snapshot +
+# rm + remote delete + index strip). Lock order: file lock OUTER, index lock
+# INNER — memory_index_remove_line below takes the index lock.
+memory_file_lock_acquire "$FILENAME" || exit 1   # fail-closed: never mutate unlocked
+trap 'memory_file_lock_release' EXIT
+
+# MEMORY_EXPECT_SHA=<sha256> — conditional (compare-and-swap) delete. A caller
+# that read this file earlier passes the hash it saw; if the content changed
+# since, ABORT rather than retire an update it never merged. Checked under the
+# lock, so the value cannot drift between the check and the rm.
+if [[ -n "${MEMORY_EXPECT_SHA:-}" ]]; then
+    # Reject a malformed value rather than treating it as "no CAS requested" — a
+    # caller whose hash lookup silently produced garbage must not get an
+    # unconditional delete.
+    if [[ ! "$MEMORY_EXPECT_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "[delete-memory] REFUSING: MEMORY_EXPECT_SHA is set but not a 64-hex sha256" >&2
+        exit 1
+    fi
+    ACTUAL_SHA="$(memory_file_sha "${LOCAL_DIR}/${FILENAME}")"
+    if [[ "$ACTUAL_SHA" != "$MEMORY_EXPECT_SHA" ]]; then
+        echo "[delete-memory] REFUSING: ${FILENAME} changed since it was read" >&2
+        echo "[delete-memory]   expected ${MEMORY_EXPECT_SHA:0:12}… got ${ACTUAL_SHA:0:12}…" >&2
+        exit 1
+    fi
+fi
+
+# 0a. Remote CAS PRE-CHECK — must happen BEFORE anything local is touched.
+# Resolving the remote sha here (rather than inside the delete block below) means a
+# remote that moved on, or an unreachable API, aborts with the local canonical file
+# still in place. Checking it after the local rm would leave the store showing only
+# the merged memory while an updated payout/custody record sat in .trash.
+REMOTE_SHA=""
+if [[ -n "$REPO" ]]; then
+    if RESP=$(gh api "repos/${REPO}/contents/${REMOTE_PATH}/${FILENAME}" 2>/dev/null); then
+        REMOTE_SHA=$(echo "$RESP" | jq -r '.sha // empty')
+    elif [[ -n "${MEMORY_EXPECT_REMOTE_SHA:-}" ]]; then
+        # A caller that asked for remote CAS cannot be served if the API is
+        # unreachable — fail closed rather than deleting blind.
+        echo "[delete-memory] REFUSING: cannot read remote ${FILENAME} to honour MEMORY_EXPECT_REMOTE_SHA" >&2
+        exit 1
+    fi
+    if [[ -n "${MEMORY_EXPECT_REMOTE_SHA:-}" && "$REMOTE_SHA" != "$MEMORY_EXPECT_REMOTE_SHA" ]]; then
+        echo "[delete-memory] REFUSING: remote ${FILENAME} changed since it was read" >&2
+        echo "[delete-memory]   expected ${MEMORY_EXPECT_REMOTE_SHA:0:12}… got ${REMOTE_SHA:0:12}…" >&2
+        exit 1
+    fi
+fi
+
+# 0b. Local recoverability snapshot. Remote deletes are git-recoverable ONLY when
 # CLAUDE_MEMORY_REPO is set; with no remote (local-first) a plain rm is permanent.
 # Always snapshot to .trash/ first so every deletion has a local undo. .trash is a
 # subdir, so MEM_DIR.glob("*.md") (non-recursive) never picks these up.
@@ -40,10 +88,9 @@ fi
 # PUT/DELETE aborts the whole script under `set -e`, so the index strip + vector
 # cleanup below never run. Local-first: skip cleanly.
 if [[ -n "$REPO" ]]; then
-    REMOTE_SHA=""
-    if RESP=$(gh api "repos/${REPO}/contents/${REMOTE_PATH}/${FILENAME}" 2>/dev/null); then
-        REMOTE_SHA=$(echo "$RESP" | jq -r '.sha // empty')
-    fi
+    # REMOTE_SHA was resolved and CAS-checked in step 0a, before anything local was
+    # touched. Deleting at that exact sha means GitHub itself rejects the call if the
+    # blob moved in between, so the remote delete is conditional end to end.
     if [[ -n "$REMOTE_SHA" ]]; then
         gh api "repos/${REPO}/contents/${REMOTE_PATH}/${FILENAME}" \
             --method DELETE \

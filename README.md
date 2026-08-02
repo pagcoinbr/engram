@@ -123,6 +123,7 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 | **`/memory-checkpoint`** | Review the current session and save any new, durable facts as memories (dedup-aware). |
 | **`/memory-curate`** | *Systems consolidation.* Cluster narrow / overlapping facts and merge them into class-level "umbrella" memories; prune the stale ones. |
 | **`/memory-fixate`** | *Long-term potentiation.* Score memories (age + recurrence + distillation-survival + injection-suspicion), distill/merge the trusted ones, and gate suspect (possibly-poisoned) memories through you. |
+| **`/memory-cluster`** | *Topic consolidation.* Merge many memories describing ONE system into a single distilled file, resolving contradictions as it goes. Unlike `auto_curate` (near-duplicates, cosine ≥ 0.92) this handles complementary facets whose similarity is far below any dedup threshold. |
 | **`/memory-reformat`** | Rewrite memories into the canonical **Summary → Index → Body** shape so each file is graspable at a glance (facts preserved, nothing dropped). |
 | **`/memory-clean-review`** | Walk the store file-by-file with you deciding **keep / edit / delete** on each — fully human-driven. |
 | **`/memory-to-skill`** | Promote a high-trust, frequently-recalled *procedural* memory into a first-class Claude Code skill. |

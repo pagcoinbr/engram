@@ -79,6 +79,75 @@ memory_frontmatter_type() {
 # ---------------------------------------------------------------------------
 memory_index_lockfile() { printf '%s' "$(memory_index).lock"; }
 
+# ── PER-MEMORY locking (added 2026-08) ──────────────────────────────────────
+# The index lock serialises MEMORY.md, but nothing serialised the MEMORY FILES
+# themselves: save_memory.sh overwrites and delete_memory.sh removes with no
+# compare-and-swap, so two writers touching the same filename (a session's
+# save racing the unattended curator, or a long /memory-cluster run) could lose
+# an update outright. These give every memory its own lock file under .locks/.
+#
+# LOCK ORDER — always file lock OUTER, index lock INNER. Both writers take the
+# file lock for their whole mutation and only then call memory_index_* (which
+# takes the index lock). Never invert, or two writers deadlock.
+#
+# Same fd-in-the-CURRENT-shell discipline as memory_with_index_lock: under
+# Claude Code's shell snapshot, running the mutation in a `( … ) 9>>lock`
+# subshell lets a function-shadowed builtin exec away mid-write.
+memory_file_lockfile() {
+    local d; d="$(memory_dir)/.locks"
+    mkdir -p "$d" 2>/dev/null || true
+    printf '%s' "${d}/${1}.lock"
+}
+
+# memory_file_lock_acquire <filename.md> — take the per-memory lock for the rest
+# of this shell. FAIL-CLOSED: returns non-zero if the lock cannot be opened or
+# acquired, and every caller MUST abort.
+#
+# Deliberately unlike memory_with_index_lock, which falls back to running
+# unlocked. That is defensible for the index (a best-effort append), but NOT
+# here: MEMORY_NOCLOBBER and MEMORY_EXPECT_SHA are compare-and-swap primitives,
+# and a CAS that proceeds unlocked after a timeout silently stops being a CAS —
+# two writers would both pass their check and one update would be lost. If flock
+# is missing entirely, that guarantee cannot be offered at all, so a caller that
+# explicitly asked for CAS is refused rather than quietly downgraded.
+memory_file_lock_acquire() {
+    MEMORY_FILE_LOCK_FD=""
+    local wait="${MEMORY_LOCK_WAIT:-30}"
+    if ! command -v flock >/dev/null 2>&1; then
+        if [[ -n "${MEMORY_NOCLOBBER:-}" || -n "${MEMORY_EXPECT_SHA:-}" ]]; then
+            echo "[memory] REFUSING: flock unavailable, cannot honour MEMORY_NOCLOBBER/MEMORY_EXPECT_SHA" >&2
+            return 1
+        fi
+        return 0   # no CAS requested: proceed as before
+    fi
+    local lock; lock="$(memory_file_lockfile "$1")"
+    if ! exec {MEMORY_FILE_LOCK_FD}>>"$lock" 2>/dev/null; then
+        MEMORY_FILE_LOCK_FD=""
+        echo "[memory] REFUSING: cannot open lock for $1" >&2
+        return 1
+    fi
+    if ! flock -w "$wait" "$MEMORY_FILE_LOCK_FD"; then
+        echo "[memory] REFUSING: timed out after ${wait}s waiting for the lock on $1 (another writer holds it)" >&2
+        exec {MEMORY_FILE_LOCK_FD}>&- 2>/dev/null || true
+        MEMORY_FILE_LOCK_FD=""
+        return 1
+    fi
+    return 0
+}
+
+memory_file_lock_release() {
+    [[ -n "${MEMORY_FILE_LOCK_FD:-}" ]] || return 0
+    exec {MEMORY_FILE_LOCK_FD}>&- 2>/dev/null || true
+    MEMORY_FILE_LOCK_FD=""
+}
+
+# memory_file_sha <path> — sha256 of a memory file, or "" when absent. Used for
+# the conditional (compare-and-swap) delete.
+memory_file_sha() {
+    [[ -f "$1" ]] || { printf ''; return 0; }
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+}
+
 # memory_with_index_lock <cmd> [args...] — run cmd while holding an exclusive
 # advisory lock on the index lockfile, so all MEMORY.md mutations serialize.
 # Falls back to running unlocked (best-effort) if flock is unavailable. The
