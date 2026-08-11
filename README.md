@@ -56,6 +56,49 @@ mutation is **dry-run + human-approved**.
 - **Runs on your terms** — local Ollama (GPU) *or* Claude-only (no GPU). Your data stays on your machine unless you opt into sync.
 - **Safe by default** — every automated mutation is dry-run + human-approved.
 
+## What it costs you — measured
+
+Auto-recall runs on **every prompt**, so it has to be cheap in both wall-clock and
+context. Numbers below are from a real 358-memory store (Qdrant + Neo4j + Ollama, all
+on localhost), `python3` on Linux — reproduce them with the commands underneath.
+
+| | time |
+|---|---|
+| **Auto-recall hook, end to end** | **~0.27s** |
+| ├ Ollama `nomic-embed-text` embed | 0.04s |
+| ├ Qdrant vector search | 0.04s |
+| ├ BM25 keyword leg (358 memories, pure python) | 0.13s |
+| └ Neo4j 1-hop graph facts | 0.07s |
+| The same hook using the *client libraries* instead of HTTP | 1.85s |
+
+The gap is import time, not I/O: `import qdrant_client` alone costs **0.78s** to
+perform a **0.04s** search, and `mg_config` pulls in graphiti for a 0.07s query. So
+the recall path speaks HTTP to Qdrant/Ollama/Neo4j with nothing but the standard
+library — which is also why it needs **no venv, no daemon, and no server**.
+
+**Context cost is bounded, not per-prompt.** Auto-recall injects names and one-line
+descriptions only — never memory bodies — and never injects the same memory or graph
+fact twice in a session:
+
+| session | naive re-injection | engram (deduped) |
+|---|---|---|
+| 100 prompts, k=4 | ~25,000 tokens | **~500-800 tokens** |
+
+Recall converges: the first prompts about a topic pay for it, the rest are free. A
+long session ends up having loaded ~15-30 unique memories in total.
+
+```bash
+# time the whole hook against your own store
+echo '{"prompt":"how does X work","session_id":"bench"}' > /tmp/prompt.json
+time ~/.claude/hooks/memory-recall-inject.py < /tmp/prompt.json
+
+# why was it quiet? (gated / not importable / disabled / already injected)
+ENGRAM_HOOK_DEBUG=1 ~/.claude/hooks/memory-recall-inject.py < /tmp/prompt.json
+
+# the recall core alone — add --json for the raw fused ranking
+time ~/.claude/memory_recall.py "how does X work" --k 4 --fast
+```
+
 ## Backends — pick what your hardware allows
 - **`ollama`** — local models on a GPU box, free + private. Choose a `tier` for your VRAM (`cpu`/`small`/`medium`/`large`).
 - **`claude`** — no GPU: an always-on loop container runs the pipeline via the `claude` CLI. Cost = Claude usage instead of a GPU.
