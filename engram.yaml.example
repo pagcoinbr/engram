@@ -218,6 +218,16 @@ recall:
     k_rrf: 60                    # RRF constant (standard 60); damps low-rank contributions
     default_k: 6                 # how many fused memories a recall returns
     weights: { graph: 1.0, vector: 1.0, keyword: 1.0 }   # per-ranker RRF weight
+  # Auto-recall: the UserPromptSubmit hook (hooks/memory-recall-inject.py) puts the
+  # memories relevant to each prompt in front of Claude without waiting for it to
+  # call a recall tool. It injects NAMES + DESCRIPTIONS ONLY (never memory bodies)
+  # and never repeats a memory or a fact within one session, so a long session costs
+  # a few hundred tokens in total rather than k memories x every prompt.
+  inject:
+    enabled: true                # false = hook goes quiet (no need to unmerge it)
+    k: 4                         # memories per injection (post-dedup)
+    max_facts: 6                 # 1-hop graph facts per injection
+    timeout_ms: 2500             # per-leg HTTP budget; past it the leg drops out
 
 # Local MCP servers wired into interactive sessions. The graph recall server
 # (graph/mcp_server.py) is registered by the installer as `engram-graph`; the

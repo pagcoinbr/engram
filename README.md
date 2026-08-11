@@ -128,6 +128,7 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 | **`/memory-to-skill`** | Promote a high-trust, frequently-recalled *procedural* memory into a first-class Claude Code skill. |
 
 ### Recall — how the right memories reach Claude
+- **Auto-recall** (the `UserPromptSubmit` hook): every prompt gets the memories that match it injected automatically — no waiting for Claude to think of calling a recall tool. Names + one-line descriptions only, **at most once per memory per session**, ~0.3s, fail-open. Off with `recall.inject.enabled: false`.
 - **Graph recall** (`engram-graph` MCP): `memory_recall`, `memory_search_facts`, `memory_neighbors`, `memory_stats` — Claude loads only the relevant memories on demand, instead of dumping the whole store into context.
 - **Hybrid recall** (`memory_recall_hybrid`, on `engram-graph`): the best single recall — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename. Each ranker degrades independently; optional `type` filter.
 - **Vector recall** (the optional `engram-vector` MCP): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search via Qdrant. Plus `memory_recall_fused` (vector+keyword) for no-graph installs. Off by default; enable with `./install.sh --vector`.
@@ -136,6 +137,13 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 
 ### Automatic
 A Stop hook harvests new facts each session; the daemon consolidates / fixates / syncs the graph (and the vector index, if enabled) on a cadence — all dry-run + human-approved.
+
+### The console
+`~/.claude/engram-tui.py` — a terminal UI over the whole store: dashboard (backend /
+graph / vector health), memories (browse, search, view, edit, save, delete), recall,
+vector search + re-sync, graph entity lookup, skills, and the staging/quarantine
+queues. Pure stdlib `curses`, no server and no browser; saves and deletes go through
+`save_memory.sh` / `delete_memory.sh`, the same gates the CLI uses.
 
 ## The 24/7 daemon
 `engram-daemon` runs the pipeline + graph sync + health on independent cadences:
