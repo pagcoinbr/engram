@@ -111,11 +111,11 @@ Respects `local_enabled` and the dry-run gates.
 
 ## 6. File map
 ```
-bin/      engine + engram_llm.py (+ engram_api.py for the GUI)  → installs to ~/.claude/
+bin/      engine + engram_llm.py + memory_recall.py + engram-tui.py → ~/.claude/
+bin/hooks/ memory-recall-inject.py (UserPromptSubmit auto-recall)  → ~/.claude/hooks/
 commands/ the 6 /memory-* slash commands                        → ~/.claude/commands/
 graph/    Graphiti/Neo4j: graph_sync, mg_config, mcp_server, …  → ~/.claude/graph/ (+ venv)
 vector/   OPTIONAL Qdrant: vector_store, vector_sync, mcp_server → ~/.claude/vector/ (+ venv)
 daemon/   engram-daemon.py, systemd units, Dockerfile + compose
-ui/       React/Vite GUI (FastAPI backend = bin/engram_api.py)
 examples/memory/  synthetic seed memories (the AcmeCorp stack)
 ```

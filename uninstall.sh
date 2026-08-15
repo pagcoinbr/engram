@@ -14,8 +14,11 @@ say(){ printf '\033[1;36m[engram]\033[0m %s\n' "$*"; }
 systemctl --user disable --now engram.timer memory-nightly-apply.timer >/dev/null 2>&1 || true
 systemctl --user stop memory-nightly-apply.service engram.service >/dev/null 2>&1 || true
 
-# engine files (by the names shipped in the repo)
-[[ -d "$REPO/bin" ]] && for f in "$REPO"/bin/*; do rm -f "$CLAUDE/$(basename "$f")"; done
+# engine files (by the names shipped in the repo). -f only: bin/ has a hooks/ subdir,
+# and `rm -f` on a directory FAILS (exit 1) — under set -e that would abort the uninstall.
+[[ -d "$REPO/bin" ]] && for f in "$REPO"/bin/*; do [[ -f "$f" ]] && rm -f "$CLAUDE/$(basename "$f")"; done
+[[ -d "$REPO/bin/hooks" ]] && for f in "$REPO"/bin/hooks/*; do rm -f "$CLAUDE/hooks/$(basename "$f")"; done
+rm -rf "$CLAUDE/ui" "$CLAUDE/engram_api.py" "$CLAUDE/engram-ui.sh"   # pre-TUI GUI leftovers
 [[ -d "$REPO/commands" ]] && for f in "$REPO"/commands/*; do rm -f "$CLAUDE/commands/$(basename "$f")"; done
 rm -f "$CLAUDE/engram-daemon.py"
 [[ -d "$REPO/graph" ]] && for f in "$REPO"/graph/*.py "$REPO"/graph/*.md; do rm -f "$CLAUDE/graph/$(basename "$f")"; done
@@ -28,7 +31,7 @@ say "removed engine files"
 if command -v jq >/dev/null && [[ -f "$SETTINGS" ]]; then
   if jq '.hooks //= {} | .hooks |= (to_entries
         | map(.value |= (map(.hooks |= map(select((.command // "")
-              | test("(memory_curate_check|memory_agent|memory_session_curate|codex-availability-warn)\\.sh")|not)))
+              | test("(memory_curate_check|memory_agent|memory_session_curate|codex-availability-warn)\\.sh|memory-recall-inject\\.py")|not)))
             | map(select((.hooks|length) > 0))))
         | from_entries)' "$SETTINGS" > "$SETTINGS.tmp"; then
     mv "$SETTINGS.tmp" "$SETTINGS"; say "removed hooks from settings.json"

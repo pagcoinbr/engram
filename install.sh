@@ -101,8 +101,10 @@ done
 for f in "$REPO"/graph/*.py "$REPO"/graph/*.md "$REPO"/graph/docker-compose.yml; do [[ -e "$f" ]] && install -m 0644 "$f" "$CLAUDE/graph/"; done
 for f in "$REPO"/vector/*.py "$REPO"/vector/docker-compose.yml; do [[ -e "$f" ]] && install -m 0644 "$f" "$CLAUDE/vector/"; done
 install -m 0755 "$REPO"/daemon/engram-daemon.py "$CLAUDE"/ 2>/dev/null || true
-mkdir -p "$CLAUDE/ui"; [[ -f "$REPO/ui/index.html" ]] && install -m 0644 "$REPO/ui/index.html" "$CLAUDE/ui/"
-say "engine installed into $CLAUDE (GUI: run engram-ui.sh)"
+mkdir -p "$CLAUDE/hooks"; install -m 0755 "$REPO"/bin/hooks/*.py "$CLAUDE/hooks/" 2>/dev/null || true
+# the GUI (FastAPI + SPA) was replaced by engram-tui.py — clear it out on update
+rm -rf "$CLAUDE/ui" "$CLAUDE/engram_api.py" "$CLAUDE/engram-ui.sh" 2>/dev/null || true
+say "engine installed into $CLAUDE (console: run $CLAUDE/engram-tui.py)"
 
 # ---- engram.yaml ----
 if [[ -f "$CLAUDE/engram.yaml" ]]; then
@@ -254,6 +256,9 @@ if command -v jq >/dev/null; then
   merge_hook SessionStart "$CLAUDE/codex-availability-warn.sh"
   merge_hook Stop "$CLAUDE/memory_agent.sh"
   merge_hook Stop "$CLAUDE/memory_session_curate.sh"
+  # auto-recall: inject the memories relevant to each prompt (deduped per session).
+  # Turn off with `recall.inject.enabled: false` in engram.yaml — no need to unmerge.
+  merge_hook UserPromptSubmit "$CLAUDE/hooks/memory-recall-inject.py"
   say "hooks merged into settings.json"
 fi
 

@@ -56,6 +56,49 @@ mutation is **dry-run + human-approved**.
 - **Runs on your terms** — local Ollama (GPU) *or* Claude-only (no GPU). Your data stays on your machine unless you opt into sync.
 - **Safe by default** — every automated mutation is dry-run + human-approved.
 
+## What it costs you — measured
+
+Auto-recall runs on **every prompt**, so it has to be cheap in both wall-clock and
+context. Numbers below are from a real 358-memory store (Qdrant + Neo4j + Ollama, all
+on localhost), `python3` on Linux — reproduce them with the commands underneath.
+
+| | time |
+|---|---|
+| **Auto-recall hook, end to end** | **~0.27s** |
+| ├ Ollama `nomic-embed-text` embed | 0.04s |
+| ├ Qdrant vector search | 0.04s |
+| ├ BM25 keyword leg (358 memories, pure python) | 0.13s |
+| └ Neo4j 1-hop graph facts | 0.07s |
+| The same hook using the *client libraries* instead of HTTP | 1.85s |
+
+The gap is import time, not I/O: `import qdrant_client` alone costs **0.78s** to
+perform a **0.04s** search, and `mg_config` pulls in graphiti for a 0.07s query. So
+the recall path speaks HTTP to Qdrant/Ollama/Neo4j with nothing but the standard
+library — which is also why it needs **no venv, no daemon, and no server**.
+
+**Context cost is bounded, not per-prompt.** Auto-recall injects names and one-line
+descriptions only — never memory bodies — and never injects the same memory or graph
+fact twice in a session:
+
+| session | naive re-injection | engram (deduped) |
+|---|---|---|
+| 100 prompts, k=4 | ~25,000 tokens | **~500-800 tokens** |
+
+Recall converges: the first prompts about a topic pay for it, the rest are free. A
+long session ends up having loaded ~15-30 unique memories in total.
+
+```bash
+# time the whole hook against your own store
+echo '{"prompt":"how does X work","session_id":"bench"}' > /tmp/prompt.json
+time ~/.claude/hooks/memory-recall-inject.py < /tmp/prompt.json
+
+# why was it quiet? (gated / not importable / disabled / already injected)
+ENGRAM_HOOK_DEBUG=1 ~/.claude/hooks/memory-recall-inject.py < /tmp/prompt.json
+
+# the recall core alone — add --json for the raw fused ranking
+time ~/.claude/memory_recall.py "how does X work" --k 4 --fast
+```
+
 ## Backends — pick what your hardware allows
 - **`ollama`** — local models on a GPU box, free + private. Choose a `tier` for your VRAM (`cpu`/`small`/`medium`/`large`).
 - **`claude`** — no GPU: an always-on loop container runs the pipeline via the `claude` CLI. Cost = Claude usage instead of a GPU.
@@ -128,6 +171,7 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 | **`/memory-to-skill`** | Promote a high-trust, frequently-recalled *procedural* memory into a first-class Claude Code skill. |
 
 ### Recall — how the right memories reach Claude
+- **Auto-recall** (the `UserPromptSubmit` hook): every prompt gets the memories that match it injected automatically — no waiting for Claude to think of calling a recall tool. Names + one-line descriptions only, **at most once per memory per session**, ~0.3s, fail-open. Off with `recall.inject.enabled: false`.
 - **Graph recall** (`engram-graph` MCP): `memory_recall`, `memory_search_facts`, `memory_neighbors`, `memory_stats` — Claude loads only the relevant memories on demand, instead of dumping the whole store into context.
 - **Hybrid recall** (`memory_recall_hybrid`, on `engram-graph`): the best single recall — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename. Each ranker degrades independently; optional `type` filter.
 - **Vector recall** (the optional `engram-vector` MCP): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search via Qdrant. Plus `memory_recall_fused` (vector+keyword) for no-graph installs. Off by default; enable with `./install.sh --vector`.
@@ -136,6 +180,13 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 
 ### Automatic
 A Stop hook harvests new facts each session; the daemon consolidates / fixates / syncs the graph (and the vector index, if enabled) on a cadence — all dry-run + human-approved.
+
+### The console
+`~/.claude/engram-tui.py` — a terminal UI over the whole store: dashboard (backend /
+graph / vector health), memories (browse, search, view, edit, save, delete), recall,
+vector search + re-sync, graph entity lookup, skills, and the staging/quarantine
+queues. Pure stdlib `curses`, no server and no browser; saves and deletes go through
+`save_memory.sh` / `delete_memory.sh`, the same gates the CLI uses.
 
 ## The 24/7 daemon
 `engram-daemon` runs the pipeline + graph sync + health on independent cadences:

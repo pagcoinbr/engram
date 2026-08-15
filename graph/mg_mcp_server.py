@@ -16,7 +16,7 @@ from pathlib import Path
 logging.getLogger("neo4j").setLevel(logging.ERROR)
 logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 
-# Shared engine modules (memory_ai / memory_keyword / memory_fusion) live flat in
+# Shared engine modules (memory_ai / memory_recall / memory_keyword) live flat in
 # ~/.claude; the optional vector store in ~/.claude/vector. Make both importable so
 # the hybrid tool can fuse graph + vector + keyword in-process.
 sys.path.insert(0, str(Path.home() / ".claude" / "vector"))
@@ -107,11 +107,9 @@ async def _recall_hybrid(query: str, k: int = 6, type: str = "") -> str:
     callable so neither tool depends on the @mcp.tool decorator's return value)."""
     import asyncio
     import memory_ai
-    import memory_fusion
-    import memory_keyword
+    import memory_recall
 
     cfg = memory_ai.load()
-    rc = memory_ai.recall_cfg(cfg).get("hybrid", {})
     mtype = type or ""
     want = max(k * 2, 10)
     rankings, names, facts = {}, {}, {}
@@ -147,24 +145,17 @@ async def _recall_hybrid(query: str, k: int = 6, type: str = "") -> str:
         pass  # vector store disabled/unreachable -> drops out
 
     # keyword leg (pure-python; effectively always available)
-    try:
-        krank = memory_keyword.rank(query, want, mtype or None)
-        rankings["keyword"] = [f for f, _ in krank]
-    except Exception:
-        pass
+    rankings["keyword"] = [f for f, _ in memory_recall.keyword_leg(query, want, mtype)]
 
-    fused = memory_fusion.fuse(rankings, k_rrf=int(rc.get("k_rrf", 60)),
-                               weights=rc.get("weights"))[:k]
-    if not fused:
+    # RRF + record assembly live in bin/memory_recall.py — one fusion, three callers
+    # (this tool, the prompt hook, the TUI).
+    results = memory_recall.fuse(rankings, names, facts, cfg, k)
+    if not results:
         return f"(no memories matched: {query})"
-    out = [f"Recalled {len(fused)} memories for: {query}", ""]
-    for d in fused:
-        if d["file"] not in names:                  # keyword-only hit -> read frontmatter
-            nm, desc, _ = memory_keyword.meta(d["file"])
-            names[d["file"]] = (nm, desc)
-        nm, desc = names[d["file"]]
-        out.append(f"- {nm or d['file']} [{'+'.join(d['sources'])}]: {(desc or '').strip()}")
-        for fact in facts.get(d["file"], [])[:2]:
+    out = [f"Recalled {len(results)} memories for: {query}", ""]
+    for r in results:
+        out.append(f"- {r['name']} [{'+'.join(r['sources'])}]: {r['description']}")
+        for fact in r["facts"][:2]:
             out.append(f"    - {fact}")
     return "\n".join(out)
 

@@ -109,7 +109,32 @@ recall:
     k_rrf: 60                    # RRF constant (standard 60)
     default_k: 6                 # fused memories returned
     weights: { graph: 1.0, vector: 1.0, keyword: 1.0 }
+  inject:                        # auto-recall on every prompt (UserPromptSubmit hook)
+    enabled: true
+    k: 4                         # memories per injection
+    max_facts: 6                 # 1-hop graph facts per injection
+    timeout_ms: 2500             # per-leg HTTP budget
 ```
+
+## Auto-recall (the prompt hook)
+`hooks/memory-recall-inject.py` runs on every prompt and injects the memories that
+match it, so recall does not depend on Claude remembering to call a recall tool. The
+installer merges it as a `UserPromptSubmit` hook; `recall.inject.enabled: false`
+silences it without unmerging.
+
+It is built to be cheap and quiet:
+- **names + one-line descriptions only** — never memory bodies;
+- **once per session** — a memory (or graph fact) already injected in this session is
+  never injected again, state in `~/.claude/logs/recall-inject/<session_id>.json`,
+  swept after 7 days. This is what stops a long session from re-paying for the same
+  memories on every prompt;
+- **~0.3s, stdlib only** — it talks to Qdrant/Ollama/Neo4j over HTTP rather than
+  importing their clients (`import qdrant_client` alone measures 0.78s), so it needs
+  no venv and no daemon;
+- **fail-open** — any error prints nothing and exits 0. To find out *why* it was
+  quiet: `echo '{"prompt":"...","session_id":"dbg"}' | ENGRAM_HOOK_DEBUG=1 ~/.claude/hooks/memory-recall-inject.py`.
+
+A prompt shorter than 25 characters, or starting with `/` or `!`, is skipped.
 
 ## Graph (Neo4j)
 Config is mostly env: `NEO4J_URI` (default `bolt://127.0.0.1:7687`), `NEO4J_PASSWORD`
