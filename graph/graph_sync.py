@@ -14,10 +14,19 @@ one incremental command the daemon runs on a cadence:
   --status              counts: store memories / in graph / pending.
 
 Authority model (v1): .md-authoritative. Insert handles NEW files; CHANGED files
-are reported (re-run `memory_graph_insert.py --rebuild` to refresh — that avoids
-duplicate episodes). Extraction needs only the LLM (works on either backend); the
-insert/export/reconcile subprocesses need the graph venv (Graphiti + Neo4j).
+are only REPORTED here — refresh them with `graph_maint.py --refresh-changed`,
+which deletes the stale episode before re-inserting.
+
+⚠ Do NOT use `memory_graph_insert.py --rebuild` to refresh: it resets the local
+state file and deletes NOTHING in Neo4j, so it mints a SECOND episode for every
+memory and duplicates the graph. (This docstring used to claim the opposite; that
+is how 126 duplicate episodes accumulated.) --rebuild is only for a graph that has
+been wiped, and now refuses to run against a populated one without --force.
+
+Extraction needs only the LLM (works on either backend); the insert/export/
+reconcile subprocesses need the graph venv (Graphiti + Neo4j).
 """
+import copy
 import hashlib
 import json
 import os
@@ -31,6 +40,7 @@ sys.path.insert(0, str(HERE.parent / "bin"))
 if str(Path.home() / ".claude") not in sys.path:
     sys.path.append(str(Path.home() / ".claude"))
 import engram_llm  # generation routed by backend (ollama | claude)
+import memory_ai   # config loader, for the per-attempt temperature override
 
 
 def _slug() -> str:
@@ -52,7 +62,8 @@ if not Path(GRAPH_PY).exists():
 def _store_files():
     if not MEM_DIR.exists():
         return []
-    return sorted(p for p in MEM_DIR.glob("*.md") if p.name != "MEMORY.md")
+    return sorted(p for p in MEM_DIR.glob("*.md")
+                  if p.name not in ("MEMORY.md", "MEMORY_FULL.md"))
 
 def _done_files() -> set:
     if not INSERT_STATE.exists():
@@ -89,7 +100,27 @@ def extract(md_path: Path) -> dict:
     content = md_path.read_text(errors="ignore")
     prompt = (f"{spec}\n\n---\nFILE: {md_path.name}\n---\n{content}\n\n"
               "Output ONLY the JSON object described above — no prose, no code fences.")
-    data = _parse_json(engram_llm.generate(prompt, role="harvest"))
+    # For some inputs the model falls into a degenerate non-JSON reply and repeats it
+    # BYTE-IDENTICALLY at the configured temperature — measured 3/3 the same 52-char
+    # string on reference_cipher_signer_remote_cutover.md (2026-08-15). So retrying the
+    # same call is provably useless; vary the sampling instead. Stays on the local
+    # backend by design — no fallback provider.
+    last = None
+    for temp in (None, 0.6, 1.0):
+        cfg = None
+        if temp is not None:
+            cfg = copy.deepcopy(memory_ai.load())
+            cfg.setdefault("ollama", {})["temperature"] = temp
+        try:
+            data = _parse_json(engram_llm.generate(prompt, role="harvest", cfg=cfg))
+            if temp is not None:
+                print(f"[sync] {md_path.name}: extraction recovered at temperature {temp}",
+                      flush=True)
+            break
+        except Exception as e:                      # non-JSON reply or transport error
+            last = e
+    else:
+        raise last
     data.setdefault("file", md_path.name)
     data.setdefault("entities", [])
     data.setdefault("edges", [])
