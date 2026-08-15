@@ -8,6 +8,7 @@
 #   --graph | --no-graph        (build the Neo4j graph venv + register the MCP server)
 #   --vector | --no-vector      (build the Qdrant vector venv + register the MCP server)
 #   --hermes | --no-hermes      (also register the MCP servers with hermes; default: auto)
+#   --no-start-services         (do NOT `docker compose up` Neo4j/Qdrant; just print how)
 #   --yes                       (accept defaults, no prompts)
 #
 # What it does: copies the engine into ~/.claude, writes engram.yaml, merges the
@@ -23,6 +24,7 @@ SETTINGS="$CLAUDE/settings.json"
 BACKEND=""; TIER="small"; OLLAMA_HOST="http://localhost:11434"
 STORAGE="local"; REPO_REMOTE=""; DAEMON="none"; YES=0; WANT_GRAPH="auto"; WANT_VECTOR="auto"
 WANT_HERMES="auto"   # auto = register only if the hermes CLI is on PATH
+START_SERVICES="yes" # bring Neo4j/Qdrant UP (they were only ever printed as a hint)
 
 while [[ $# -gt 0 ]]; do case "$1" in
   --backend) BACKEND="$2"; shift 2;;
@@ -37,6 +39,8 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --no-vector) WANT_VECTOR="no"; shift;;
   --hermes) WANT_HERMES="yes"; shift;;
   --no-hermes) WANT_HERMES="no"; shift;;
+  --start-services) START_SERVICES="yes"; shift;;
+  --no-start-services) START_SERVICES="no"; shift;;
   --yes|-y) YES=1; shift;;
   -h|--help) sed -n '2,17p' "$0"; exit 0;;
   *) echo "unknown arg: $1" >&2; exit 2;;
@@ -45,6 +49,37 @@ esac; done
 say()  { printf '\033[1;36m[engram]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[engram] warning:\033[0m %s\n' "$*"; }
 ask()  { local __v="$1" __p="$2" __d="$3" __a; if [[ "$YES" == 1 || ! -t 0 ]]; then printf -v "$__v" '%s' "${!__v:-$__d}"; return; fi; read -r -p "$__p [$__d]: " __a || true; printf -v "$__v" '%s' "${__a:-${!__v:-$__d}}"; }
+
+# compose_up <dir> <container> <label> — actually START a dependency instead of just
+# printing the command. Both compose files already declare `restart: unless-stopped`,
+# so once up they survive reboots — PROVIDED the docker daemon starts at boot. Both
+# conditions are verified rather than assumed: a Neo4j that is merely down does not
+# error loudly, it silently pauses every graph insert (7 nights of that, 2026-08).
+# `docker compose` picks up the sibling .env for ${NEO4J_PASSWORD} on its own.
+compose_up() {
+  local dir="$1" cname="$2" label="$3" pol
+  if [[ "$START_SERVICES" != yes ]]; then
+    say "not starting $label (--no-start-services); run: cd $dir && docker compose up -d"; return
+  fi
+  if ! command -v docker >/dev/null; then
+    warn "docker not found — start $label yourself: cd $dir && docker compose up -d"; return
+  fi
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$cname"; then
+    say "$label already running ($cname)"
+  elif ( cd "$dir" && docker compose up -d ) >/dev/null 2>&1; then
+    say "$label started ($cname)"
+  else
+    warn "could not start $label — run manually: cd $dir && docker compose up -d"; return
+  fi
+  pol="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$cname" 2>/dev/null || true)"
+  case "$pol" in
+    unless-stopped|always) ;;
+    *) warn "$cname restart policy is '${pol:-unknown}' — it will NOT return after a reboot."
+       warn "  fix: docker update --restart unless-stopped $cname";;
+  esac
+  systemctl is-enabled docker >/dev/null 2>&1 \
+    || warn "docker is not enabled at boot — $label will not auto-start (sudo systemctl enable docker)"
+}
 
 # hermes_register <server-name> <python> <server.py> — also expose an engram MCP
 # server to hermes, an MCP client that drives a LOCAL Ollama model, so the local

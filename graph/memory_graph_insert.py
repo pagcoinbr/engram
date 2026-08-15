@@ -10,7 +10,13 @@ from EXTRACT_DIR, plus the canonical .md (for verbatim source_md + body). Entiti
 merge across memories by canonical name. Episode carries verbatim source_md so the
 graph alone regenerates the file. Resumable via a state file.
 
-Usage: python3 memory_graph_insert.py [--only FILE.md ...] [--rebuild]
+⚠ --rebuild resets the local state file ONLY — it deletes nothing in Neo4j, so on a
+populated graph it mints a second episode per memory instead of refreshing them. It
+is for re-populating a WIPED graph; to refresh changed memories use
+`graph_maint.py --refresh-changed` (delete-then-insert). It now refuses to run
+against a non-empty graph unless --force is passed.
+
+Usage: python3 memory_graph_insert.py [--only FILE.md ...] [--rebuild [--force]]
 """
 import asyncio
 import datetime as dt
@@ -76,7 +82,12 @@ async def main():
     etype = {}
     for p in jsons:
         for e in json.loads(p.read_text()).get("entities", []):
-            nm = e["name"].strip()
+            # The extractor occasionally emits an entity with no name (4 of 1488 on
+            # 2026-08-15). This pre-pass runs before ANY insert, so a KeyError here
+            # aborted every run and silently blocked 142 pending memories.
+            if not isinstance(e, dict):
+                continue
+            nm = (e.get("name") or "").strip()
             if nm and nm not in etype and e.get("type"):
                 etype[nm] = e["type"]
 
@@ -85,6 +96,23 @@ async def main():
 
     g = build_graphiti()
     await g.build_indices_and_constraints()
+
+    # --rebuild only clears the LOCAL state file; every existing Episodic node stays
+    # in Neo4j, so re-inserting mints a second episode per memory. Refuse rather than
+    # silently duplicate the graph — that is how 126 duplicates accumulated before
+    # 2026-08-15. `graph_maint.py --refresh-changed` is the delete-then-insert path.
+    if rebuild and "--force" not in args:
+        r, _, _ = await g.driver.execute_query(
+            "MATCH (e:Episodic) WHERE e.file IS NOT NULL RETURN count(e) AS c")
+        existing = r[0]["c"] if r else 0
+        if existing:
+            print(f"refusing --rebuild: {existing} Episodic node(s) already in the graph.\n"
+                  f"  It would ADD duplicates, not refresh them (no delete happens here).\n"
+                  f"  To refresh changed memories:  graph_maint.py --refresh-changed --apply\n"
+                  f"  To rebuild a wiped graph anyway:  --rebuild --force",
+                  file=sys.stderr)
+            await g.close()
+            sys.exit(2)
     emb = g.embedder
     now = dt.datetime.now(dt.timezone.utc)
 
@@ -126,21 +154,47 @@ async def main():
             d=meta.get("description", ""), t=meta.get("type", "reference"))
 
         ents = ex.get("entities", [])
+        mentioned = set()          # entity uuids this episode should link to
         for e in ents:
-            await ensure_entity(e["name"])
+            if isinstance(e, dict):
+                u = await ensure_entity(e.get("name") or "")   # ensure_entity no-ops on blank
+                if u:
+                    mentioned.add(u)
         nedges = 0
         for ed in ex.get("edges", []):
             s = await ensure_entity(ed.get("source", ""))
             t = await ensure_entity(ed.get("target", ""))
             if not s or not t or s == t:
                 continue
+            mentioned.update((s, t))
+            # A blank fact embeds to [] and Neo4j's setRelationshipVectorProperty
+            # rejects an empty vector, ABORTING the whole run — 1 factless edge out
+            # of 170 cost all 10 memories of a batch (2026-08-14). The edge itself is
+            # still real, so synthesize prose from the triple rather than drop it.
+            rel = ed.get("relation", "RELATES_TO")
+            fact = (ed.get("fact") or "").strip() or \
+                f"{ed.get('source', '').strip()} {rel} {ed.get('target', '').strip()}".strip()
             edge = EntityEdge(source_node_uuid=s, target_node_uuid=t,
-                              name=ed.get("relation", "RELATES_TO"),
-                              fact=ed.get("fact", ""), group_id=CANONICAL_GROUP,
+                              name=rel,
+                              fact=fact, group_id=CANONICAL_GROUP,
                               episodes=[ep.uuid], created_at=now, valid_at=ref)
             await edge.generate_embedding(emb)
+            if not edge.fact_embedding:
+                # Belt and braces: an embedder hiccup must cost one edge, not the batch.
+                print(f"  skip edge (empty embedding): {fact!r}", flush=True)
+                continue
             await edge.save(g.driver)
             nedges += 1
+        # Link the episode to every entity it mentions. Without this the graph stores
+        # Entity->Entity facts but nothing connects them BACK to the memory, so
+        # "which memories mention X" / "what does this memory mention" cannot be
+        # traversed — 372 of 613 episodes had zero MENTIONS before this (2026-08-15).
+        # MERGE keeps it idempotent across re-inserts.
+        if mentioned:
+            await g.driver.execute_query(
+                "MATCH (ep:Episodic {uuid:$e}) UNWIND $u AS uu "
+                "MATCH (n:Entity {uuid:uu}) MERGE (ep)-[:MENTIONS]->(n)",
+                e=ep.uuid, u=sorted(mentioned))
         st["done"][fname] = ep.uuid
         st["entities"] = ent_uuid
         save_state(st)

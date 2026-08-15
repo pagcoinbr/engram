@@ -158,7 +158,18 @@ def task_graph():
     if not _neo4j_up():
         log("graph: Neo4j down — skipping insert")
         return False
-    _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--insert"])
+    # --limit: graph_sync extracts every pending memory BEFORE its single terminal
+    # write, so an unbounded run on a large backlog is killed mid-extraction by the
+    # 3600s _run cap and commits NOTHING. That cost 7 consecutive nights (2026-08-08
+    # .. 08-14) with the graph frozen at the 327 the bootstrap left. Keep N * per-
+    # memory-time comfortably under the cap; the backlog drains a batch per night.
+    # Bound the batch: an unbounded run on a large backlog is killed mid-extraction
+    # by the 3600s _run cap, which is how the graph sat frozen at the bootstrap's 327
+    # for 7 nights (2026-08-08..08-14). memory_graph_insert commits per memory, so a
+    # kill costs the in-flight memory, not the batch — size this for the cap, not for
+    # safety. 25 @ ~40s measured (think:false, 2026-08-14) ~= 17 min, 3x headroom.
+    return _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"),
+                 "--insert", "--limit", "25"]) == 0
 
 def task_vector():
     if not _vector_enabled():
@@ -191,11 +202,16 @@ def task_harvest():
             pipe = c; break
     if not pipe:
         log("harvest: memory_pipeline.sh not found"); return False
-    _run(["bash", str(pipe)])
+    ok = _run(["bash", str(pipe)]) == 0
     if ((cfg().get("telegram") or {}).get("activity_log")):
         gate = ENGRAM_BIN / "engram_telegram_gate.py"
         if gate.exists():
             _run([sys.executable, str(gate), "--activity"], timeout=30)
+    # Report the PIPELINE's result, not the activity ping's: a timed-out encode must
+    # not stamp as a completed run (it did until 2026-08-14). Each pipeline stage is
+    # already bounded internally (harvest max_files_per_run, stage-apply max_per_run),
+    # so a failure here is a real fault worth retrying, not runaway work.
+    return ok
 
 
 def task_maintenance():
@@ -203,11 +219,17 @@ def task_maintenance():
     # (harvest->graduate) is now its own frequent task, NOT run here. Deterministic
     # scoring needs no LLM, but distill does — the cron gates that internally.
     sh = _maintenance_script()
+    if sh and sh.name == "memory_pipeline.sh":
+        # No dedicated fixate script on this install, so _maintenance_script() falls
+        # through to the very pipeline task_harvest already ran — measured as two full
+        # runs a night (04:00 + 06:00, 2026-08-14), each capable of burning the 3600s
+        # cap. Stamp (not defer) so this logs once a day, not every 30 min.
+        log(f"maintenance: no dedicated fixate script — {sh.name} already ran in harvest; skipping duplicate")
+        return
     if sh:
-        _run(["bash", str(sh)])   # activity notify lives in task_harvest (encode is where the news is)
-    else:
-        log("maintenance: no maintenance script found (memory_fixate_cron.sh / memory_pipeline.sh)")
-        return False
+        return _run(["bash", str(sh)]) == 0   # activity notify lives in task_harvest (encode is where the news is)
+    log("maintenance: no maintenance script found (memory_fixate_cron.sh / memory_pipeline.sh)")
+    return False
 
 def task_curate():
     """CONSOLIDATE (weekly): auto-merge near-duplicate memories. Same slow time-constant
