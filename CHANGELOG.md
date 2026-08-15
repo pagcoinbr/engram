@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — auto-recall + the console
+## 1.1.0 — auto-recall, the console, and a graph that actually inserts
 
 ### Added
 - **Auto-recall on every prompt.** `hooks/memory-recall-inject.py` (a `UserPromptSubmit`
@@ -26,6 +26,50 @@
 - Recall legs talk to Qdrant / Ollama / Neo4j over **HTTP instead of their client
   libraries** (`import qdrant_client` alone measured 0.78s against a 0.04s search), so
   the hook and console run on system `python3` with no venv: 1.85s → 0.3s.
+
+### Fixed — the graph insert had been silently producing nothing
+The nightly graph insert produced **zero rows for 7 consecutive nights** while every
+timer stayed green. Three instances of one defect class — a single malformed record
+aborting an entire run:
+- A blank edge `fact` embeds to `[]` and Neo4j's `setRelationshipVectorProperty`
+  rejects an empty vector: **1 factless edge out of 170 killed all 10 memories** in
+  the batch. The fact is now synthesized from the triple instead of dropped.
+- An entity with no `name` raised `KeyError` in the global type pre-pass, which runs
+  *before* any insert — **4 nameless entities in one JSON blocked all 142 pending
+  memories**. Guarded in both the pre-pass and the per-memory loop.
+- An unbounded run is killed by the daemon's 3600s cap mid-extraction and commits
+  nothing, so `task_graph` now passes `--limit`.
+
+- **Extraction retries that can actually work.** The model can fall into a degenerate
+  non-JSON reply and repeat it *byte-identically* (measured 3/3 at temperature 0.2), so
+  retrying the same call is useless. `extract()` escalates sampling instead
+  (`None → 0.6 → 1.0`). Stays on the local backend; no fallback provider.
+- **`MENTIONS` are created on insert.** The insert built Entity nodes and Entity→Entity
+  `RELATES_TO` but never linked the episode to what it mentions, leaving
+  "which memories mention X" untraversable for **372 of 613 episodes**.
+- **`--rebuild` no longer duplicates the graph.** It resets the local state file and
+  deletes nothing in Neo4j, so on a populated graph it minted a second episode per
+  memory — the opposite of what its own docstring claimed, and the source of 126
+  duplicates. It now refuses a non-empty graph without `--force`.
+- **Timeouts stop reporting success.** A timed-out task no longer stamps
+  `daemon_state.json` as a completed run, and `maintenance` skips `memory_pipeline.sh`
+  when `harvest` already ran it — without a dedicated fixate script both tasks ran the
+  same pipeline twice a night.
+- `MEMORY_FULL.md` is excluded from the store scan, so the index is not extracted as a
+  memory.
+
+### Added
+- **`graph/graph_maint.py`** — repairs the sync path can't do itself: `--dedup`,
+  `--prune-stale`, `--refresh-changed`, `--backfill-mentions`, `--prune-isolated`,
+  `--all`. Dry-run by default. Every selection is `group_id`-scoped so a shared Neo4j is
+  never touched; staleness is judged against `Episodic.source_md` rather than
+  `sync_state` (bootstrap-era memories have no `sync_state` entry, which made the
+  "293 changed memory(ies)" banner false — only 56 were real).
+- **`install.sh` starts and verifies its dependencies.** It now runs `docker compose up -d`
+  for Neo4j/Qdrant instead of printing the command, then checks the container restart
+  policy and that docker is enabled at boot. Both compose files already declared
+  `restart: unless-stopped`; nothing ever ran them. `--no-start-services` opts out.
+
 
 ## 1.0.0 — The autonomous release
 
