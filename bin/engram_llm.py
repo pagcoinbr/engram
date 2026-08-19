@@ -29,7 +29,7 @@ CLI:
   engram_llm.py --embed                 # read text on stdin, print JSON vector
 """
 from __future__ import annotations
-import json, os, re, subprocess, sys, urllib.request
+import json, os, re, shutil, subprocess, sys, urllib.request
 from pathlib import Path
 
 # Make sibling modules importable; the sibling (this dir) wins over ~/.claude so
@@ -94,6 +94,21 @@ def model_for(role: str, cfg=None) -> str:
 def fallback(cfg=None) -> str:
     return (_cfg(cfg).get("fallback") or "").strip().lower()
 
+def _ccg_gateway_from_cli() -> str | None:
+    """The gateway URL from the installed `ccg` launcher, if present. It's the single
+    source of truth for where the working gateway lives, so when ccg.base_url isn't
+    pinned we reuse it — engram then can't drift from a stale origin baked into the
+    yaml (e.g. a raw IP that moved). Returns None if no `ccg` is on PATH / unreadable."""
+    launcher = shutil.which("ccg")
+    if not launcher:
+        return None
+    try:
+        m = re.search(r'^GATEWAY_URL="?([^"\n]+?)"?\s*$', Path(launcher).read_text(), re.M)
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
 def _ccg_generate(prompt: str, role: str, cfg) -> str:
     """Generation via cc-gateway (ccg): the Claude Code CLI pointed at the ccg OAuth
     proxy (ANTHROPIC_BASE_URL) with the ccg client key (ANTHROPIC_API_KEY). ccg swaps
@@ -101,9 +116,10 @@ def _ccg_generate(prompt: str, role: str, cfg) -> str:
     OAuth session needed) — unlike raw `claude`. The key is read from an env var
     (default ENGRAM_CCG_KEY) so it lives in the service EnvironmentFile, never the repo."""
     gc = cfg.get("ccg", {})
-    base_url = gc.get("base_url") or os.environ.get("ANTHROPIC_BASE_URL")
+    # Explicit config wins; fall back to the installed `ccg` CLI's gateway host.
+    base_url = gc.get("base_url") or os.environ.get("ANTHROPIC_BASE_URL") or _ccg_gateway_from_cli()
     if not base_url:
-        raise RuntimeError("ccg backend: no base_url configured (ccg.base_url or ANTHROPIC_BASE_URL)")
+        raise RuntimeError("ccg backend: no base_url configured (ccg.base_url, ANTHROPIC_BASE_URL, or an installed `ccg` CLI)")
     # Require the configured key env EXPLICITLY. No implicit ANTHROPIC_API_KEY
     # fallback: that would ship the REAL Anthropic key to the gateway as the client
     # key (a compromised gateway could then impersonate/charge the account). An
