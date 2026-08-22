@@ -99,6 +99,32 @@ def test_auth_failure_is_non_retryable(monkey_env):
     assert n["c"] == 1, f"auth failure must NOT retry, ran {n['c']}x"
 
 
+def test_ccg_gateway_from_cli_fills_unset_base_url(monkey_env):
+    """With no ccg.base_url / ANTHROPIC_BASE_URL, the gateway host is read from the
+    installed `ccg` launcher on PATH — so engram tracks the working gateway instead
+    of a stale origin pinned in the yaml."""
+    import os, tempfile
+    d = tempfile.mkdtemp()
+    launcher = Path(d) / "ccg"
+    launcher.write_text('#!/bin/bash\nGATEWAY_URL="https://ccg.example.org"\n')
+    launcher.chmod(0o755)
+    monkey_env("PATH", d + os.pathsep + os.environ.get("PATH", ""))
+    monkey_env("ANTHROPIC_BASE_URL", "")   # ensure nothing pins it above the CLI
+
+    captured = {}
+    def fake_run(cmd, **kw):
+        captured["env"] = kw.get("env") or {}
+        return types.SimpleNamespace(stdout="PONG", returncode=0)
+    e.subprocess.run = fake_run
+    cfg = {"backend": "ccg", "fallback": "claude",
+           "ccg": {"api_key_env": "ENGRAM_CCG_KEY"},   # no base_url pinned
+           "claude": {"bin": "claude"}}
+    monkey_env("ENGRAM_CCG_KEY", "ccg-client-key-123")
+    out = e.generate("hi", "triage", cfg)
+    assert out == "PONG"
+    assert captured["env"]["ANTHROPIC_BASE_URL"] == "https://ccg.example.org", captured["env"]
+
+
 if __name__ == "__main__":
     import os
     saved = {}
@@ -106,7 +132,7 @@ if __name__ == "__main__":
         saved.setdefault(k, os.environ.get(k)); os.environ[k] = v
     for t in (test_ccg_sets_proxy_env, test_ccg_falls_back_to_raw_claude,
               test_ccg_auth_denial_fails_closed, test_ccg_requires_explicit_key_no_anthropic_fallback,
-              test_auth_failure_is_non_retryable):
+              test_auth_failure_is_non_retryable, test_ccg_gateway_from_cli_fills_unset_base_url):
         t(monkey_env)
     for k, v in saved.items():
         if v is None: os.environ.pop(k, None)
