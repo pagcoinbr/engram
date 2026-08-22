@@ -111,6 +111,11 @@ def test_ccg_gateway_from_cli_fills_unset_base_url(monkey_env):
     monkey_env("PATH", d + os.pathsep + os.environ.get("PATH", ""))
     monkey_env("ANTHROPIC_BASE_URL", "")   # ensure nothing pins it above the CLI
 
+    # A compiled `ccg` on PATH must degrade to None, not crash the backend.
+    launcher.write_bytes(b"\x7fELF\x02\x01\x01\xff\xfe\x00binary")
+    assert e._ccg_gateway_from_cli() is None
+    launcher.write_text('#!/bin/bash\nGATEWAY_URL="https://ccg.example.org"\n')
+
     captured = {}
     def fake_run(cmd, **kw):
         captured["env"] = kw.get("env") or {}

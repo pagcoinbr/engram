@@ -104,7 +104,7 @@ def _ccg_gateway_from_cli() -> str | None:
         return None
     try:
         m = re.search(r'^GATEWAY_URL="?([^"\n]+?)"?\s*$', Path(launcher).read_text(), re.M)
-    except OSError:
+    except (OSError, UnicodeDecodeError):   # a compiled `ccg` on PATH is not text
         return None
     return m.group(1) if m else None
 
