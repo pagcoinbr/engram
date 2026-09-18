@@ -116,6 +116,8 @@ Graphiti behaviour exactly. It fails closed if that path is unavailable. `native
 uses Rust's typed-triple and embedding index together with the usual hybrid RRF;
 use it for shadow evaluation until its representative recall evaluation reaches
 parity. `ENGRAM_GRAPH_BACKEND` temporarily overrides this setting for a process.
+The daemon uses the matching Graphiti writer, export, and reconciliation jobs while
+this backend is selected, so new memories remain visible to Graphiti recall.
 
 ```yaml
 recall:

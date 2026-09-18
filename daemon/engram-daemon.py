@@ -61,6 +61,10 @@ ORDER = ["health", "approvals", "harvest", "graph", "vector", "maintenance",
 def cfg():
     return memory_ai.load() if memory_ai else {}
 
+def graphiti_compat_enabled() -> bool:
+    """Keep the Graphiti writer and reader on the same index during migration."""
+    return (cfg().get("graph", {}) or {}).get("backend") == "graphiti_compat"
+
 def intervals():
     iv = dict(DEFAULT_INTERVALS)
     iv.update((cfg().get("daemon", {}) or {}).get("intervals", {}) or {})
@@ -169,7 +173,7 @@ def task_graph():
     # kill costs the in-flight memory, not the batch — size this for the cap, not for
     # safety. 25 @ ~40s measured (think:false, 2026-08-14) ~= 17 min, 3x headroom.
     rust_sync = ENGRAM_BIN / "rust" / "engram-native-graph-sync"
-    if rust_sync.is_file() and os.access(rust_sync, os.X_OK):
+    if not graphiti_compat_enabled() and rust_sync.is_file() and os.access(rust_sync, os.X_OK):
         slug = os.environ.get("CLAUDE_MEMORY_SLUG") or str(HOME).replace("/", "-")
         return _run([str(rust_sync), "--config", str(ENGRAM_BIN / "engram.yaml"),
                      "--slug", slug, "--limit", "25"]) == 0
@@ -268,7 +272,7 @@ def task_export():
     if not _neo4j_up():
         return False
     rust_sync = ENGRAM_BIN / "rust" / "engram-graph-sync"
-    if rust_sync.is_file() and os.access(rust_sync, os.X_OK):
+    if not graphiti_compat_enabled() and rust_sync.is_file() and os.access(rust_sync, os.X_OK):
         return _run([str(rust_sync), "--config", str(ENGRAM_BIN / "engram.yaml"), "--graph-dir", str(ENGRAM_GRAPH), "--mode", "export"]) == 0
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--export", "--verify"])
 
@@ -276,7 +280,7 @@ def task_reconcile():
     if not _neo4j_up():
         return False
     rust_sync = ENGRAM_BIN / "rust" / "engram-graph-sync"
-    if rust_sync.is_file() and os.access(rust_sync, os.X_OK):
+    if not graphiti_compat_enabled() and rust_sync.is_file() and os.access(rust_sync, os.X_OK):
         return _run([str(rust_sync), "--config", str(ENGRAM_BIN / "engram.yaml"), "--graph-dir", str(ENGRAM_GRAPH), "--mode", "reconcile"]) == 0
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--reconcile"])
 
