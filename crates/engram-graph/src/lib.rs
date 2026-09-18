@@ -2,6 +2,13 @@ use reqwest::Client;
 use serde::Deserialize;
 use thiserror::Error;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecallHit {
+    pub file: String,
+    pub facts: Vec<String>,
+    pub score: f64,
+}
+
 #[derive(Clone)]
 pub struct GraphClient {
     endpoint: String,
@@ -71,6 +78,50 @@ impl GraphClient {
                     .into_iter()
                     .next()
                     .and_then(|value| value.as_str().map(str::to_string))
+            })
+            .collect())
+    }
+    pub async fn semantic_files(
+        &self,
+        vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<RecallHit>, GraphError> {
+        self.file_hits(
+            "MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity) WITH e, vector.similarity.cosine(e.fact_embedding, $vector) AS score WHERE score > 0 UNWIND coalesce(e.episodes, []) AS episode MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL RETURN ep.file AS file, collect(DISTINCT e.fact) AS facts, max(score) AS score ORDER BY score DESC LIMIT $limit",
+            serde_json::json!({"vector": vector, "limit": limit}),
+        ).await
+    }
+    pub async fn keyword_files(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RecallHit>, GraphError> {
+        self.file_hits(
+            "CALL db.index.fulltext.queryRelationships('edge_name_and_fact', $query, {limit: $limit}) YIELD relationship AS rel, score UNWIND coalesce(rel.episodes, []) AS episode MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL RETURN ep.file AS file, collect(DISTINCT rel.fact) AS facts, max(score) AS score ORDER BY score DESC LIMIT $limit",
+            serde_json::json!({"query": query, "limit": limit}),
+        ).await
+    }
+    async fn file_hits(
+        &self,
+        statement: &str,
+        parameters: serde_json::Value,
+    ) -> Result<Vec<RecallHit>, GraphError> {
+        let response = self.query(statement, parameters).await?;
+        Ok(response
+            .results
+            .into_iter()
+            .flat_map(|set| set.data)
+            .filter_map(|row| {
+                let file = row.row.first()?.as_str()?.to_string();
+                let facts = row
+                    .row
+                    .get(1)?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect();
+                let score = row.row.get(2)?.as_f64().unwrap_or_default();
+                Some(RecallHit { file, facts, score })
             })
             .collect())
     }

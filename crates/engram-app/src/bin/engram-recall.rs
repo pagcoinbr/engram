@@ -63,8 +63,8 @@ async fn main() {
         .collect::<Vec<_>>();
     legs.insert("keyword".into(), "ok".into());
     let vector = vector_leg(&config, &args.query, &args.slug, args.k * 2, &mut legs).await;
-    let facts = graph_leg(&args.query, &mut legs).await;
-    let rankings = vec![keyword.clone(), vector.clone()];
+    let (graph, facts) = graph_leg(&config, &args.query, args.k * 2, &mut legs).await;
+    let rankings = vec![keyword.clone(), vector.clone(), graph.clone()];
     let by_file: HashMap<String, &Memory> = memories
         .iter()
         .map(|memory| (memory.file.clone(), memory))
@@ -79,6 +79,9 @@ async fn main() {
             }
             if vector.contains(&hit.file) {
                 sources.push("vector".into());
+            }
+            if graph.contains(&hit.file) {
+                sources.push("graph".into());
             }
             Some(ResultItem {
                 file: memory.file.clone(),
@@ -139,11 +142,16 @@ async fn vector_leg(
     }
 }
 
-async fn graph_leg(query: &str, legs: &mut HashMap<String, String>) -> Vec<String> {
+async fn graph_leg(
+    config: &Config,
+    query: &str,
+    k: usize,
+    legs: &mut HashMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
     let password = std::env::var("NEO4J_PASSWORD").unwrap_or_default();
     if password.is_empty() {
         legs.insert("graph".into(), "password unavailable".into());
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let tokens = query
         .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
@@ -154,19 +162,36 @@ async fn graph_leg(query: &str, legs: &mut HashMap<String, String>) -> Vec<Strin
     let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://127.0.0.1:7687".into());
     let database = std::env::var("NEO4J_DATABASE").unwrap_or_else(|_| "neo4j".into());
     match GraphClient::new(&uri, &database, "neo4j", password) {
-        Ok(client) => match client.facts_for_tokens(&tokens, 6).await {
-            Ok(facts) => {
-                legs.insert("graph".into(), "ok".into());
-                facts
-            }
-            Err(error) => {
-                legs.insert("graph".into(), error.to_string());
-                Vec::new()
-            }
-        },
+        Ok(client) => {
+            let facts = client
+                .facts_for_tokens(&tokens, 6)
+                .await
+                .unwrap_or_default();
+            let keyword = client.keyword_files(query, k).await.unwrap_or_default();
+            let semantic = match OpenAiCompatibleClient::new(config.embed.url.clone()) {
+                Ok(embeddings) => match embeddings.embedding(&config.embed.model, query).await {
+                    Ok(vector) => client.semantic_files(&vector, k).await.unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                },
+                Err(_) => Vec::new(),
+            };
+            let ranked = rrf(
+                &[
+                    keyword.iter().map(|hit| hit.file.clone()).collect(),
+                    semantic.iter().map(|hit| hit.file.clone()).collect(),
+                ],
+                k,
+                60.0,
+            )
+            .into_iter()
+            .map(|hit| hit.file)
+            .collect();
+            legs.insert("graph".into(), "ok".into());
+            (ranked, facts)
+        }
         Err(error) => {
             legs.insert("graph".into(), error.to_string());
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     }
 }
