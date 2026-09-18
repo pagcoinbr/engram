@@ -233,7 +233,7 @@ if [[ "$WANT_GRAPH" == yes ]]; then
   if [[ ! -x "$VENV/bin/python" ]]; then
     say "building graph venv (graphiti-core, neo4j, fastembed)... this can take a few minutes"
     if python3 -m venv "$VENV" && "$VENV/bin/pip" install -q --upgrade pip && \
-       "$VENV/bin/pip" install -q "mcp[cli]" graphiti-core neo4j fastembed pyyaml; then
+       "$VENV/bin/pip" install -q "mcp[cli]" "graphiti-core==0.29.2" neo4j fastembed pyyaml; then
       say "graph venv ready"
     else
       warn "graph venv build failed — install graphiti-core/neo4j/fastembed manually into $VENV"
@@ -247,6 +247,11 @@ if [[ "$WANT_GRAPH" == yes ]]; then
     "$VENV/bin/pip" install -q "mcp[cli]" \
       && say "added mcp to graph venv (engram-graph could not start without it)" \
       || warn "could not install mcp into graph venv — engram-graph will not start"
+  fi
+  if [[ -x "$VENV/bin/python" ]] && ! "$VENV/bin/python" -c "import importlib.metadata as m; assert m.version('graphiti-core') == '0.29.2'" 2>/dev/null; then
+    "$VENV/bin/pip" install -q "graphiti-core==0.29.2" \
+      && say "pinned graphiti-core to 0.29.2 for recall compatibility" \
+      || warn "could not pin graphiti-core — graphiti_compat recall may differ from the tested version"
   fi
   if command -v claude >/dev/null && [[ -x "$VENV/bin/python" ]]; then
     if ! claude mcp list 2>/dev/null | grep -q engram-graph; then

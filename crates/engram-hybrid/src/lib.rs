@@ -29,6 +29,27 @@ pub async fn recall(
     k: usize,
 ) -> Result<Output, String> {
     let config = Config::load(config_path).map_err(|error| error.to_string())?;
+    recall_with_config(config, config_path, slug, query, k).await
+}
+
+pub async fn recall_native(
+    config_path: &Path,
+    slug: &str,
+    query: &str,
+    k: usize,
+) -> Result<Output, String> {
+    let mut config = Config::load(config_path).map_err(|error| error.to_string())?;
+    config.graph.backend = "native".into();
+    recall_with_config(config, config_path, slug, query, k).await
+}
+
+async fn recall_with_config(
+    config: Config,
+    config_path: &Path,
+    slug: &str,
+    query: &str,
+    k: usize,
+) -> Result<Output, String> {
     let store = config_path
         .parent()
         .ok_or("configuration path has no parent")?
@@ -56,6 +77,13 @@ pub async fn recall(
     };
     let graph_limit = if graphiti_compat { k } else { k * 2 };
     let (graph, facts) = graph_leg(&config, query, graph_limit, &mut legs).await;
+    if graphiti_compat
+        && legs
+            .get("graph")
+            .is_some_and(|value| value != "graphiti_compat")
+    {
+        return Err("Graphiti compatibility recall is unavailable".into());
+    }
     let by_file: HashMap<String, &Memory> = memories
         .iter()
         .map(|memory| (memory.file.clone(), memory))
@@ -163,8 +191,11 @@ async fn graph_leg(
         if let Ok(output) = output
             && output.status.success()
         {
-            let records = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
-                .unwrap_or_default();
+            let Ok(records) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+            else {
+                legs.insert("graph".into(), "graphiti_compat invalid response".into());
+                return (Vec::new(), Vec::new());
+            };
             let files = records
                 .iter()
                 .filter_map(|row| row.get("file").and_then(serde_json::Value::as_str))

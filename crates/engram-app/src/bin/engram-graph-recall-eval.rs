@@ -1,6 +1,6 @@
 use clap::Parser;
 use engram_graph::GraphClient;
-use engram_hybrid::recall;
+use engram_hybrid::recall_native;
 use serde::Deserialize;
 use std::{fs, path::PathBuf, process::ExitCode};
 
@@ -44,7 +44,7 @@ async fn main() -> ExitCode {
                 .keyword_files(&case.query, args.limit)
                 .await
                 .map_err(|error| error.to_string())?;
-            let native = recall(&args.config, &args.slug, &case.query, args.limit)
+            let native = recall_native(&args.config, &args.slug, &case.query, args.limit)
                 .await
                 .map_err(|error| error.to_string())?;
             let legacy_files = legacy

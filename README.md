@@ -263,26 +263,33 @@ queues. Pure stdlib `curses`, no server and no browser; saves and deletes go thr
 > `.md` store. With neither (or with their services down), engram still runs on pure
 > markdown. Add the vector index with `./install.sh --vector` (see [vector/README.md](vector/README.md)).
 
-### Native graph parity
+### Graphiti compatibility and native graph evaluation
 
-The native synchronizer is the daemon's preferred graph writer. It records typed
-triples with confidence, preserves replaced claims as history, and excludes
-quarantined claims from recall. After a native reindex, compare its recall to the
-legacy Graphiti index with:
+`graph.backend: graphiti_compat` is the recommended production setting while the
+native index is being evaluated. It delegates retrieval to the pinned Graphiti
+recall script and returns its ordered records directly; keyword and vector fusion
+are deliberately disabled so they cannot alter Graphiti's ranking. A Graphiti
+failure is reported as a recall failure rather than silently returning a weaker
+result.
+
+The native synchronizer records typed triples with confidence, preserves replaced
+claims as history, and excludes quarantined claims from recall. To evaluate that
+alternative against the legacy Graphiti index, run:
 
 ```bash
 source ~/.claude/graph/.env
 ~/.claude/rust/engram-graph-recall-eval --cases ~/.claude/rust/graph_recall_eval.json
 ```
 
-The evaluator exits non-zero until native recall contains every Graphiti hit in the
+The evaluator explicitly uses the native backend regardless of the production
+setting and exits non-zero until native recall contains every Graphiti hit in the
 representative query set.
 
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full data flow and **[CONFIG.md](CONFIG.md)** for `engram.yaml`.
 
 ## Requirements
 - `cargo` is required for the Rust API, hook, MCP, and indexer. `python3`, `jq`, `git`/`gh` remain required for the legacy lifecycle pipeline and optional sync.
-- Graph: Docker (Neo4j) + a Python venv (graphiti-core, neo4j, fastembed) — the installer builds it.
+- Graph: Docker (Neo4j) + a Python venv (pinned `graphiti-core==0.29.2`, neo4j, fastembed) — the installer builds it.
 - Vector index (optional): Docker (Qdrant) + a Python venv (qdrant-client, mcp, fastembed) — `./install.sh --vector` builds it.
 - A backend: a reachable Ollama, **or** the `claude` CLI + an Anthropic API key.
 

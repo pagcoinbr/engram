@@ -101,6 +101,22 @@ is the 2-way (vector+keyword) variant for no-graph installs. Each ranker degrade
 independently. The installer adds `qdrant-client` to the graph venv on `--vector` so
 the warm graph server can query Qdrant in-process.
 
+## Rust graph backend
+
+The Rust recall service has two graph backends:
+
+```yaml
+graph:
+  backend: graphiti_compat       # graphiti_compat | native
+```
+
+`graphiti_compat` is the production-safe migration choice. It calls the installed,
+pinned Graphiti recall path and returns its ordered results without RRF, preserving
+Graphiti behaviour exactly. It fails closed if that path is unavailable. `native`
+uses Rust's typed-triple and embedding index together with the usual hybrid RRF;
+use it for shadow evaluation until its representative recall evaluation reaches
+parity. `ENGRAM_GRAPH_BACKEND` temporarily overrides this setting for a process.
+
 ```yaml
 recall:
   scope_to_slug: true            # restrict vector/hybrid recall to the current store's slug
