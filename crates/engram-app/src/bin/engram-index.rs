@@ -72,6 +72,7 @@ async fn run(args: Args) -> Result<usize, String> {
     }
     let embeddings =
         OpenAiCompatibleClient::new(config.embed.url).map_err(|error| error.to_string())?;
+    let mut indexed = 0;
     for memory in &memories {
         let body = redact(&memory.body);
         let input = format!(
@@ -80,6 +81,15 @@ async fn run(args: Args) -> Result<usize, String> {
             memory.description,
             truncate(&body, 1500)
         );
+        let sha = digest(&input);
+        if !args.rebuild
+            && vectors
+                .is_current(&args.slug, &memory.file, &sha)
+                .await
+                .map_err(|error| format!("{}: {error}", memory.file))?
+        {
+            continue;
+        }
         let vector = embeddings
             .embedding(&config.embed.model, &input)
             .await
@@ -99,13 +109,14 @@ async fn run(args: Args) -> Result<usize, String> {
                 description: &memory.description,
                 memory_type: &memory.memory_type,
                 slug: &args.slug,
-                sha: &digest(&input),
+                sha: &sha,
                 vector,
             })
             .await
             .map_err(|error| format!("{}: {error}", memory.file))?;
+        indexed += 1;
     }
-    Ok(memories.len())
+    Ok(indexed)
 }
 
 fn digest(value: &str) -> String {

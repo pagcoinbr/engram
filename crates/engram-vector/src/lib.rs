@@ -185,4 +185,24 @@ impl QdrantClient {
             .error_for_status()?;
         Ok(())
     }
+
+    pub async fn is_current(&self, slug: &str, file: &str, sha: &str) -> Result<bool, VectorError> {
+        let id = Uuid::new_v5(&POINT_NAMESPACE, format!("{slug}::{file}").as_bytes());
+        let response = self
+            .client
+            .get(format!(
+                "{}/collections/{}/points/{}",
+                self.base_url, self.collection, id
+            ))
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let body: serde_json::Value = response.error_for_status()?.json().await?;
+        Ok(body
+            .pointer("/result/payload/sha")
+            .and_then(serde_json::Value::as_str)
+            == Some(sha))
+    }
 }
