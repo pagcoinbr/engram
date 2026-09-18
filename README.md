@@ -18,7 +18,7 @@ It's not a flat notes file. It's a pipeline modeled on how human memory actually
 | **Systems consolidation** (hippocampus → neocortex) | `/memory-curate` — cluster narrow facts into class-level "umbrella" memories |
 | **Long-term potentiation / reconsolidation** | `/memory-fixate` — memories graduate *suspect → provisional → corroborated → fixed* |
 | **The forgetting curve / schema abstraction** | `distill` — compress clusters, drop noise (verbatim hard-facts preserved) |
-| **Associative recall** | a **Neo4j knowledge graph** (Graphiti) + embeddings — semantic + multi-hop + temporal |
+| **Associative recall** | a **Neo4j knowledge graph** with native Rust triples + embeddings — semantic + multi-hop + temporal |
 | **Immune system** | an injection guard that quarantines suspicious/poisoned memories |
 
 Your memories are plain Markdown files (`.md`) — the source of truth, readable and
@@ -102,8 +102,52 @@ time ~/.claude/memory_recall.py "how does X work" --k 4 --fast
 ## Backends — pick what your hardware allows
 - **`ollama`** — local models on a GPU box, free + private. Choose a `tier` for your VRAM (`cpu`/`small`/`medium`/`large`).
 - **`claude`** — no GPU: an always-on loop container runs the pipeline via the `claude` CLI. Cost = Claude usage instead of a GPU.
+- **`llama_cpp`** — an OpenAI-compatible `llama-server` endpoint. Generation and embeddings can run on separate servers, which is useful when a reasoning model and BGE-M3 live on different GPU services.
 
-Either way, **embeddings are always local** (Ollama `nomic-embed-text`, or CPU `fastembed`) — the graph never needs a paid embeddings API.
+Embeddings remain local: Ollama, CPU `fastembed`, or a llama.cpp/OpenAI-compatible endpoint. The graph never needs a paid embeddings API.
+
+### llama.cpp with a dedicated embedding server
+
+Engram supports `llama-server`'s OpenAI-compatible `/v1` API. Keep generation and
+embedding configuration independent; for example, a reasoning server can live on
+port 8090 while BGE-M3 serves embeddings on port 8091:
+
+```yaml
+backend: llama_cpp
+llama_cpp:
+  url: "http://10.0.0.101:8090/v1"
+  model: "qwen3-35B-A3B"
+
+embed:
+  provider: llama_cpp
+  url: "http://10.0.0.101:8091/v1"
+  model: "bge-m3"
+  dim: 1024
+```
+
+The embedding server must provide `POST /v1/embeddings`; generation uses
+`POST /v1/chat/completions`. Confirm the model alias with `GET /v1/models`.
+**Changing an embedding model, dimension, normalization, or query/document prefix
+creates a new embedding space and requires rebuilding the Qdrant and Neo4j indexes.**
+Do not silently fall back from BGE-M3 to Nomic (or vice versa): equal dimensions do
+not make vectors compatible.
+
+### Rust recall and model API
+
+The Rust workspace owns the fast recall path: Markdown BM25, OpenAI-compatible
+embeddings, Qdrant search/indexing, Neo4j HTTP graph ranking, the prompt hook, and
+the MCP `memory_recall_hybrid` tool. It also exposes a loopback-only service:
+
+```bash
+cargo run -p engram-app --bin engram-app -- --config ~/.claude/engram.yaml
+curl http://127.0.0.1:8787/api/v1/status
+cargo run -p engram-app --bin engram-index -- --rebuild
+```
+
+`/api/v1/status` reports configured and observed reasoning/embedding models.
+`/api/v1/config/editor` provides revision-protected validation and saves for the
+Atlas configuration screen. The installer places these binaries in
+`~/.claude/rust/` and enables `engram-api.service` for systemd installations.
 
 ---
 
@@ -171,7 +215,8 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 | **`/memory-to-skill`** | Promote a high-trust, frequently-recalled *procedural* memory into a first-class Claude Code skill. |
 
 ### Recall — how the right memories reach Claude
-- **Auto-recall** (the `UserPromptSubmit` hook): every prompt gets the memories that match it injected automatically — no waiting for Claude to think of calling a recall tool. Names + one-line descriptions only, **at most once per memory per session**, ~0.3s, fail-open. Off with `recall.inject.enabled: false`.
+- **Auto-recall** (the `UserPromptSubmit` hook): every prompt gets the memories that match it injected automatically — no waiting for Claude to think of calling a recall tool. Names + one-line descriptions only, **at most once per memory per session**, ~0.3s, fail-open. The installer uses the Rust hook when available. Off with `recall.inject.enabled: false`.
+- **Rust hybrid recall** (`engram-rust` MCP): `memory_recall_hybrid` fuses Markdown, Qdrant, and Neo4j rankings via Reciprocal Rank Fusion. Native triples use a controlled relation taxonomy, temporal state, and confidence quarantine; the legacy Graphiti MCP remains available only while parity evaluation is in progress.
 - **Graph recall** (`engram-graph` MCP): `memory_recall`, `memory_search_facts`, `memory_neighbors`, `memory_stats` — Claude loads only the relevant memories on demand, instead of dumping the whole store into context.
 - **Hybrid recall** (`memory_recall_hybrid`, on `engram-graph`): the best single recall — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename. Each ranker degrades independently; optional `type` filter.
 - **Vector recall** (the optional `engram-vector` MCP): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search via Qdrant. Plus `memory_recall_fused` (vector+keyword) for no-graph installs. Off by default; enable with `./install.sh --vector`.
@@ -206,7 +251,7 @@ queues. Pure stdlib `curses`, no server and no browser; saves and deletes go thr
         │                                            │  ▲                     │
         │                                     insert │  │ export (byte-exact) │
         ▼                                            ▼  │                     │
-   recall (MCP) ◀──────── memory_recall ◀─── Neo4j graph (Graphiti) ──────────┘
+   recall (MCP) ◀──────── memory_recall ◀─── Neo4j native triples ────────────┘
         ▲                                     associative / temporal
         └──── memory_vector_recall ◀─── Qdrant vector index (OPTIONAL) ───────┘
                                         dense semantic search + fast dedup
@@ -218,11 +263,33 @@ queues. Pure stdlib `curses`, no server and no browser; saves and deletes go thr
 > `.md` store. With neither (or with their services down), engram still runs on pure
 > markdown. Add the vector index with `./install.sh --vector` (see [vector/README.md](vector/README.md)).
 
+### Graphiti compatibility and native graph evaluation
+
+`graph.backend: graphiti_compat` is the recommended production setting while the
+native index is being evaluated. It delegates retrieval to the pinned Graphiti
+recall script and returns its ordered records directly; keyword and vector fusion
+are deliberately disabled so they cannot alter Graphiti's ranking. A Graphiti
+failure is reported as a recall failure rather than silently returning a weaker
+result.
+
+The native synchronizer records typed triples with confidence, preserves replaced
+claims as history, and excludes quarantined claims from recall. To evaluate that
+alternative against the legacy Graphiti index, run:
+
+```bash
+source ~/.claude/graph/.env
+~/.claude/rust/engram-graph-recall-eval --cases ~/.claude/rust/graph_recall_eval.json
+```
+
+The evaluator explicitly uses the native backend regardless of the production
+setting and exits non-zero until native recall contains every Graphiti hit in the
+representative query set.
+
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full data flow and **[CONFIG.md](CONFIG.md)** for `engram.yaml`.
 
 ## Requirements
-- `python3`, `jq` (engine). `git`/`gh` for optional sync.
-- Graph: Docker (Neo4j) + a Python venv (graphiti-core, neo4j, fastembed) — the installer builds it.
+- `cargo` is required for the Rust API, hook, MCP, and indexer. `python3`, `jq`, `git`/`gh` remain required for the legacy lifecycle pipeline and optional sync.
+- Graph: Docker (Neo4j) + a Python venv (pinned `graphiti-core==0.29.2`, neo4j, fastembed) — the installer builds it.
 - Vector index (optional): Docker (Qdrant) + a Python venv (qdrant-client, mcp, fastembed) — `./install.sh --vector` builds it.
 - A backend: a reachable Ollama, **or** the `claude` CLI + an Anthropic API key.
 

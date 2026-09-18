@@ -20,6 +20,8 @@ const NAV = [
   ["recall", "Recall", Sparkles],
   ["activity", "Activity", Activity],
   ["system", "System", Server],
+  ["models", "Models", BrainCircuit],
+  ["config", "Configuration", Settings2],
 ];
 
 async function api(path, options) {
@@ -325,6 +327,37 @@ function SystemPage() {
   return <div className="page-content"><div className="service-grid">{services.map(([name, ok, detail]) => <div className="service-card" key={name}><div><HeartPulse size={18}/><span>{name}</span></div><Badge tone={ok ? "ok" : "danger"}>{ok ? "Healthy" : "Down"}</Badge><p>{detail}</p></div>)}</div><section className="panel"><div className="section-heading"><h3>Installed skills</h3><span>{skills?.installed?.length || 0} available</span></div><div className="skills-grid">{skills?.installed?.map(skill => <div key={skill.name}><strong>/{skill.name}</strong><p>{skill.description}</p></div>) || <Spinner/>}</div></section></div>;
 }
 
+function ModelsPage() {
+  const [status, setStatus] = useState(null);
+  const [error, setError] = useState("");
+  const load = () => {setStatus(null); setError(""); api("/api/atlas/models").then(setStatus).catch(error => setError(error.message));};
+  useEffect(load, []);
+  if (error) return <div className="page-content"><Notice>{error}</Notice><button className="action-button" onClick={load}>Retry probe</button></div>;
+  if (!status) return <Spinner label="Probing configured models…"/>;
+  return <div className="page-content model-page"><div className="section-heading"><div><span className="eyebrow">Model assignments</span><h3>Reasoning and retrieval health</h3></div><button className="action-button" onClick={load}><RefreshCw size={15}/>Refresh</button></div><Notice tone="info">A reachable server is not enough: embedding dimensions must match the active index. Probes are cached for 15 seconds.</Notice><div className="model-grid">{status.models.map(item => <article className="model-card" key={item.role}><div className="section-heading"><div><span className="eyebrow">{item.role}</span><h3>{item.configuredModel}</h3></div><Badge tone={item.reachable === true ? "ok" : item.reachable === false ? "danger" : "neutral"}>{item.reachable === true ? "Healthy" : item.reachable === false ? "Unavailable" : "Not probed"}</Badge></div><dl className="metadata"><div><dt>Provider</dt><dd>{item.provider}</dd></div><div><dt>Endpoint</dt><dd>{item.endpoint || "provider default"}</dd></div><div><dt>Observed</dt><dd>{item.observedModel || "—"}</dd></div>{item.role === "embedding" && <div><dt>Dimension</dt><dd>{item.observedDimension || "—"} / expected {item.expectedDimension || "—"}</dd></div>}<div><dt>Latency</dt><dd>{item.latencyMs ? `${item.latencyMs} ms` : "—"}</dd></div></dl>{item.error && <Notice>{item.error}</Notice>}</article>)}</div><RecommendedModels/></div>;
+}
+
+function RecommendedModels() {
+  const models = [["BGE-M3", "1024D", "Current multilingual baseline"], ["Qwen3-Embedding-0.6B", "1024D", "Semantic-retrieval alternative"], ["EmbeddingGemma-300M", "768D", "Compact multilingual option"], ["Nomic Embed Text v1.5", "768D", "Lightweight local option"]];
+  return <section className="panel recommendation-panel"><div className="section-heading"><h3>Embedding models to evaluate</h3><span>Each model needs its own index generation</span></div><div className="recommendation-grid">{models.map(([name, dimension, note]) => <div key={name}><strong>{name}</strong><Badge>{dimension}</Badge><p>{note}</p></div>)}</div></section>;
+}
+
+function ConfigPage() {
+  const [data, setData] = useState(null);
+  const [draft, setDraft] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const load = () => {setError(""); api("/api/atlas/config").then(result => {setData(result); setDraft(result.editable); setPreview(null);}).catch(error => setError(error.message));};
+  useEffect(load, []);
+  const update = (section, key, value) => setDraft(current => section ? {...current, [section]: {...current[section], [key]: value}} : {...current, [key]: value});
+  const validate = async () => {try {setError(""); setPreview(await api("/api/atlas/config/validate", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({config: draft})}));} catch (error) {setError(error.message);}};
+  const save = async () => {setSaving(true); try {const result = await api("/api/atlas/config", {method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({revision: data.revision, config: draft})}); setPreview(result); await load();} catch (error) {setError(error.message);} finally {setSaving(false);}};
+  if (error) return <div className="page-content"><Notice>{error}</Notice></div>;
+  if (!data || !draft) return <Spinner label="Loading configuration…"/>;
+  return <div className="page-content config-page"><span className="eyebrow">Configuration</span><h2>Models and retrieval</h2><Notice tone="info">Saved changes keep a local backup, use revision protection, and never expose secrets. Model-process restarts are required after saving.</Notice><section className="panel config-form"><div className="section-heading"><h3>{data.path}</h3><Badge>Revision {data.revision}</Badge></div><label>Generation backend<select value={draft.backend} onChange={event => update(null, "backend", event.target.value)}><option value="llama_cpp">llama.cpp</option><option value="ollama">Ollama</option><option value="claude">Claude CLI</option><option value="ccg">cc-gateway</option></select></label><h3>Reasoning model</h3><label>OpenAI-compatible endpoint<input value={draft.llama_cpp.url} onChange={event => update("llama_cpp", "url", event.target.value)} placeholder="http://host:port/v1"/></label><label>Model alias<input value={draft.llama_cpp.model} onChange={event => update("llama_cpp", "model", event.target.value)}/></label><label>Timeout seconds<input type="number" min="1" value={draft.llama_cpp.timeout_seconds} onChange={event => update("llama_cpp", "timeout_seconds", event.target.value)}/></label><h3>Embedding model</h3><label>Provider<select value={draft.embed.provider} onChange={event => update("embed", "provider", event.target.value)}><option value="llama_cpp">llama.cpp / OpenAI-compatible</option><option value="ollama">Ollama</option><option value="fastembed">FastEmbed</option></select></label><label>Embedding endpoint<input value={draft.embed.url} onChange={event => update("embed", "url", event.target.value)} placeholder="http://host:port/v1"/></label><label>Model alias<input value={draft.embed.model} onChange={event => update("embed", "model", event.target.value)}/></label><label>Vector dimension<input type="number" min="1" value={draft.embed.dim} onChange={event => update("embed", "dim", event.target.value)}/></label><h3>Graph recall</h3><label>Backend<select value={draft.graph.backend} onChange={event => update("graph", "backend", event.target.value)}><option value="graphiti_compat">Graphiti compatibility (recommended)</option><option value="native">Native Rust (shadow / evaluation)</option></select></label><div className="form-actions"><button className="action-button" onClick={validate}>Validate change</button><button className="action-button primary" onClick={save} disabled={saving}>{saving ? "Saving…" : "Save configuration"}</button></div></section>{preview && <Notice tone={preview.requiresReindex ? "warning" : "info"}>{preview.requiresReindex ? "Embedding space changed: rebuild Qdrant and Neo4j before relying on recall." : preview.ok ? `Saved. Backup: ${preview.backup}` : "Configuration is valid; no index migration is required."}</Notice>}<section className="panel"><div className="section-heading"><h3>Full configuration</h3><Badge>Secrets redacted</Badge></div><pre className="config-json">{JSON.stringify(data.config, null, 2)}</pre></section></div>;
+}
+
 function App() {
   const url = useUrlState();
   const [snapshot, setSnapshot] = useState(null);
@@ -346,6 +379,8 @@ function App() {
       {snapshot && url.view === "recall" && <RecallPage onLocate={locate}/>} 
       {snapshot && url.view === "activity" && <ActivityPage snapshot={snapshot}/>} 
       {snapshot && url.view === "system" && <SystemPage/>}
+      {snapshot && url.view === "models" && <ModelsPage/>}
+      {snapshot && url.view === "config" && <ConfigPage/>}
     </main>
   </div>;
 }
