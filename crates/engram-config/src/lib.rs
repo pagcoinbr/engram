@@ -19,26 +19,46 @@ pub struct Config {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct LlamaCpp {
-    #[serde(default)] pub url: String,
-    #[serde(default)] pub model: String,
-    #[serde(default)] pub timeout_seconds: u64,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Embed {
-    #[serde(default)] pub provider: String,
-    #[serde(default)] pub url: String,
-    #[serde(default)] pub model: String,
-    #[serde(default = "default_dimension")] pub dim: u32,
-    #[serde(default)] pub query_prefix: String,
-    #[serde(default)] pub document_prefix: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default = "default_dimension")]
+    pub dim: u32,
+    #[serde(default)]
+    pub query_prefix: String,
+    #[serde(default)]
+    pub document_prefix: String,
 }
 
-fn default_backend() -> String { "ollama".into() }
-fn default_dimension() -> u32 { 768 }
+fn default_backend() -> String {
+    "ollama".into()
+}
+fn default_dimension() -> u32 {
+    768
+}
 impl Default for Embed {
     fn default() -> Self {
-        Self { provider: String::new(), url: String::new(), model: String::new(), dim: default_dimension(), query_prefix: String::new(), document_prefix: String::new() }
+        Self {
+            provider: String::new(),
+            url: String::new(),
+            model: String::new(),
+            dim: default_dimension(),
+            query_prefix: String::new(),
+            document_prefix: String::new(),
+        }
     }
 }
 
@@ -61,10 +81,30 @@ pub struct RecommendedEmbedder {
 
 pub fn recommended_embedders() -> Vec<RecommendedEmbedder> {
     vec![
-        RecommendedEmbedder { id: "bge-m3", label: "BGE-M3", dimension: 1024, use_case: "Current multilingual baseline." },
-        RecommendedEmbedder { id: "qwen3-embedding-0.6b", label: "Qwen3-Embedding-0.6B", dimension: 1024, use_case: "Alternative to benchmark for semantic precision." },
-        RecommendedEmbedder { id: "embeddinggemma-300m", label: "EmbeddingGemma-300M", dimension: 768, use_case: "Compact multilingual deployment." },
-        RecommendedEmbedder { id: "nomic-embed-text-v1.5", label: "Nomic Embed Text v1.5", dimension: 768, use_case: "Established lightweight local option." },
+        RecommendedEmbedder {
+            id: "bge-m3",
+            label: "BGE-M3",
+            dimension: 1024,
+            use_case: "Current multilingual baseline.",
+        },
+        RecommendedEmbedder {
+            id: "qwen3-embedding-0.6b",
+            label: "Qwen3-Embedding-0.6B",
+            dimension: 1024,
+            use_case: "Alternative to benchmark for semantic precision.",
+        },
+        RecommendedEmbedder {
+            id: "embeddinggemma-300m",
+            label: "EmbeddingGemma-300M",
+            dimension: 768,
+            use_case: "Compact multilingual deployment.",
+        },
+        RecommendedEmbedder {
+            id: "nomic-embed-text-v1.5",
+            label: "Nomic Embed Text v1.5",
+            dimension: 768,
+            use_case: "Established lightweight local option.",
+        },
     ]
 }
 
@@ -81,33 +121,66 @@ pub enum ConfigError {
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let mut config: Self = serde_yaml::from_str(&fs::read_to_string(path)?)?;
-        if config.config_version == 0 { config.config_version = CONFIG_VERSION; }
+        if config.config_version == 0 {
+            config.config_version = CONFIG_VERSION;
+        }
         config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.embed.dim == 0 { return Err(ConfigError::Invalid("embed.dim must be greater than zero".into())); }
-        if !self.embed.url.is_empty() { endpoint(&self.embed.url, "embed.url")?; }
-        if !self.llama_cpp.url.is_empty() { endpoint(&self.llama_cpp.url, "llama_cpp.url")?; }
-        if matches!(self.embed.provider.as_str(), "llama_cpp" | "openai") && self.embed.url.is_empty() {
-            return Err(ConfigError::Invalid("embed.url is required for llama_cpp/openai embeddings".into()));
+        if self.embed.dim == 0 {
+            return Err(ConfigError::Invalid(
+                "embed.dim must be greater than zero".into(),
+            ));
+        }
+        if !self.embed.url.is_empty() {
+            endpoint(&self.embed.url, "embed.url")?;
+        }
+        if !self.llama_cpp.url.is_empty() {
+            endpoint(&self.llama_cpp.url, "llama_cpp.url")?;
+        }
+        if matches!(self.embed.provider.as_str(), "llama_cpp" | "openai")
+            && self.embed.url.is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "embed.url is required for llama_cpp/openai embeddings".into(),
+            ));
         }
         Ok(())
     }
 
     pub fn profiles(&self) -> Vec<ModelProfile> {
         let generation_endpoint = self.llama_cpp.url.clone();
-        let generation = ModelProfile { role: "reasoning", provider: self.backend.clone(), endpoint: generation_endpoint, model: self.llama_cpp.model.clone(), expected_dimension: None };
-        let embed_endpoint = if self.embed.url.is_empty() { self.llama_cpp.url.clone() } else { self.embed.url.clone() };
-        let embedding = ModelProfile { role: "embedding", provider: self.embed.provider.clone(), endpoint: embed_endpoint, model: self.embed.model.clone(), expected_dimension: Some(self.embed.dim) };
+        let generation = ModelProfile {
+            role: "reasoning",
+            provider: self.backend.clone(),
+            endpoint: generation_endpoint,
+            model: self.llama_cpp.model.clone(),
+            expected_dimension: None,
+        };
+        let embed_endpoint = if self.embed.url.is_empty() {
+            self.llama_cpp.url.clone()
+        } else {
+            self.embed.url.clone()
+        };
+        let embedding = ModelProfile {
+            role: "embedding",
+            provider: self.embed.provider.clone(),
+            endpoint: embed_endpoint,
+            model: self.embed.model.clone(),
+            expected_dimension: Some(self.embed.dim),
+        };
         vec![generation, embedding]
     }
 }
 
 fn endpoint(value: &str, name: &str) -> Result<(), ConfigError> {
-    let parsed = Url::parse(value).map_err(|_| ConfigError::Invalid(format!("{name} must be an absolute HTTP(S) URL")))?;
-    if !matches!(parsed.scheme(), "http" | "https") { return Err(ConfigError::Invalid(format!("{name} must use HTTP(S)"))); }
+    let parsed = Url::parse(value)
+        .map_err(|_| ConfigError::Invalid(format!("{name} must be an absolute HTTP(S) URL")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ConfigError::Invalid(format!("{name} must use HTTP(S)")));
+    }
     Ok(())
 }
 
@@ -123,11 +196,17 @@ mod tests {
     }
     #[test]
     fn llama_cpp_embeddings_require_an_endpoint() {
-        let config: Config = serde_yaml::from_str("embed: {provider: llama_cpp, model: bge-m3, dim: 1024}\n").unwrap();
+        let config: Config =
+            serde_yaml::from_str("embed: {provider: llama_cpp, model: bge-m3, dim: 1024}\n")
+                .unwrap();
         assert!(config.validate().is_err());
     }
     #[test]
     fn catalog_includes_the_bge_m3_baseline() {
-        assert!(recommended_embedders().iter().any(|item| item.id == "bge-m3" && item.dimension == 1024));
+        assert!(
+            recommended_embedders()
+                .iter()
+                .any(|item| item.id == "bge-m3" && item.dimension == 1024)
+        );
     }
 }
