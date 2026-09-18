@@ -57,12 +57,17 @@ async fn main() -> ExitCode {
                 .map(|hit| hit.file)
                 .collect::<std::collections::HashSet<_>>();
             let matched = legacy_files.intersection(&native_files).count();
+            let missing = legacy_files
+                .difference(&native_files)
+                .cloned()
+                .collect::<Vec<_>>();
             legacy_total += legacy_files.len();
             native_total += matched;
             println!(
-                "{}: native matched {matched}/{} legacy files",
+                "{}: native matched {matched}/{} legacy files; missing: {}",
                 case.query,
-                legacy_files.len()
+                legacy_files.len(),
+                missing.join(", ")
             );
         }
         let recall = if legacy_total == 0 {
