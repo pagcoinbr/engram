@@ -34,6 +34,18 @@ struct EmbeddingResponse {
 struct EmbeddingItem {
     embedding: Vec<f32>,
 }
+#[derive(Deserialize)]
+struct ChatResponse {
+    choices: Vec<Choice>,
+}
+#[derive(Deserialize)]
+struct Choice {
+    message: Message,
+}
+#[derive(Deserialize)]
+struct Message {
+    content: String,
+}
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct ProbeReport {
@@ -115,6 +127,15 @@ impl OpenAiCompatibleClient {
             index_compatible: expected_dimension
                 .map(|expected| expected as usize == observed_dimension),
         })
+    }
+    pub async fn chat(&self, model: &str, prompt: &str) -> Result<String, ProbeError> {
+        let response = self.client.post(format!("{}/chat/completions", self.base_url)).json(&serde_json::json!({"model": model, "temperature": 0, "messages": [{"role": "user", "content": prompt}]})).send().await?.error_for_status()?.json::<ChatResponse>().await?;
+        response
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| choice.message.content)
+            .ok_or(ProbeError::EmptyEmbedding)
     }
 }
 
