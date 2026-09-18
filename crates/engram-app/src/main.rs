@@ -9,6 +9,7 @@ use clap::Parser;
 use engram_config::{Config, ModelProfile, recommended_embedders};
 use engram_hybrid::recall;
 use engram_models::OpenAiCompatibleClient;
+use engram_vector::QdrantClient;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -128,6 +129,7 @@ async fn main() {
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/v1/status", get(status))
         .route("/api/v1/models/recommended", get(recommended_models))
+        .route("/api/v1/index/status", get(index_status))
         .route("/api/v1/config", get(config))
         .route("/api/v1/config/editor", get(editor).put(save_editor))
         .route("/api/v1/config/editor/validate", post(validate_editor))
@@ -141,6 +143,39 @@ async fn main() {
 
 async fn recommended_models() -> Json<Vec<engram_config::RecommendedEmbedder>> {
     Json(recommended_embedders())
+}
+
+#[derive(Serialize)]
+struct IndexStatus {
+    enabled: bool,
+    collection: String,
+    dimension: u32,
+    points: Option<u64>,
+    error: Option<String>,
+}
+
+async fn index_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let config = match Config::load(&state.config) {
+        Ok(config) => config,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    let mut status = IndexStatus {
+        enabled: config.vector_store.enabled,
+        collection: config.vector_store.collection.clone(),
+        dimension: config.embed.dim,
+        points: None,
+        error: None,
+    };
+    if status.enabled {
+        match QdrantClient::new(config.vector_store.url, config.vector_store.collection)
+            .count(None)
+            .await
+        {
+            Ok(points) => status.points = Some(points),
+            Err(error) => status.error = Some(error.to_string()),
+        }
+    }
+    (StatusCode::OK, Json(status)).into_response()
 }
 
 async fn editor(State(state): State<Arc<AppState>>) -> impl IntoResponse {

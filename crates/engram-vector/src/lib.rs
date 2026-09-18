@@ -254,4 +254,28 @@ impl QdrantClient {
             offset = next;
         }
     }
+
+    pub async fn count(&self, slug: Option<&str>) -> Result<u64, VectorError> {
+        let mut body = serde_json::json!({"exact": true});
+        if let Some(slug) = slug {
+            body["filter"] =
+                serde_json::json!({"must": [{"key": "slug", "match": {"value": slug}}]});
+        }
+        let response: serde_json::Value = self
+            .client
+            .post(format!(
+                "{}/collections/{}/points/count",
+                self.base_url, self.collection
+            ))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(response
+            .pointer("/result/count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0))
+    }
 }
