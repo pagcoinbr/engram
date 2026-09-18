@@ -1,0 +1,19 @@
+[Unit]
+Description=Engram Memory Atlas
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=ENGRAM_UI_HOST=127.0.0.1
+Environment=ENGRAM_UI_PORT=8765
+Environment=ENGRAM_BIN=/root/.claude
+Environment=ENGRAM_GRAPH=/root/.claude/graph
+Environment=ENGRAM_VECTOR=/root/.claude/vector
+Environment=ENGRAM_UI_DIR=/root/ASCP/engram/atlas/dist
+ExecStart=/root/.claude/graph/venv/bin/python /root/ASCP/engram/atlas/atlas_api.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
