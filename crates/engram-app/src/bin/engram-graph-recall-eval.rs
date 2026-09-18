@@ -1,5 +1,6 @@
 use clap::Parser;
 use engram_graph::GraphClient;
+use engram_hybrid::recall;
 use serde::Deserialize;
 use std::{fs, path::PathBuf, process::ExitCode};
 
@@ -15,6 +16,10 @@ struct Args {
     password: String,
     #[arg(long, default_value_t = 8)]
     limit: usize,
+    #[arg(long, default_value = "/root/.claude/engram.yaml")]
+    config: PathBuf,
+    #[arg(long, default_value = "-root")]
+    slug: String,
 }
 
 #[derive(Deserialize)]
@@ -39,8 +44,7 @@ async fn main() -> ExitCode {
                 .keyword_files(&case.query, args.limit)
                 .await
                 .map_err(|error| error.to_string())?;
-            let native = client
-                .native_keyword_files(&case.query, args.limit)
+            let native = recall(&args.config, &args.slug, &case.query, args.limit)
                 .await
                 .map_err(|error| error.to_string())?;
             let legacy_files = legacy
@@ -48,6 +52,7 @@ async fn main() -> ExitCode {
                 .map(|hit| hit.file)
                 .collect::<std::collections::HashSet<_>>();
             let native_files = native
+                .results
                 .into_iter()
                 .map(|hit| hit.file)
                 .collect::<std::collections::HashSet<_>>();

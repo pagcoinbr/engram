@@ -114,7 +114,7 @@ async fn vector_leg(
 }
 
 async fn graph_leg(
-    config: &Config,
+    _config: &Config,
     query: &str,
     k: usize,
     legs: &mut HashMap<String, String>,
@@ -137,37 +137,19 @@ async fn graph_leg(
         return (Vec::new(), Vec::new());
     };
     let mut facts = client
-        .facts_for_tokens(&tokens, 6)
+        .native_facts_for_tokens(&tokens, 6)
         .await
         .unwrap_or_default();
-    facts.extend(
-        client
-            .native_facts_for_tokens(&tokens, 6)
-            .await
-            .unwrap_or_default(),
-    );
     facts.sort();
     facts.dedup();
-    let keyword = client.keyword_files(query, k).await.unwrap_or_default();
     let native_keyword = client
         .native_keyword_files(query, k)
         .await
         .unwrap_or_default();
-    let semantic = match OpenAiCompatibleClient::new(config.embed.url.clone()) {
-        Ok(embeddings) => match embeddings.embedding(&config.embed.model, query).await {
-            Ok(vector) => client.semantic_files(&vector, k).await.unwrap_or_default(),
-            Err(_) => Vec::new(),
-        },
-        Err(_) => Vec::new(),
-    };
     legs.insert("graph".into(), "ok".into());
     (
         rrf(
-            &[
-                keyword.iter().map(|hit| hit.file.clone()).collect(),
-                native_keyword.iter().map(|hit| hit.file.clone()).collect(),
-                semantic.iter().map(|hit| hit.file.clone()).collect(),
-            ],
+            &[native_keyword.iter().map(|hit| hit.file.clone()).collect()],
             k,
             60.0,
         )
