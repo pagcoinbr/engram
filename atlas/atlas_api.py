@@ -19,6 +19,7 @@ DIST = ATLAS_ROOT / "dist"
 ENGRAM_BIN = Path(os.environ.get("ENGRAM_BIN", Path.home() / ".claude"))
 PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 GRAPH_ROOT = Path(os.environ.get("ENGRAM_GRAPH", ENGRAM_BIN / "graph"))
+RUST_API = os.environ.get("ENGRAM_RUST_API", "http://127.0.0.1:8787")
 LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 SAFE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -323,6 +324,34 @@ def _request_json(url: str, body: dict | None = None, timeout: float = 3.0) -> d
         return json.loads(response.read().decode())
 
 
+def _rust_json(path: str, body: dict | None = None, method: str = "GET") -> dict:
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(f"{RUST_API}{path}", data=data, method=method,
+                                     headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.loads(response.read().decode())
+
+
+def _atlas_model_status(status: dict) -> dict:
+    for item in status.get("models", []):
+        item["configuredModel"] = item.pop("configured_model", "")
+        item["expectedDimension"] = item.pop("expected_dimension", None)
+        item["observedModel"] = item.pop("observed_model", None)
+        item["observedDimension"] = item.pop("observed_dimension", None)
+        item["indexCompatible"] = item.pop("index_compatible", None)
+        item["reachable"] = not bool(item.get("error")) if item.get("endpoint") else None
+        item["latencyMs"] = None
+    return status
+
+
+def _atlas_config_result(result: dict) -> dict:
+    for source, target in (("read_only", "readOnly"), ("requires_reindex", "requiresReindex"),
+                           ("restart_required", "restartRequired")):
+        if source in result:
+            result[target] = result.pop(source)
+    return result
+
+
 def _models_status() -> dict:
     cfg = base.memory_ai.load()
     embed = cfg.get("embed", {}) or {}
@@ -392,12 +421,21 @@ def atlas_models():
     global _model_cache
     if _model_cache and time.monotonic() - _model_cache[0] < 15:
         return _model_cache[1]
-    _model_cache = (time.monotonic(), _models_status())
+    try:
+        status = _atlas_model_status(_rust_json("/api/v1/status"))
+        status["generatedAt"] = int(time.time())
+    except (OSError, ValueError, urllib.error.URLError):
+        status = _models_status()
+    _model_cache = (time.monotonic(), status)
     return _model_cache[1]
 
 
 @app.get("/api/atlas/config")
 def atlas_config():
+    try:
+        return _atlas_config_result(_rust_json("/api/v1/config/editor"))
+    except (OSError, ValueError, urllib.error.URLError):
+        pass
     cfg = base.memory_ai.load()
     return {"path": str(_config_path()), "revision": _config_revision(), "config": _redact(cfg),
             "editable": _editable_config(cfg), "readOnly": False}
@@ -405,12 +443,20 @@ def atlas_config():
 
 @app.post("/api/atlas/config/validate")
 def atlas_config_validate(payload: dict = Body(...)):
+    try:
+        return _atlas_config_result(_rust_json("/api/v1/config/editor/validate", payload, "POST"))
+    except (OSError, ValueError, urllib.error.URLError):
+        pass
     editable, reindex = _validate_config_patch(payload.get("config", {}), base.memory_ai.load())
     return {"valid": True, "config": editable, "requiresReindex": reindex}
 
 
 @app.put("/api/atlas/config")
 def atlas_config_save(payload: dict = Body(...)):
+    try:
+        return _atlas_config_result(_rust_json("/api/v1/config/editor", payload, "PUT"))
+    except (OSError, ValueError, urllib.error.URLError):
+        pass
     if payload.get("revision") != _config_revision():
         raise HTTPException(409, "configuration changed on disk; reload before saving")
     editable, reindex = _validate_config_patch(payload.get("config", {}), base.memory_ai.load())
