@@ -30,7 +30,7 @@ base = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = base
 spec.loader.exec_module(base)
 
-from fastapi import HTTPException, Query  # noqa: E402
+from fastapi import Body, HTTPException, Query  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 app = base.app
@@ -235,6 +235,87 @@ def _redact(value, key: str = ""):
     return value
 
 
+def _config_path() -> Path:
+    return base.memory_ai.CONFIG_PATH
+
+
+def _config_revision() -> str:
+    try:
+        return hashlib.sha256(_config_path().read_bytes()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def _editable_config(cfg: dict) -> dict:
+    llama = cfg.get("llama_cpp", {}) or {}
+    embed = cfg.get("embed", {}) or {}
+    return {
+        "backend": cfg.get("backend", ""),
+        "llama_cpp": {key: llama.get(key, "") for key in ("url", "model", "timeout_seconds")},
+        "embed": {key: embed.get(key, "") for key in ("provider", "url", "model", "dim")},
+    }
+
+
+def _validate_config_patch(patch: dict, current: dict) -> tuple[dict, bool]:
+    if not isinstance(patch, dict):
+        raise HTTPException(400, "config patch must be an object")
+    backend = patch.get("backend", current.get("backend", ""))
+    if backend not in ("ollama", "claude", "ccg", "llama_cpp"):
+        raise HTTPException(400, "unsupported backend")
+    normalized = _editable_config(current)
+    normalized["backend"] = backend
+    for section, keys in (("llama_cpp", ("url", "model", "timeout_seconds")),
+                          ("embed", ("provider", "url", "model", "dim"))):
+        incoming = patch.get(section, {})
+        if not isinstance(incoming, dict):
+            raise HTTPException(400, f"{section} must be an object")
+        for key in keys:
+            if key in incoming:
+                normalized[section][key] = incoming[key]
+    for section in ("llama_cpp", "embed"):
+        url = str(normalized[section].get("url", "")).strip()
+        if url and not re.match(r"^https?://[^\s]+/v1/?$", url):
+            raise HTTPException(400, f"{section}.url must be an HTTP(S) /v1 endpoint")
+        normalized[section]["url"] = url.rstrip("/")
+        normalized[section]["model"] = str(normalized[section].get("model", "")).strip()
+    provider = str(normalized["embed"].get("provider", "")).strip().lower()
+    if provider not in ("", "ollama", "fastembed", "llama_cpp", "openai"):
+        raise HTTPException(400, "unsupported embedding provider")
+    normalized["embed"]["provider"] = provider
+    try:
+        normalized["embed"]["dim"] = int(normalized["embed"].get("dim", 0))
+        normalized["llama_cpp"]["timeout_seconds"] = int(normalized["llama_cpp"].get("timeout_seconds", 600))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "embedding dimension and timeout must be integers")
+    if normalized["embed"]["dim"] <= 0 or normalized["llama_cpp"]["timeout_seconds"] <= 0:
+        raise HTTPException(400, "embedding dimension and timeout must be positive")
+    if provider in ("llama_cpp", "openai") and not normalized["embed"]["url"]:
+        raise HTTPException(400, "embed.url is required for llama_cpp/openai")
+    prior = _editable_config(current)
+    reindex = any(prior["embed"].get(key) != normalized["embed"].get(key)
+                  for key in ("provider", "url", "model", "dim"))
+    return normalized, reindex
+
+
+def _write_config(editable: dict) -> str:
+    import yaml
+    path = _config_path()
+    raw = yaml.safe_load(path.read_text()) or {}
+    raw["backend"] = editable["backend"]
+    raw.setdefault("llama_cpp", {}).update(editable["llama_cpp"])
+    raw.setdefault("embed", {}).update(editable["embed"])
+    backup_dir = ENGRAM_BIN / "backups" / "config"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = backup_dir / f"engram.yaml.{stamp}.bak"
+    backup.write_bytes(path.read_bytes())
+    temp = path.with_suffix(".yaml.tmp")
+    temp.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    os.chmod(temp, path.stat().st_mode)
+    temp.replace(path)
+    return str(backup)
+
+
 def _request_json(url: str, body: dict | None = None, timeout: float = 3.0) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -317,7 +398,25 @@ def atlas_models():
 
 @app.get("/api/atlas/config")
 def atlas_config():
-    return {"path": str(base.memory_ai.CONFIG_PATH), "config": _redact(base.memory_ai.load()), "readOnly": True}
+    cfg = base.memory_ai.load()
+    return {"path": str(_config_path()), "revision": _config_revision(), "config": _redact(cfg),
+            "editable": _editable_config(cfg), "readOnly": False}
+
+
+@app.post("/api/atlas/config/validate")
+def atlas_config_validate(payload: dict = Body(...)):
+    editable, reindex = _validate_config_patch(payload.get("config", {}), base.memory_ai.load())
+    return {"valid": True, "config": editable, "requiresReindex": reindex}
+
+
+@app.put("/api/atlas/config")
+def atlas_config_save(payload: dict = Body(...)):
+    if payload.get("revision") != _config_revision():
+        raise HTTPException(409, "configuration changed on disk; reload before saving")
+    editable, reindex = _validate_config_patch(payload.get("config", {}), base.memory_ai.load())
+    backup = _write_config(editable)
+    return {"ok": True, "revision": _config_revision(), "backup": backup,
+            "requiresReindex": reindex, "restartRequired": True}
 
 
 def main():

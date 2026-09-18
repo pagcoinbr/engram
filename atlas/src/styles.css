@@ -182,6 +182,14 @@ button, select { cursor: pointer; }
 .config-page h2 { margin: 6px 0 18px; font-size: 28px; letter-spacing: -.035em; }
 .config-json { max-height: 66vh; margin: 0; padding: 15px; overflow: auto; color: #c7d7e9; background: #0e151f; border: 1px solid #263549; border-radius: 9px; font: 11px/1.65 ui-monospace, "Cascadia Code", monospace; }
 .action-button { display: inline-flex; align-items: center; gap: 7px; padding: 8px 11px; color: var(--accent); border: 1px solid #315658; border-radius: 8px; background: #13272a; font-size: 11px; }
+.action-button.primary { color: #09201e; border-color: var(--accent); background: var(--accent); font-weight: 650; }
+.config-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 14px 0; }
+.config-form > .section-heading, .config-form > h3, .config-form > .form-actions { grid-column: 1 / -1; }
+.config-form h3 { margin: 7px 0 0; font-size: 12px; }
+.config-form label { display: grid; gap: 6px; color: var(--subtle); font-size: 10px; }
+.config-form input, .config-form select { height: 36px; padding: 0 10px; color: var(--text); border: 1px solid var(--border); border-radius: 8px; outline: 0; background: #101923; }
+.config-form input:focus, .config-form select:focus { border-color: #4a7876; box-shadow: 0 0 0 2px #5eead412; }
+.form-actions { display: flex; gap: 8px; padding-top: 5px; }
 .metric-card, .service-card, .panel { border: 1px solid var(--border); border-radius: 11px; background: var(--surface); }
 .metric-card { display: grid; grid-template-columns: 8px 1fr; gap: 9px; padding: 15px; }
 .metric-card strong { grid-column: 2; font-size: 27px; }
@@ -218,6 +226,7 @@ button, select { cursor: pointer; }
   .atlas-workspace.with-results { grid-template-columns: 240px minmax(0, 1fr); }
   .metric-grid, .service-grid { grid-template-columns: repeat(2, 1fr); }
   .model-grid { grid-template-columns: 1fr; }
+  .config-form { grid-template-columns: 1fr; }
   .skills-grid { grid-template-columns: repeat(2, 1fr); }
 }
 
