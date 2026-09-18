@@ -257,11 +257,17 @@ def task_curate():
 def task_export():
     if not _neo4j_up():
         return False
+    rust_sync = ENGRAM_BIN / "rust" / "engram-graph-sync"
+    if rust_sync.is_file() and os.access(rust_sync, os.X_OK):
+        return _run([str(rust_sync), "--config", str(ENGRAM_BIN / "engram.yaml"), "--graph-dir", str(ENGRAM_GRAPH), "--mode", "export"]) == 0
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--export", "--verify"])
 
 def task_reconcile():
     if not _neo4j_up():
         return False
+    rust_sync = ENGRAM_BIN / "rust" / "engram-graph-sync"
+    if rust_sync.is_file() and os.access(rust_sync, os.X_OK):
+        return _run([str(rust_sync), "--config", str(ENGRAM_BIN / "engram.yaml"), "--graph-dir", str(ENGRAM_GRAPH), "--mode", "reconcile"]) == 0
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--reconcile"])
 
 def task_approvals():

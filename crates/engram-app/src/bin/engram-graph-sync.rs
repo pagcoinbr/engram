@@ -18,6 +18,8 @@ struct Args {
     python: Option<PathBuf>,
     #[arg(long, default_value_t = 25)]
     limit: usize,
+    #[arg(long, value_parser = ["insert", "export", "reconcile"], default_value = "insert")]
+    mode: String,
 }
 
 fn main() -> ExitCode {
@@ -37,12 +39,24 @@ fn main() -> ExitCode {
     } else {
         PathBuf::from("python3")
     };
-    let status = Command::new(interpreter)
-        .arg(graph_dir.join("graph_sync.py"))
-        .arg("--insert")
-        .arg("--limit")
-        .arg(args.limit.to_string())
-        .status();
+    let mut command = Command::new(interpreter);
+    command.arg(graph_dir.join("graph_sync.py"));
+    match args.mode.as_str() {
+        "insert" => {
+            command
+                .arg("--insert")
+                .arg("--limit")
+                .arg(args.limit.to_string());
+        }
+        "export" => {
+            command.arg("--export").arg("--verify");
+        }
+        "reconcile" => {
+            command.arg("--reconcile");
+        }
+        _ => unreachable!(),
+    }
+    let status = command.status();
     match status {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(status) => ExitCode::from(status.code().unwrap_or(1).clamp(1, 255) as u8),
