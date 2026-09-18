@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     net::SocketAddr,
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -278,6 +279,7 @@ fn revision(path: &PathBuf) -> String {
 }
 
 fn write_edit(path: &PathBuf, edit: &EditableConfig) -> Result<String, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let mut raw: serde_yaml::Value =
         serde_yaml::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -317,6 +319,11 @@ fn write_edit(path: &PathBuf, edit: &EditableConfig) -> Result<String, String> {
     fs::write(
         &temp,
         serde_yaml::to_string(&raw).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    fs::set_permissions(
+        &temp,
+        fs::Permissions::from_mode(metadata.permissions().mode()),
     )
     .map_err(|error| error.to_string())?;
     fs::rename(temp, path).map_err(|error| error.to_string())?;
