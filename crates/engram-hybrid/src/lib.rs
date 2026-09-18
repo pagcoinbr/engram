@@ -141,6 +141,10 @@ async fn graph_leg(
         .await
         .unwrap_or_default();
     let keyword = client.keyword_files(query, k).await.unwrap_or_default();
+    let native_keyword = client
+        .native_keyword_files(query, k)
+        .await
+        .unwrap_or_default();
     let semantic = match OpenAiCompatibleClient::new(config.embed.url.clone()) {
         Ok(embeddings) => match embeddings.embedding(&config.embed.model, query).await {
             Ok(vector) => client.semantic_files(&vector, k).await.unwrap_or_default(),
@@ -153,6 +157,7 @@ async fn graph_leg(
         rrf(
             &[
                 keyword.iter().map(|hit| hit.file.clone()).collect(),
+                native_keyword.iter().map(|hit| hit.file.clone()).collect(),
                 semantic.iter().map(|hit| hit.file.clone()).collect(),
             ],
             k,

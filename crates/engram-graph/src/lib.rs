@@ -101,6 +101,18 @@ impl GraphClient {
             serde_json::json!({"query": query, "limit": limit}),
         ).await
     }
+    pub async fn native_keyword_files(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RecallHit>, GraphError> {
+        let tokens = query
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|word| word.len() >= 4)
+            .map(|word| word.to_lowercase())
+            .collect::<Vec<_>>();
+        self.file_hits("MATCH (m:EngramMemory)-[:HAS_FACT]->(f:EngramFact) WHERE any(token IN $tokens WHERE toLower(f.text) CONTAINS token) RETURN m.file AS file, collect(DISTINCT f.text) AS facts, count(f) AS score ORDER BY score DESC LIMIT $limit", serde_json::json!({"tokens": tokens, "limit": limit})).await
+    }
     pub async fn upsert_native_memory(
         &self,
         file: &str,
