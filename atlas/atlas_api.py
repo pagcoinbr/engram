@@ -250,10 +250,12 @@ def _config_revision() -> str:
 def _editable_config(cfg: dict) -> dict:
     llama = cfg.get("llama_cpp", {}) or {}
     embed = cfg.get("embed", {}) or {}
+    graph = cfg.get("graph", {}) or {}
     return {
         "backend": cfg.get("backend", ""),
         "llama_cpp": {key: llama.get(key, "") for key in ("url", "model", "timeout_seconds")},
         "embed": {key: embed.get(key, "") for key in ("provider", "url", "model", "dim")},
+        "graph": {"backend": graph.get("backend", "native")},
     }
 
 
@@ -279,6 +281,13 @@ def _validate_config_patch(patch: dict, current: dict) -> tuple[dict, bool]:
             raise HTTPException(400, f"{section}.url must be an HTTP(S) /v1 endpoint")
         normalized[section]["url"] = url.rstrip("/")
         normalized[section]["model"] = str(normalized[section].get("model", "")).strip()
+    incoming_graph = patch.get("graph", {})
+    if not isinstance(incoming_graph, dict):
+        raise HTTPException(400, "graph must be an object")
+    if "backend" in incoming_graph:
+        normalized["graph"]["backend"] = str(incoming_graph["backend"]).strip().lower()
+    if normalized["graph"]["backend"] not in ("native", "graphiti_compat"):
+        raise HTTPException(400, "unsupported graph backend")
     provider = str(normalized["embed"].get("provider", "")).strip().lower()
     if provider not in ("", "ollama", "fastembed", "llama_cpp", "openai"):
         raise HTTPException(400, "unsupported embedding provider")
@@ -305,6 +314,7 @@ def _write_config(editable: dict) -> str:
     raw["backend"] = editable["backend"]
     raw.setdefault("llama_cpp", {}).update(editable["llama_cpp"])
     raw.setdefault("embed", {}).update(editable["embed"])
+    raw.setdefault("graph", {}).update(editable["graph"])
     backup_dir = ENGRAM_BIN / "backups" / "config"
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
