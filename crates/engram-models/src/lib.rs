@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Clone)]
@@ -69,7 +70,10 @@ impl OpenAiCompatibleClient {
         }
         Ok(Self {
             base_url,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(90))
+                .build()
+                .map_err(ProbeError::Request)?,
         })
     }
 
