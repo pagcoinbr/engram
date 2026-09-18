@@ -17,8 +17,12 @@ struct Args {
     config: PathBuf,
     #[arg(long, default_value = "-root")]
     slug: String,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["only", "delete"])]
     rebuild: bool,
+    #[arg(long, value_name = "FILE", conflicts_with = "delete")]
+    only: Vec<String>,
+    #[arg(long, value_name = "FILE")]
+    delete: Option<String>,
 }
 
 #[tokio::main]
@@ -47,12 +51,25 @@ async fn run(args: Args) -> Result<usize, String> {
         .join("projects")
         .join(&args.slug)
         .join("memory");
-    let memories = load(store).map_err(|error| error.to_string())?;
+    let mut memories = load(store).map_err(|error| error.to_string())?;
     let vectors = QdrantClient::new(config.vector_store.url, config.vector_store.collection);
     vectors
         .ensure_collection(config.embed.dim, args.rebuild)
         .await
         .map_err(|error| error.to_string())?;
+    if let Some(file) = args.delete {
+        vectors
+            .delete(&args.slug, &file)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(0);
+    }
+    if !args.only.is_empty() {
+        memories.retain(|memory| args.only.iter().any(|file| file == &memory.file));
+        if memories.len() != args.only.len() {
+            return Err("one or more --only files are not present in the memory store".into());
+        }
+    }
     let embeddings =
         OpenAiCompatibleClient::new(config.embed.url).map_err(|error| error.to_string())?;
     for memory in &memories {

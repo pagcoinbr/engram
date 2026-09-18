@@ -171,4 +171,18 @@ impl QdrantClient {
             .error_for_status()?;
         Ok(())
     }
+
+    pub async fn delete(&self, slug: &str, file: &str) -> Result<(), VectorError> {
+        let id = Uuid::new_v5(&POINT_NAMESPACE, format!("{slug}::{file}").as_bytes());
+        self.client
+            .post(format!(
+                "{}/collections/{}/points/delete",
+                self.base_url, self.collection
+            ))
+            .json(&serde_json::json!({"points": [id.to_string()]}))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
 }
