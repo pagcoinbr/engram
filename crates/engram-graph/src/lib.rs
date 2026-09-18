@@ -132,7 +132,7 @@ impl GraphClient {
         file: &str,
         facts: &[String],
     ) -> Result<(), GraphError> {
-        self.query("MATCH (m:EngramMemory {file: $file}) OPTIONAL MATCH (m)-[old:HAS_FACT]->(:EngramFact) DELETE old WITH m UNWIND $facts AS fact MERGE (f:EngramFact {memory_file: $file, text: fact}) SET f.updated_at = datetime() MERGE (m)-[:HAS_FACT]->(f) WITH f, [word IN split(toLower(f.text), ' ') WHERE size(word) >= 6] AS names UNWIND names AS name MERGE (e:EngramEntity {name: name}) MERGE (f)-[:MENTIONS]->(e)", serde_json::json!({"file": file, "facts": facts})).await?;
+        self.query("MATCH (m:EngramMemory {file: $file}) OPTIONAL MATCH (m)-[old:HAS_FACT]->(:EngramFact) DELETE old WITH m UNWIND $facts AS fact MERGE (f:EngramFact {memory_file: $file, text: fact}) ON CREATE SET f.valid_from = datetime(), f.created_at = datetime() SET f.valid_until = null, f.updated_at = datetime() MERGE (m)-[:HAS_FACT]->(f) WITH f, [word IN split(toLower(f.text), ' ') WHERE size(word) >= 6] AS names UNWIND names AS name MERGE (e:EngramEntity {name: name}) MERGE (f)-[:MENTIONS]->(e)", serde_json::json!({"file": file, "facts": facts})).await?;
         Ok(())
     }
     async fn file_hits(
