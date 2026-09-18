@@ -253,6 +253,15 @@ memory_guard_secret_content() {
 # slow or down Qdrant never delays (or fails) a save/delete. Mirrors the local-first
 # posture of the optional GitHub push above.
 memory_vector_sync() {
+    local rust="${ENGRAM_BIN:-${HOME}/.claude}/rust/engram-index"
+    if [[ -x "$rust" ]]; then
+        local -a rust_args=()
+        local arg slug
+        slug="${CLAUDE_MEMORY_SLUG:-$(printf '%s' "$HOME" | sed 's|/|-|g')}"
+        for arg in "$@"; do [[ "$arg" != "--insert" ]] && rust_args+=("$arg"); done
+        ( "$rust" --config "${ENGRAM_CONFIG:-${HOME}/.claude/engram.yaml}" --slug "$slug" "${rust_args[@]}" >/dev/null 2>&1 & ) 2>/dev/null || true
+        return 0
+    fi
     local script="${HOME}/.claude/vector/vector_sync.py"
     [[ -f "$script" ]] || return 0
     # Prefer the vector venv (has qdrant-client) > env override > graph venv > python3.
