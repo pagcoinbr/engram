@@ -10,6 +10,8 @@ import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 ATLAS_ROOT = Path(__file__).resolve().parent
@@ -36,6 +38,7 @@ if (DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="atlas-assets")
 
 _snapshot_cache: dict[str, tuple[float, dict]] = {}
+_model_cache: tuple[float, dict] | None = None
 
 
 def _project_dirs() -> list[Path]:
@@ -222,6 +225,56 @@ def _build_snapshot(scope: str) -> dict:
     }
 
 
+def _redact(value, key: str = ""):
+    if any(term in key.lower() for term in ("key", "token", "password", "secret")):
+        return "••••••••" if value else ""
+    if isinstance(value, dict):
+        return {name: _redact(item, name) for name, item in value.items()}
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    return value
+
+
+def _request_json(url: str, body: dict | None = None, timeout: float = 3.0) -> dict:
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode())
+
+
+def _models_status() -> dict:
+    cfg = base.memory_ai.load()
+    embed = cfg.get("embed", {}) or {}
+    llama = cfg.get("llama_cpp", {}) or {}
+    backend = cfg.get("backend", "ollama")
+    models = []
+    for role, provider, endpoint, model, dimension in (
+        ("reasoning", backend, llama.get("url", ""), llama.get("model", ""), None),
+        ("embedding", embed.get("provider", ""), embed.get("url", ""), embed.get("model", ""), embed.get("dim")),
+    ):
+        item = {"role": role, "provider": provider or "auto", "endpoint": endpoint,
+                "configuredModel": model or "auto", "expectedDimension": dimension,
+                "reachable": None, "observedModel": "", "observedDimension": None, "latencyMs": None, "error": ""}
+        if provider not in ("llama_cpp", "openai") or not endpoint:
+            models.append(item)
+            continue
+        started = time.monotonic()
+        try:
+            discovered = _request_json(endpoint.rstrip("/") + "/models")
+            ids = [entry.get("id", "") for entry in discovered.get("data", [])]
+            item["reachable"] = True
+            item["observedModel"] = ids[0] if ids else "server reachable"
+            if role == "embedding":
+                probe = _request_json(endpoint.rstrip("/") + "/embeddings", {"model": model, "input": "engram health probe"})
+                item["observedDimension"] = len(probe.get("data", [{}])[0].get("embedding", []))
+            item["latencyMs"] = round((time.monotonic() - started) * 1000)
+        except (OSError, ValueError, KeyError, IndexError, urllib.error.URLError) as exc:
+            item["reachable"] = False
+            item["error"] = str(exc)[:180]
+        models.append(item)
+    return {"models": models, "generatedAt": int(time.time())}
+
+
 @app.get("/api/atlas/projects")
 def atlas_projects():
     projects, _ = _inventory("all")
@@ -251,6 +304,20 @@ def atlas_memory(project: str, file: str):
     raw = path.read_text(errors="ignore")
     meta = base._frontmatter(raw)
     return {"project": project, "file": file, "metadata": meta, "content": raw}
+
+
+@app.get("/api/atlas/models")
+def atlas_models():
+    global _model_cache
+    if _model_cache and time.monotonic() - _model_cache[0] < 15:
+        return _model_cache[1]
+    _model_cache = (time.monotonic(), _models_status())
+    return _model_cache[1]
+
+
+@app.get("/api/atlas/config")
+def atlas_config():
+    return {"path": str(base.memory_ai.CONFIG_PATH), "config": _redact(base.memory_ai.load()), "readOnly": True}
 
 
 def main():

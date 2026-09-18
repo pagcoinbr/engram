@@ -102,8 +102,35 @@ time ~/.claude/memory_recall.py "how does X work" --k 4 --fast
 ## Backends — pick what your hardware allows
 - **`ollama`** — local models on a GPU box, free + private. Choose a `tier` for your VRAM (`cpu`/`small`/`medium`/`large`).
 - **`claude`** — no GPU: an always-on loop container runs the pipeline via the `claude` CLI. Cost = Claude usage instead of a GPU.
+- **`llama_cpp`** — an OpenAI-compatible `llama-server` endpoint. Generation and embeddings can run on separate servers, which is useful when a reasoning model and BGE-M3 live on different GPU services.
 
-Either way, **embeddings are always local** (Ollama `nomic-embed-text`, or CPU `fastembed`) — the graph never needs a paid embeddings API.
+Embeddings remain local: Ollama, CPU `fastembed`, or a llama.cpp/OpenAI-compatible endpoint. The graph never needs a paid embeddings API.
+
+### llama.cpp with a dedicated embedding server
+
+Engram supports `llama-server`'s OpenAI-compatible `/v1` API. Keep generation and
+embedding configuration independent; for example, a reasoning server can live on
+port 8090 while BGE-M3 serves embeddings on port 8091:
+
+```yaml
+backend: llama_cpp
+llama_cpp:
+  url: "http://10.0.0.101:8090/v1"
+  model: "qwen3-35B-A3B"
+
+embed:
+  provider: llama_cpp
+  url: "http://10.0.0.101:8091/v1"
+  model: "bge-m3"
+  dim: 1024
+```
+
+The embedding server must provide `POST /v1/embeddings`; generation uses
+`POST /v1/chat/completions`. Confirm the model alias with `GET /v1/models`.
+**Changing an embedding model, dimension, normalization, or query/document prefix
+creates a new embedding space and requires rebuilding the Qdrant and Neo4j indexes.**
+Do not silently fall back from BGE-M3 to Nomic (or vice versa): equal dimensions do
+not make vectors compatible.
 
 ---
 

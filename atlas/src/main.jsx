@@ -20,6 +20,8 @@ const NAV = [
   ["recall", "Recall", Sparkles],
   ["activity", "Activity", Activity],
   ["system", "System", Server],
+  ["models", "Models", BrainCircuit],
+  ["config", "Configuration", Settings2],
 ];
 
 async function api(path, options) {
@@ -325,6 +327,25 @@ function SystemPage() {
   return <div className="page-content"><div className="service-grid">{services.map(([name, ok, detail]) => <div className="service-card" key={name}><div><HeartPulse size={18}/><span>{name}</span></div><Badge tone={ok ? "ok" : "danger"}>{ok ? "Healthy" : "Down"}</Badge><p>{detail}</p></div>)}</div><section className="panel"><div className="section-heading"><h3>Installed skills</h3><span>{skills?.installed?.length || 0} available</span></div><div className="skills-grid">{skills?.installed?.map(skill => <div key={skill.name}><strong>/{skill.name}</strong><p>{skill.description}</p></div>) || <Spinner/>}</div></section></div>;
 }
 
+function ModelsPage() {
+  const [status, setStatus] = useState(null);
+  const [error, setError] = useState("");
+  const load = () => {setStatus(null); setError(""); api("/api/atlas/models").then(setStatus).catch(error => setError(error.message));};
+  useEffect(load, []);
+  if (error) return <div className="page-content"><Notice>{error}</Notice><button className="action-button" onClick={load}>Retry probe</button></div>;
+  if (!status) return <Spinner label="Probing configured models…"/>;
+  return <div className="page-content model-page"><div className="section-heading"><div><span className="eyebrow">Model assignments</span><h3>Reasoning and retrieval health</h3></div><button className="action-button" onClick={load}><RefreshCw size={15}/>Refresh</button></div><Notice tone="info">A reachable server is not enough: embedding dimensions must match the active index. Probes are cached for 15 seconds.</Notice><div className="model-grid">{status.models.map(item => <article className="model-card" key={item.role}><div className="section-heading"><div><span className="eyebrow">{item.role}</span><h3>{item.configuredModel}</h3></div><Badge tone={item.reachable === true ? "ok" : item.reachable === false ? "danger" : "neutral"}>{item.reachable === true ? "Healthy" : item.reachable === false ? "Unavailable" : "Not probed"}</Badge></div><dl className="metadata"><div><dt>Provider</dt><dd>{item.provider}</dd></div><div><dt>Endpoint</dt><dd>{item.endpoint || "provider default"}</dd></div><div><dt>Observed</dt><dd>{item.observedModel || "—"}</dd></div>{item.role === "embedding" && <div><dt>Dimension</dt><dd>{item.observedDimension || "—"} / expected {item.expectedDimension || "—"}</dd></div>}<div><dt>Latency</dt><dd>{item.latencyMs ? `${item.latencyMs} ms` : "—"}</dd></div></dl>{item.error && <Notice>{item.error}</Notice>}</article>)}</div></div>;
+}
+
+function ConfigPage() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  useEffect(() => {api("/api/atlas/config").then(setData).catch(error => setError(error.message));}, []);
+  if (error) return <div className="page-content"><Notice>{error}</Notice></div>;
+  if (!data) return <Spinner label="Loading configuration…"/>;
+  return <div className="page-content config-page"><span className="eyebrow">Configuration</span><h2>Current Engram configuration</h2><Notice tone="info">This first migration screen is intentionally read-only. The Rust configuration service will add validated edits, diff preview, revisions, and safe model-index migrations.</Notice><section className="panel"><div className="section-heading"><h3>{data.path}</h3><Badge>Secrets redacted</Badge></div><pre className="config-json">{JSON.stringify(data.config, null, 2)}</pre></section></div>;
+}
+
 function App() {
   const url = useUrlState();
   const [snapshot, setSnapshot] = useState(null);
@@ -346,6 +367,8 @@ function App() {
       {snapshot && url.view === "recall" && <RecallPage onLocate={locate}/>} 
       {snapshot && url.view === "activity" && <ActivityPage snapshot={snapshot}/>} 
       {snapshot && url.view === "system" && <SystemPage/>}
+      {snapshot && url.view === "models" && <ModelsPage/>}
+      {snapshot && url.view === "config" && <ConfigPage/>}
     </main>
   </div>;
 }
