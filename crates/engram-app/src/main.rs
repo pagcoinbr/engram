@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use engram_config::{Config, ModelProfile};
+use engram_config::{Config, ModelProfile, recommended_embedders};
 use engram_hybrid::recall;
 use engram_models::OpenAiCompatibleClient;
 use serde::{Deserialize, Serialize};
@@ -127,6 +127,7 @@ async fn main() {
     let app = Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/v1/status", get(status))
+        .route("/api/v1/models/recommended", get(recommended_models))
         .route("/api/v1/config", get(config))
         .route("/api/v1/config/editor", get(editor).put(save_editor))
         .route("/api/v1/config/editor/validate", post(validate_editor))
@@ -136,6 +137,10 @@ async fn main() {
         }));
     let listener = tokio::net::TcpListener::bind(args.bind).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn recommended_models() -> Json<Vec<engram_config::RecommendedEmbedder>> {
+    Json(recommended_embedders())
 }
 
 async fn editor(State(state): State<Arc<AppState>>) -> impl IntoResponse {
