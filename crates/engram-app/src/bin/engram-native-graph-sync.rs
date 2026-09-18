@@ -1,6 +1,9 @@
 use clap::Parser;
+use engram_config::Config;
 use engram_graph::GraphClient;
+use engram_models::OpenAiCompatibleClient;
 use engram_store::load;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, process::ExitCode};
 
@@ -22,6 +25,11 @@ struct Args {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct Extraction {
+    facts: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
@@ -36,6 +44,8 @@ async fn main() -> ExitCode {
         let client = GraphClient::new(&args.uri, &args.database, "neo4j", args.password)
             .map_err(|error| error.to_string())?;
         let memories = load(directory).map_err(|error| error.to_string())?;
+        let config = Config::load(&args.config).map_err(|error| error.to_string())?;
+        let reasoning = OpenAiCompatibleClient::new(config.llama_cpp.url.clone()).map_err(|error| error.to_string())?;
         for memory in &memories {
             let sha = format!(
                 "{:x}",
@@ -53,8 +63,9 @@ async fn main() -> ExitCode {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
+            let extracted = reasoning.chat(&config.llama_cpp.model, &format!("Extract durable factual claims from this memory. Return JSON only: {{\"facts\":[\"claim\"]}}.\n{}\n{}", memory.description, memory.body)).await.ok().and_then(|raw| serde_json::from_str::<Extraction>(&raw).ok()).map(|value| value.facts).filter(|facts| !facts.is_empty()).unwrap_or_else(|| facts(&memory.description, &memory.body));
             client
-                .replace_native_facts(&memory.file, &facts(&memory.description, &memory.body))
+                .replace_native_facts(&memory.file, &extracted)
                 .await
                 .map_err(|error| error.to_string())?;
         }
