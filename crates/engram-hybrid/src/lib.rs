@@ -136,10 +136,18 @@ async fn graph_leg(
         legs.insert("graph".into(), "invalid client".into());
         return (Vec::new(), Vec::new());
     };
-    let facts = client
+    let mut facts = client
         .facts_for_tokens(&tokens, 6)
         .await
         .unwrap_or_default();
+    facts.extend(
+        client
+            .native_facts_for_tokens(&tokens, 6)
+            .await
+            .unwrap_or_default(),
+    );
+    facts.sort();
+    facts.dedup();
     let keyword = client.keyword_files(query, k).await.unwrap_or_default();
     let native_keyword = client
         .native_keyword_files(query, k)

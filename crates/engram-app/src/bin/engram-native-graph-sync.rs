@@ -1,6 +1,6 @@
 use clap::Parser;
 use engram_config::Config;
-use engram_graph::GraphClient;
+use engram_graph::{GraphClient, NativeTriple, RELATION_TAXONOMY, is_valid_relation};
 use engram_models::OpenAiCompatibleClient;
 use engram_store::load;
 use serde::Deserialize;
@@ -75,9 +75,20 @@ async fn main() -> ExitCode {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            let extracted = reasoning.chat(&config.llama_cpp.model, &format!("Extract durable facts and typed triples. Return JSON only: {{\"facts\":[\"claim\"],\"triples\":[{{\"subject\":\"x\",\"relation\":\"uses\",\"object\":\"y\",\"confidence\":0.9,\"temporal\":\"current\"}}]}}.\n{}\n{}", memory.description, memory.body)).await.ok().and_then(|raw| serde_json::from_str::<Extraction>(&raw).ok()).map(|value| { let mut facts = value.facts; facts.extend(value.triples.into_iter().filter(|triple| triple.confidence >= 0.7).map(|triple| format!("{} {} {} ({})", triple.subject, triple.relation, triple.object, triple.temporal))); facts }).filter(|facts| !facts.is_empty()).unwrap_or_else(|| facts(&memory.description, &memory.body));
+            let extraction = reasoning.chat(&config.llama_cpp.model, &format!("Extract durable facts and typed triples. Return JSON only: {{\"facts\":[\"claim\"],\"triples\":[{{\"subject\":\"x\",\"relation\":\"uses\",\"object\":\"y\",\"confidence\":0.9,\"temporal\":\"current\"}}]}}. Relations must be one of: {}. Infer temporal as current when present tense applies, formerly for past or replaced states, and use supersedes when wording says replacement, migration, or succession. Confidence is 0 to 1; preserve uncertain triples.\n{}\n{}", RELATION_TAXONOMY.join(", "), memory.description, memory.body)).await.ok().and_then(|raw| serde_json::from_str::<Extraction>(&raw).ok()).unwrap_or(Extraction { facts: facts(&memory.description, &memory.body), triples: Vec::new() });
+            let extracted = if extraction.facts.is_empty() { facts(&memory.description, &memory.body) } else { extraction.facts };
+            let source = format!("{}\n{}", memory.description, memory.body);
+            let triples = extraction
+                .triples
+                .into_iter()
+                .filter_map(|triple| normalize_triple(triple, &source))
+                .collect::<Vec<_>>();
             client
                 .replace_native_facts(&memory.file, &extracted)
+                .await
+                .map_err(|error| error.to_string())?;
+            client
+                .replace_native_triples(&memory.file, &triples)
                 .await
                 .map_err(|error| error.to_string())?;
         }
@@ -96,6 +107,47 @@ async fn main() -> ExitCode {
     }
 }
 
+fn normalize_triple(triple: Triple, source: &str) -> Option<NativeTriple> {
+    let relation = triple
+        .relation
+        .trim()
+        .to_lowercase()
+        .replace([' ', '-'], "_");
+    let source = source.to_lowercase();
+    let temporal = match triple.temporal.trim().to_lowercase().as_str() {
+        "formerly" | "former" | "past" => "formerly",
+        "superseded" | "supersedes" => "supersedes",
+        _ if ["superseded", "replaced by", "migrated to", "succeeded by"]
+            .iter()
+            .any(|phrase| source.contains(phrase)) =>
+        {
+            "supersedes"
+        }
+        _ if ["formerly", "previously", "used to", "was "]
+            .iter()
+            .any(|phrase| source.contains(phrase)) =>
+        {
+            "formerly"
+        }
+        _ => "current",
+    };
+    let relation = if temporal == "supersedes" {
+        "supersedes".to_string()
+    } else {
+        relation
+    };
+    (is_valid_relation(&relation)
+        && !triple.subject.trim().is_empty()
+        && !triple.object.trim().is_empty())
+    .then_some(NativeTriple {
+        subject: triple.subject.trim().to_string(),
+        relation,
+        object: triple.object.trim().to_string(),
+        confidence: triple.confidence.clamp(0.0, 1.0),
+        temporal: temporal.to_string(),
+    })
+}
+
 fn facts(description: &str, body: &str) -> Vec<String> {
     format!("{description} {body}")
         .split(['.', '!', '?', '\n'])
@@ -104,4 +156,31 @@ fn facts(description: &str, body: &str) -> Vec<String> {
         .take(12)
         .map(str::to_string)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_temporal_language_and_quarantines_invalid_relations() {
+        let triple = Triple {
+            subject: "Engram".into(),
+            relation: "uses".into(),
+            object: "Neo4j".into(),
+            confidence: 0.4,
+            temporal: String::new(),
+        };
+        let value = normalize_triple(triple, "Engram previously used Neo4j.").unwrap();
+        assert_eq!(value.temporal, "formerly");
+        assert_eq!(value.confidence, 0.4);
+        let invalid = Triple {
+            subject: "Engram".into(),
+            relation: "guesses".into(),
+            object: "Neo4j".into(),
+            confidence: 1.0,
+            temporal: String::new(),
+        };
+        assert!(normalize_triple(invalid, "").is_none());
+    }
 }
