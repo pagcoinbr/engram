@@ -1,6 +1,13 @@
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
+};
 use clap::Parser;
 use engram_config::{Config, ModelProfile};
+use engram_hybrid::recall;
 use engram_models::OpenAiCompatibleClient;
 use serde::Serialize;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
@@ -41,6 +48,13 @@ struct StatusResponse {
     models: Vec<ModelStatus>,
 }
 
+#[derive(serde::Deserialize)]
+struct RecallQuery {
+    q: String,
+    slug: Option<String>,
+    k: Option<usize>,
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -48,6 +62,7 @@ async fn main() {
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/v1/status", get(status))
         .route("/api/v1/config", get(config))
+        .route("/api/v1/recall", get(recall_api))
         .with_state(Arc::new(AppState {
             config: args.config,
         }));
@@ -79,6 +94,23 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         }),
     )
         .into_response()
+}
+
+async fn recall_api(
+    Query(query): Query<RecallQuery>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match recall(
+        &state.config,
+        query.slug.as_deref().unwrap_or("-root"),
+        &query.q,
+        query.k.unwrap_or(6).clamp(1, 20),
+    )
+    .await
+    {
+        Ok(output) => (StatusCode::OK, Json(output)).into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    }
 }
 
 async fn probe(profile: ModelProfile) -> ModelStatus {

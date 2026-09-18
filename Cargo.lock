@@ -241,6 +241,7 @@ dependencies = [
  "clap",
  "engram-config",
  "engram-graph",
+ "engram-hybrid",
  "engram-models",
  "engram-retrieval",
  "engram-store",
@@ -270,6 +271,19 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "engram-hybrid"
+version = "0.1.0"
+dependencies = [
+ "engram-config",
+ "engram-graph",
+ "engram-models",
+ "engram-retrieval",
+ "engram-store",
+ "engram-vector",
+ "serde",
 ]
 
 [[package]]
