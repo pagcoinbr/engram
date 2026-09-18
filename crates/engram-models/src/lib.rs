@@ -77,10 +77,14 @@ impl OpenAiCompatibleClient {
     }
 
     pub async fn embedding_dimension(&self, model: &str) -> Result<usize, ProbeError> {
+        Ok(self.embedding(model, "engram health probe").await?.len())
+    }
+
+    pub async fn embedding(&self, model: &str, input: &str) -> Result<Vec<f32>, ProbeError> {
         let response = self
             .client
             .post(format!("{}/embeddings", self.base_url))
-            .json(&serde_json::json!({"model": model, "input": "engram health probe"}))
+            .json(&serde_json::json!({"model": model, "input": input}))
             .send()
             .await?
             .error_for_status()?
@@ -90,8 +94,8 @@ impl OpenAiCompatibleClient {
             .data
             .into_iter()
             .next()
-            .map(|item| item.embedding.len())
-            .filter(|size| *size > 0)
+            .map(|item| item.embedding)
+            .filter(|embedding| !embedding.is_empty())
             .ok_or(ProbeError::EmptyEmbedding)
     }
 

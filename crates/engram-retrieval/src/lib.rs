@@ -7,6 +7,27 @@ pub struct Hit {
     pub score: f64,
 }
 
+pub fn rrf(rankings: &[Vec<String>], limit: usize, k: f64) -> Vec<Hit> {
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    for ranking in rankings {
+        for (position, file) in ranking.iter().enumerate() {
+            *scores.entry(file.clone()).or_default() += 1.0 / (k + position as f64 + 1.0);
+        }
+    }
+    let mut hits: Vec<Hit> = scores
+        .into_iter()
+        .map(|(file, score)| Hit { file, score })
+        .collect();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.file.cmp(&right.file))
+    });
+    hits.truncate(limit);
+    hits
+}
+
 pub fn bm25(memories: &[Memory], query: &str, limit: usize) -> Vec<Hit> {
     let documents: Vec<Vec<String>> = memories.iter().map(tokens).collect();
     let terms = tokenize(query);
@@ -87,5 +108,12 @@ mod tests {
             },
         ];
         assert_eq!(bm25(&memories, "IPv6 DNS", 1)[0].file, "dns.md");
+    }
+    #[test]
+    fn rrf_rewards_consensus() {
+        assert_eq!(
+            rrf(&[vec!["a".into(), "b".into()], vec!["b".into()]], 2, 60.0)[0].file,
+            "b"
+        );
     }
 }

@@ -283,6 +283,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-vector"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "engram-models",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

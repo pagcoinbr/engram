@@ -15,6 +15,8 @@ pub struct Config {
     pub llama_cpp: LlamaCpp,
     #[serde(default)]
     pub embed: Embed,
+    #[serde(default)]
+    pub vector_store: VectorStore,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -58,6 +60,32 @@ impl Default for Embed {
             dim: default_dimension(),
             query_prefix: String::new(),
             document_prefix: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct VectorStore {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_qdrant_url")]
+    pub url: String,
+    #[serde(default = "default_collection")]
+    pub collection: String,
+}
+
+fn default_qdrant_url() -> String {
+    "http://127.0.0.1:6333".into()
+}
+fn default_collection() -> String {
+    "engram_memory".into()
+}
+impl Default for VectorStore {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_qdrant_url(),
+            collection: default_collection(),
         }
     }
 }
