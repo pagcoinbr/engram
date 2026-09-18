@@ -116,6 +116,22 @@ async fn run(args: Args) -> Result<usize, String> {
             .map_err(|error| format!("{}: {error}", memory.file))?;
         indexed += 1;
     }
+    if args.only.is_empty() && !args.rebuild {
+        let present: std::collections::HashSet<_> =
+            memories.iter().map(|memory| memory.file.as_str()).collect();
+        for file in vectors
+            .files(&args.slug)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            if !present.contains(file.as_str()) {
+                vectors
+                    .delete(&args.slug, &file)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
     Ok(indexed)
 }
 

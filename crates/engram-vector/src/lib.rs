@@ -44,6 +44,20 @@ pub struct IndexPoint<'a> {
     pub sha: &'a str,
     pub vector: Vec<f32>,
 }
+
+#[derive(Deserialize)]
+struct ScrollResponse {
+    result: ScrollResult,
+}
+#[derive(Deserialize)]
+struct ScrollResult {
+    points: Vec<ScrollPoint>,
+    next_page_offset: Option<serde_json::Value>,
+}
+#[derive(Deserialize)]
+struct ScrollPoint {
+    payload: Option<Payload>,
+}
 #[derive(Deserialize)]
 struct Response {
     result: Points,
@@ -204,5 +218,40 @@ impl QdrantClient {
             .pointer("/result/payload/sha")
             .and_then(serde_json::Value::as_str)
             == Some(sha))
+    }
+
+    pub async fn files(&self, slug: &str) -> Result<Vec<String>, VectorError> {
+        let mut files = Vec::new();
+        let mut offset = None;
+        loop {
+            let mut body = serde_json::json!({"limit": 256, "with_payload": true, "with_vector": false, "filter": {"must": [{"key": "slug", "match": {"value": slug}}]}});
+            if let Some(value) = offset {
+                body["offset"] = value;
+            }
+            let response = self
+                .client
+                .post(format!(
+                    "{}/collections/{}/points/scroll",
+                    self.base_url, self.collection
+                ))
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<ScrollResponse>()
+                .await?;
+            files.extend(
+                response
+                    .result
+                    .points
+                    .into_iter()
+                    .filter_map(|point| point.payload.and_then(|payload| payload.file)),
+            );
+            let next = response.result.next_page_offset;
+            if next.is_none() {
+                return Ok(files);
+            }
+            offset = next;
+        }
     }
 }
