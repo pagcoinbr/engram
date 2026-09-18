@@ -19,6 +19,8 @@ struct Args {
     slug: String,
     #[arg(long, default_value_t = 25)]
     limit: usize,
+    #[arg(long)]
+    import_legacy_embeddings: bool,
     #[arg(long, env = "NEO4J_URI", default_value = "bolt://127.0.0.1:7687")]
     uri: String,
     #[arg(long, env = "NEO4J_DATABASE", default_value = "neo4j")]
@@ -57,6 +59,10 @@ async fn main() -> ExitCode {
             .join("memory");
         let client = GraphClient::new(&args.uri, &args.database, "neo4j", args.password)
             .map_err(|error| error.to_string())?;
+        if args.import_legacy_embeddings {
+            client.import_legacy_fact_embeddings().await.map_err(|error| error.to_string())?;
+            return Ok::<_, String>(0);
+        }
         let memories = load(directory).map_err(|error| error.to_string())?;
         let config = Config::load(&args.config).map_err(|error| error.to_string())?;
         let reasoning = OpenAiCompatibleClient::new(config.llama_cpp.url.clone()).map_err(|error| error.to_string())?;

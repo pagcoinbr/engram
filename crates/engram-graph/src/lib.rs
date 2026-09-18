@@ -226,6 +226,10 @@ impl GraphClient {
     ) -> Result<Vec<RecallHit>, GraphError> {
         self.file_hits("MATCH (m:EngramMemory)-[:HAS_FACT]->(f:EngramFact) WHERE f.valid_until IS NULL AND f.embedding IS NOT NULL WITH m, f, vector.similarity.cosine(f.embedding, $vector) AS score WHERE score > 0 RETURN m.file AS file, collect(DISTINCT f.text) AS facts, max(score) AS score ORDER BY score DESC LIMIT $limit", serde_json::json!({"vector": vector, "limit": limit})).await
     }
+    pub async fn import_legacy_fact_embeddings(&self) -> Result<(), GraphError> {
+        self.query("MATCH (:Entity)-[r:RELATES_TO]->(:Entity) UNWIND coalesce(r.episodes, []) AS episode MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL MATCH (m:EngramMemory {file: ep.file}) WHERE r.fact IS NOT NULL AND r.fact_embedding IS NOT NULL MERGE (f:EngramFact {memory_file: m.file, text: r.fact}) ON CREATE SET f.created_at = datetime(), f.valid_from = datetime() SET f.embedding = r.fact_embedding, f.embedding_updated_at = datetime(), f.valid_until = null, f.updated_at = datetime() MERGE (m)-[:HAS_FACT]->(f) RETURN count(DISTINCT f)", serde_json::json!({})).await?;
+        Ok(())
+    }
     pub async fn mark_native_triples_current(&self, file: &str) -> Result<(), GraphError> {
         self.query("MATCH (m:EngramMemory {file: $file}) SET m.native_triple_version = 2, m.native_triples_synced_at = datetime() RETURN m.file", serde_json::json!({"file": file})).await?;
         Ok(())
