@@ -210,7 +210,10 @@ def task_harvest():
             pipe = c; break
     if not pipe:
         log("harvest: memory_pipeline.sh not found"); return False
-    ok = _run(["bash", str(pipe)]) == 0
+    rust_lifecycle = ENGRAM_BIN / "rust" / "engram-lifecycle"
+    ok = (_run([str(rust_lifecycle), "--bin", str(ENGRAM_BIN), "--mode", "harvest"]) == 0
+          if rust_lifecycle.is_file() and os.access(rust_lifecycle, os.X_OK)
+          else _run(["bash", str(pipe)]) == 0)
     if ((cfg().get("telegram") or {}).get("activity_log")):
         gate = ENGRAM_BIN / "engram_telegram_gate.py"
         if gate.exists():
@@ -235,6 +238,9 @@ def task_maintenance():
         log(f"maintenance: no dedicated fixate script — {sh.name} already ran in harvest; skipping duplicate")
         return
     if sh:
+        rust_lifecycle = ENGRAM_BIN / "rust" / "engram-lifecycle"
+        if sh.name == "memory_fixate_cron.sh" and rust_lifecycle.is_file() and os.access(rust_lifecycle, os.X_OK):
+            return _run([str(rust_lifecycle), "--bin", str(ENGRAM_BIN), "--mode", "maintenance"]) == 0
         return _run(["bash", str(sh)]) == 0   # activity notify lives in task_harvest (encode is where the news is)
     log("maintenance: no maintenance script found (memory_fixate_cron.sh / memory_pipeline.sh)")
     return False
@@ -251,6 +257,9 @@ def task_curate():
         return False
     ac = ENGRAM_BIN / "memory_auto_curate.py"
     if ac.exists():
+        rust_lifecycle = ENGRAM_BIN / "rust" / "engram-lifecycle"
+        if rust_lifecycle.is_file() and os.access(rust_lifecycle, os.X_OK):
+            return _run([str(rust_lifecycle), "--bin", str(ENGRAM_BIN), "--mode", "curate"]) == 0
         _run([_vector_python(), str(ac), "--apply"])
 
 
