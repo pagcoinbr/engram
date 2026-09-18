@@ -132,6 +132,23 @@ creates a new embedding space and requires rebuilding the Qdrant and Neo4j index
 Do not silently fall back from BGE-M3 to Nomic (or vice versa): equal dimensions do
 not make vectors compatible.
 
+### Rust recall and model API
+
+The Rust workspace owns the fast recall path: Markdown BM25, OpenAI-compatible
+embeddings, Qdrant search/indexing, Neo4j HTTP graph ranking, the prompt hook, and
+the MCP `memory_recall_hybrid` tool. It also exposes a loopback-only service:
+
+```bash
+cargo run -p engram-app --bin engram-app -- --config ~/.claude/engram.yaml
+curl http://127.0.0.1:8787/api/v1/status
+cargo run -p engram-app --bin engram-index -- --rebuild
+```
+
+`/api/v1/status` reports configured and observed reasoning/embedding models.
+`/api/v1/config/editor` provides revision-protected validation and saves for the
+Atlas configuration screen. The installer places these binaries in
+`~/.claude/rust/` and enables `engram-api.service` for systemd installations.
+
 ---
 
 ## Quickstart
@@ -198,7 +215,8 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 | **`/memory-to-skill`** | Promote a high-trust, frequently-recalled *procedural* memory into a first-class Claude Code skill. |
 
 ### Recall — how the right memories reach Claude
-- **Auto-recall** (the `UserPromptSubmit` hook): every prompt gets the memories that match it injected automatically — no waiting for Claude to think of calling a recall tool. Names + one-line descriptions only, **at most once per memory per session**, ~0.3s, fail-open. Off with `recall.inject.enabled: false`.
+- **Auto-recall** (the `UserPromptSubmit` hook): every prompt gets the memories that match it injected automatically — no waiting for Claude to think of calling a recall tool. Names + one-line descriptions only, **at most once per memory per session**, ~0.3s, fail-open. The installer uses the Rust hook when available. Off with `recall.inject.enabled: false`.
+- **Rust hybrid recall** (`engram-rust` MCP): `memory_recall_hybrid` fuses Markdown, Qdrant, and Neo4j rankings via Reciprocal Rank Fusion. It is registered alongside the legacy graph MCP during the staged migration.
 - **Graph recall** (`engram-graph` MCP): `memory_recall`, `memory_search_facts`, `memory_neighbors`, `memory_stats` — Claude loads only the relevant memories on demand, instead of dumping the whole store into context.
 - **Hybrid recall** (`memory_recall_hybrid`, on `engram-graph`): the best single recall — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename. Each ranker degrades independently; optional `type` filter.
 - **Vector recall** (the optional `engram-vector` MCP): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search via Qdrant. Plus `memory_recall_fused` (vector+keyword) for no-graph installs. Off by default; enable with `./install.sh --vector`.
@@ -248,7 +266,7 @@ queues. Pure stdlib `curses`, no server and no browser; saves and deletes go thr
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full data flow and **[CONFIG.md](CONFIG.md)** for `engram.yaml`.
 
 ## Requirements
-- `python3`, `jq` (engine). `git`/`gh` for optional sync.
+- `cargo` is required for the Rust API, hook, MCP, and indexer. `python3`, `jq`, `git`/`gh` remain required for the legacy lifecycle pipeline and optional sync.
 - Graph: Docker (Neo4j) + a Python venv (graphiti-core, neo4j, fastembed) — the installer builds it.
 - Vector index (optional): Docker (Qdrant) + a Python venv (qdrant-client, mcp, fastembed) — `./install.sh --vector` builds it.
 - A backend: a reachable Ollama, **or** the `claude` CLI + an Anthropic API key.
