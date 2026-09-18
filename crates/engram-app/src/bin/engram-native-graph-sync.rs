@@ -60,14 +60,24 @@ async fn main() -> ExitCode {
         let memories = load(directory).map_err(|error| error.to_string())?;
         let config = Config::load(&args.config).map_err(|error| error.to_string())?;
         let reasoning = OpenAiCompatibleClient::new(config.llama_cpp.url.clone()).map_err(|error| error.to_string())?;
-        let count = memories.len().min(args.limit);
-        for memory in memories.iter().take(args.limit) {
+        let mut count = 0;
+        for memory in &memories {
+            if count >= args.limit {
+                break;
+            }
             let sha = format!(
                 "{:x}",
                 Sha256::digest(
                     format!("{}{}{}", memory.name, memory.description, memory.body).as_bytes()
                 )
             );
+            if client
+                .native_memory_is_current(&memory.file, &sha)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                continue;
+            }
             client
                 .upsert_native_memory(
                     &memory.file,
@@ -94,6 +104,7 @@ async fn main() -> ExitCode {
                 .replace_native_triples(&memory.file, &triples)
                 .await
                 .map_err(|error| error.to_string())?;
+            count += 1;
         }
         Ok::<_, String>(count)
     }

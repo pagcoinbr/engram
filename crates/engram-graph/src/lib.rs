@@ -175,6 +175,26 @@ impl GraphClient {
         ).await?;
         Ok(())
     }
+    pub async fn native_memory_is_current(
+        &self,
+        file: &str,
+        sha: &str,
+    ) -> Result<bool, GraphError> {
+        let response = self
+            .query(
+                "MATCH (m:EngramMemory {file: $file, sha: $sha}) RETURN count(m) > 0",
+                serde_json::json!({"file": file, "sha": sha}),
+            )
+            .await?;
+        Ok(response
+            .results
+            .into_iter()
+            .flat_map(|set| set.data)
+            .next()
+            .and_then(|row| row.row.into_iter().next())
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false))
+    }
     pub async fn replace_native_facts(
         &self,
         file: &str,
