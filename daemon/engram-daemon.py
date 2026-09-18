@@ -179,7 +179,8 @@ def task_vector():
         return False
     rust_index = ENGRAM_BIN / "rust" / "engram-index"
     if rust_index.is_file() and os.access(rust_index, os.X_OK):
-        return _run([str(rust_index), "--config", str(ENGRAM_BIN / "engram.yaml")]) == 0
+        slug = os.environ.get("CLAUDE_MEMORY_SLUG") or str(HOME).replace("/", "-")
+        return _run([str(rust_index), "--config", str(ENGRAM_BIN / "engram.yaml"), "--slug", slug]) == 0
     return _run([_vector_python(), str(ENGRAM_VECTOR / "vector_sync.py"), "--insert"]) == 0
 
 def _generate_available() -> bool:
