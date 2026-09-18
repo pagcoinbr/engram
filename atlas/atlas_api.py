@@ -328,8 +328,11 @@ def _rust_json(path: str, body: dict | None = None, method: str = "GET") -> dict
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(f"{RUST_API}{path}", data=data, method=method,
                                      headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode())
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        raise HTTPException(error.code, error.read().decode(errors="replace")) from error
 
 
 def _atlas_model_status(status: dict) -> dict:
