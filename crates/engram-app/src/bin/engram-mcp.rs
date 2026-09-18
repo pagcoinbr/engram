@@ -39,7 +39,10 @@ async fn main() {
             ),
             "tools/list" => ok(
                 id,
-                json!({"tools":[{"name":"memory_recall_hybrid","description":"Hybrid Markdown, vector, and graph memory recall.","inputSchema":{"type":"object","properties":{"q":{"type":"string"},"slug":{"type":"string"},"k":{"type":"integer","minimum":1,"maximum":20}},"required":["q"]}}]}),
+                json!({"tools":[
+                    {"name":"memory_recall","description":"Primary memory recall. Uses the configured graph backend; Graphiti compatibility preserves Graphiti ordering exactly.","inputSchema":{"type":"object","properties":{"q":{"type":"string"},"slug":{"type":"string"},"k":{"type":"integer","minimum":1,"maximum":20}},"required":["q"]}},
+                    {"name":"memory_recall_hybrid","description":"Alias for memory_recall, retained for existing callers.","inputSchema":{"type":"object","properties":{"q":{"type":"string"},"slug":{"type":"string"},"k":{"type":"integer","minimum":1,"maximum":20}},"required":["q"]}}
+                ]}),
             ),
             "tools/call" => {
                 call(
@@ -57,7 +60,10 @@ async fn main() {
 }
 
 async fn call(id: &Value, params: &Value, config: &Path) -> Value {
-    if params.get("name").and_then(Value::as_str) != Some("memory_recall_hybrid") {
+    if !matches!(
+        params.get("name").and_then(Value::as_str),
+        Some("memory_recall" | "memory_recall_hybrid")
+    ) {
         return err(id, -32602, "unknown tool");
     }
     let arguments = params.get("arguments").unwrap_or(&Value::Null);
