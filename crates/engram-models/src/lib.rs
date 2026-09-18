@@ -133,7 +133,7 @@ impl OpenAiCompatibleClient {
         })
     }
     pub async fn chat(&self, model: &str, prompt: &str) -> Result<String, ProbeError> {
-        let response = self.client.post(format!("{}/chat/completions", self.base_url)).json(&serde_json::json!({"model": model, "temperature": 0, "messages": [{"role": "user", "content": prompt}]})).send().await?.error_for_status()?.json::<ChatResponse>().await?;
+        let response = self.client.post(format!("{}/chat/completions", self.base_url)).json(&serde_json::json!({"model": model, "temperature": 0, "max_tokens": 512, "messages": [{"role": "user", "content": prompt}]})).send().await?.error_for_status()?.json::<ChatResponse>().await?;
         response
             .choices
             .into_iter()
