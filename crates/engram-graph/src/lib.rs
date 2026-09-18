@@ -154,7 +154,7 @@ impl GraphClient {
         query: &str,
         limit: usize,
     ) -> Result<Vec<RecallHit>, GraphError> {
-        let legacy = self.file_hits("CALL db.index.fulltext.queryNodes('engram_native_fact_text', $query, {limit: $limit}) YIELD node AS fact, score MATCH (m:EngramMemory)-[:HAS_FACT]->(fact) RETURN m.file AS file, collect(DISTINCT fact.text) AS facts, max(score) AS score ORDER BY score DESC LIMIT $limit", serde_json::json!({"query": query, "limit": limit})).await;
+        let legacy = self.file_hits("CALL db.index.fulltext.queryNodes('engram_native_legacy_edges', $query, {limit: $limit}) YIELD node AS edge, score RETURN edge.file AS file, collect(DISTINCT edge.fact) AS facts, max(score) AS score ORDER BY score DESC LIMIT $limit", serde_json::json!({"query": query, "limit": limit})).await;
         if let Ok(hits) = legacy
             && !hits.is_empty()
         {
@@ -233,6 +233,8 @@ impl GraphClient {
         self.file_hits("MATCH (m:EngramMemory)-[:HAS_FACT]->(f:EngramFact) WHERE f.valid_until IS NULL AND f.embedding IS NOT NULL WITH m, f, vector.similarity.cosine(f.embedding, $vector) AS score WHERE score > 0 RETURN m.file AS file, collect(DISTINCT f.text) AS facts, max(score) AS score ORDER BY score DESC LIMIT $limit", serde_json::json!({"vector": vector, "limit": limit})).await
     }
     pub async fn import_legacy_fact_embeddings(&self) -> Result<(), GraphError> {
+        self.query("CREATE FULLTEXT INDEX engram_native_legacy_edges IF NOT EXISTS FOR (e:EngramLegacyEdge) ON EACH [e.name, e.fact]", serde_json::json!({})).await?;
+        self.query("MATCH (:Entity)-[r:RELATES_TO]->(:Entity) UNWIND coalesce(r.episodes, []) AS episode MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL MERGE (edge:EngramLegacyEdge {key: elementId(r) + '|' + episode}) SET edge.file = ep.file, edge.name = r.name, edge.fact = r.fact, edge.embedding = r.fact_embedding, edge.updated_at = datetime() RETURN count(edge)", serde_json::json!({})).await?;
         self.query("CREATE FULLTEXT INDEX engram_native_fact_text IF NOT EXISTS FOR (f:EngramFact) ON EACH [f.text, f.legacy_name]", serde_json::json!({})).await?;
         self.query("MATCH (:Entity)-[r:RELATES_TO]->(:Entity) UNWIND coalesce(r.episodes, []) AS episode MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL MATCH (m:EngramMemory {file: ep.file}) WHERE r.fact IS NOT NULL AND r.fact_embedding IS NOT NULL MERGE (f:EngramFact {memory_file: m.file, text: r.fact}) ON CREATE SET f.created_at = datetime(), f.valid_from = datetime() SET f.legacy_name = r.name, f.embedding = r.fact_embedding, f.embedding_updated_at = datetime(), f.valid_until = null, f.updated_at = datetime() MERGE (m)-[:HAS_FACT]->(f) RETURN count(DISTINCT f)", serde_json::json!({})).await?;
         Ok(())
