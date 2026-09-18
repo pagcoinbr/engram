@@ -51,6 +51,23 @@ pub struct ModelProfile {
     pub expected_dimension: Option<u32>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct RecommendedEmbedder {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub dimension: u32,
+    pub use_case: &'static str,
+}
+
+pub fn recommended_embedders() -> Vec<RecommendedEmbedder> {
+    vec![
+        RecommendedEmbedder { id: "bge-m3", label: "BGE-M3", dimension: 1024, use_case: "Current multilingual baseline." },
+        RecommendedEmbedder { id: "qwen3-embedding-0.6b", label: "Qwen3-Embedding-0.6B", dimension: 1024, use_case: "Alternative to benchmark for semantic precision." },
+        RecommendedEmbedder { id: "embeddinggemma-300m", label: "EmbeddingGemma-300M", dimension: 768, use_case: "Compact multilingual deployment." },
+        RecommendedEmbedder { id: "nomic-embed-text-v1.5", label: "Nomic Embed Text v1.5", dimension: 768, use_case: "Established lightweight local option." },
+    ]
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("could not read config: {0}")]
@@ -108,5 +125,9 @@ mod tests {
     fn llama_cpp_embeddings_require_an_endpoint() {
         let config: Config = serde_yaml::from_str("embed: {provider: llama_cpp, model: bge-m3, dim: 1024}\n").unwrap();
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn catalog_includes_the_bge_m3_baseline() {
+        assert!(recommended_embedders().iter().any(|item| item.id == "bge-m3" && item.dimension == 1024));
     }
 }

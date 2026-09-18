@@ -178,6 +178,12 @@ button, select { cursor: pointer; }
 .model-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; margin-top: 16px; }
 .model-card { padding: 16px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); }
 .model-card .metadata { margin-bottom: 0; }
+.recommendation-panel { margin-top: 15px; }
+.recommendation-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
+.recommendation-grid > div { padding: 12px; background: #101923; border: 1px solid #253447; border-radius: 8px; }
+.recommendation-grid strong { display: block; margin-bottom: 7px; color: #d9e6f4; font-size: 11px; }
+.recommendation-grid .badge { float: right; margin-top: -27px; }
+.recommendation-grid p { margin: 8px 0 0; color: var(--subtle); font-size: 10px; line-height: 1.45; }
 .config-page { max-width: 1000px; }
 .config-page h2 { margin: 6px 0 18px; font-size: 28px; letter-spacing: -.035em; }
 .config-json { max-height: 66vh; margin: 0; padding: 15px; overflow: auto; color: #c7d7e9; background: #0e151f; border: 1px solid #263549; border-radius: 9px; font: 11px/1.65 ui-monospace, "Cascadia Code", monospace; }
