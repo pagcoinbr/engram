@@ -141,6 +141,24 @@ mkdir -p "$CLAUDE/hooks"; install -m 0755 "$REPO"/bin/hooks/*.py "$CLAUDE/hooks/
 rm -rf "$CLAUDE/ui" "$CLAUDE/engram-ui.sh" 2>/dev/null || true
 say "engine installed into $CLAUDE (console: run $CLAUDE/engram-tui.py)"
 
+# Build the Rust API and command-line migration tools when Cargo is available.
+# Python services remain installed during the staged cutover, so a missing Rust
+# toolchain never turns an update into an outage.
+if command -v cargo >/dev/null; then
+  say "building Rust API and recall tools"
+  if (cd "$REPO" && cargo build --release -q -p engram-app); then
+    mkdir -p "$CLAUDE/rust"
+    for rust_bin in engram-app engram-index engram-mcp engram-recall engram-recall-hook; do
+      [[ -x "$REPO/target/release/$rust_bin" ]] && install -m 0755 "$REPO/target/release/$rust_bin" "$CLAUDE/rust/$rust_bin"
+    done
+    say "Rust executables installed into $CLAUDE/rust"
+  else
+    warn "Rust build failed — retaining the installed Python services"
+  fi
+else
+  warn "cargo not found — Rust API not installed; install Rust and re-run this installer"
+fi
+
 # ---- engram.yaml ----
 if [[ -f "$CLAUDE/engram.yaml" ]]; then
   say "engram.yaml exists — preserving it (edit by hand to change backend/tier)"
@@ -336,6 +354,7 @@ DENV
     fi
     chmod 600 "$DAEMON_ENV"
     sed "s|^ExecStart=.*|ExecStart=$(command -v python3) $CLAUDE/engram-daemon.py --once|" "$REPO/daemon/engram.service" > "$HOME/.config/systemd/user/engram.service"
+    sed "s|%h/.claude|$CLAUDE|g" "$REPO/daemon/engram-api.service" > "$HOME/.config/systemd/user/engram-api.service"
     cp "$REPO/daemon/engram.timer" "$HOME/.config/systemd/user/engram.timer"
     # Optional nightly Codex-gated curate+fixate APPLY (headless Claude). ExecStart is
     # templated to the real $CLAUDE path (honours ENGRAM_CLAUDE_HOME). Enabled (NOT
@@ -351,6 +370,11 @@ DENV
     fi
     if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable --now engram.timer 2>/dev/null; then
       say "systemd timer enabled (engram.timer); 'sudo loginctl enable-linger $USER' to run when logged out"
+      if [[ -x "$CLAUDE/rust/engram-app" ]]; then
+        systemctl --user enable --now engram-api.service 2>/dev/null \
+          && say "Rust API enabled on 127.0.0.1:8787" \
+          || warn "could not enable engram-api.service"
+      fi
       if [[ "${MEMORY_NIGHTLY_APPLY:-0}" == "1" ]]; then
         # enable --now is safe here: the timer is Persistent=false with a future
         # OnCalendar, so --now starts it ticking toward the next 03:37 and never
