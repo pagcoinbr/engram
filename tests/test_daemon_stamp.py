@@ -51,5 +51,19 @@ def test_real_tasks_defer_when_deps_down():
     print("ok — graph/vector/export/reconcile/harvest all defer explicitly")
 
 
+def test_graphiti_compat_uses_legacy_jobs():
+    """The selected reader and writer must address the same Graphiti index."""
+    d = tempfile.mkdtemp()
+    m = _load(Path(d) / "s.json", {})
+    m.cfg = lambda: {"graph": {"backend": "graphiti_compat"}}
+    m._neo4j_up = lambda: True
+    seen = []
+    m._run = lambda command, **_: seen.append(command) or 0
+    m.task_graph(); m.task_export(); m.task_reconcile()
+    assert all("graph_sync.py" in str(command[1]) for command in seen), seen
+    import shutil; shutil.rmtree(d)
+    print("ok — graphiti compatibility keeps the legacy writer/export/reconcile path")
+
+
 if __name__ == "__main__":
-    test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down()
+    test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down(); test_graphiti_compat_uses_legacy_jobs()
