@@ -257,6 +257,15 @@ if [[ "$WANT_GRAPH" == yes ]]; then
   say "start Neo4j: cd $CLAUDE/graph && NEO4J_PASSWORD=\$(grep -oP 'NEO4J_PASSWORD=\\K.*' .env) docker compose up -d"
 fi
 
+# Register Rust hybrid recall while retaining the graph server's admin tools.
+if command -v claude >/dev/null && [[ -x "$CLAUDE/rust/engram-mcp" ]]; then
+  if ! claude mcp list 2>/dev/null | grep -q '^engram-rust'; then
+    claude mcp add --scope user engram-rust "$CLAUDE/rust/engram-mcp" \
+      && say "registered Rust hybrid recall MCP server" \
+      || warn "could not register engram-rust MCP server"
+  else say "engram-rust MCP already registered"; fi
+fi
+
 # ---- vector venv + MCP (optional Qdrant index) ----
 if [[ "$WANT_VECTOR" == yes ]]; then
   VVENV="$CLAUDE/vector/venv"
@@ -311,7 +320,11 @@ if command -v jq >/dev/null; then
   merge_hook Stop "$CLAUDE/memory_session_curate.sh"
   # auto-recall: inject the memories relevant to each prompt (deduped per session).
   # Turn off with `recall.inject.enabled: false` in engram.yaml — no need to unmerge.
-  merge_hook UserPromptSubmit "$CLAUDE/hooks/memory-recall-inject.py"
+  if [[ -x "$CLAUDE/rust/engram-recall-hook" ]]; then
+    merge_hook UserPromptSubmit "$CLAUDE/rust/engram-recall-hook"
+  else
+    merge_hook UserPromptSubmit "$CLAUDE/hooks/memory-recall-inject.py"
+  fi
   say "hooks merged into settings.json"
 fi
 
