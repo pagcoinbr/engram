@@ -60,6 +60,7 @@ async fn main() -> ExitCode {
         let memories = load(directory).map_err(|error| error.to_string())?;
         let config = Config::load(&args.config).map_err(|error| error.to_string())?;
         let reasoning = OpenAiCompatibleClient::new(config.llama_cpp.url.clone()).map_err(|error| error.to_string())?;
+        let embeddings = OpenAiCompatibleClient::new(config.embed.url.clone()).map_err(|error| error.to_string())?;
         let mut count = 0;
         for memory in &memories {
             if count >= args.limit {
@@ -100,6 +101,13 @@ async fn main() -> ExitCode {
                 .replace_native_facts(&memory.file, &extracted)
                 .await
                 .map_err(|error| error.to_string())?;
+            let mut fact_vectors = Vec::new();
+            for fact in &extracted {
+                if let Ok(vector) = embeddings.embedding(&config.embed.model, fact).await {
+                    fact_vectors.push((fact.as_str(), vector));
+                }
+            }
+            client.set_native_fact_embeddings(&memory.file, &fact_vectors).await.map_err(|error| error.to_string())?;
             client
                 .replace_native_triples(&memory.file, &triples)
                 .await

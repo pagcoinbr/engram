@@ -182,7 +182,7 @@ impl GraphClient {
     ) -> Result<bool, GraphError> {
         let response = self
             .query(
-                "MATCH (m:EngramMemory {file: $file, sha: $sha, native_triple_version: 1}) RETURN count(m) > 0",
+                "MATCH (m:EngramMemory {file: $file, sha: $sha, native_triple_version: 2}) RETURN count(m) > 0",
                 serde_json::json!({"file": file, "sha": sha}),
             )
             .await?;
@@ -211,8 +211,23 @@ impl GraphClient {
         self.query("MATCH (m:EngramMemory {file: $file}) OPTIONAL MATCH (m)-[old:HAS_TRIPLE]->(obsolete:EngramTriple) WHERE NOT [triple IN $triples | triple.key] CONTAINS obsolete.key SET obsolete.valid_until = datetime(), obsolete.status = 'superseded' DELETE old WITH m UNWIND $triples AS triple MERGE (t:EngramTriple {memory_file: $file, key: triple.key}) ON CREATE SET t.valid_from = datetime(), t.created_at = datetime() SET t.subject = triple.subject, t.relation = triple.relation, t.object = triple.object, t.confidence = triple.confidence, t.temporal = triple.temporal, t.status = triple.status, t.valid_until = CASE WHEN triple.status = 'active' THEN null ELSE t.valid_until END, t.updated_at = datetime() MERGE (m)-[:HAS_TRIPLE]->(t) MERGE (subject:EngramEntity {name: toLower(triple.subject)}) MERGE (object:EngramEntity {name: toLower(triple.object)}) MERGE (t)-[:SUBJECT]->(subject) MERGE (t)-[:OBJECT]->(object) WITH t, triple WHERE triple.relation = 'supersedes' AND triple.status = 'active' MATCH (prior:EngramTriple {memory_file: $file, subject: triple.subject, relation: triple.relation}) WHERE prior.key <> t.key AND prior.valid_until IS NULL SET prior.valid_until = datetime(), prior.status = 'superseded'", serde_json::json!({"file": file, "triples": triples.iter().filter(|triple| is_valid_relation(&triple.relation)).map(|triple| serde_json::json!({"key": format!("{}|{}|{}", triple.subject.to_lowercase(), triple.relation, triple.object.to_lowercase()), "subject": triple.subject, "relation": triple.relation, "object": triple.object, "confidence": triple.confidence, "temporal": triple.temporal, "status": if triple.confidence >= 0.7 { "active" } else { "quarantined" }})).collect::<Vec<_>>() })).await?;
         Ok(())
     }
+    pub async fn set_native_fact_embeddings(
+        &self,
+        file: &str,
+        points: &[(&str, Vec<f32>)],
+    ) -> Result<(), GraphError> {
+        self.query("UNWIND $points AS point MATCH (f:EngramFact {memory_file: $file, text: point.text}) SET f.embedding = point.embedding, f.embedding_updated_at = datetime() RETURN count(f)", serde_json::json!({"file": file, "points": points.iter().map(|(text, embedding)| serde_json::json!({"text": text, "embedding": embedding})).collect::<Vec<_>>() })).await?;
+        Ok(())
+    }
+    pub async fn native_semantic_files(
+        &self,
+        vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<RecallHit>, GraphError> {
+        self.file_hits("MATCH (m:EngramMemory)-[:HAS_FACT]->(f:EngramFact) WHERE f.valid_until IS NULL AND f.embedding IS NOT NULL WITH m, f, vector.similarity.cosine(f.embedding, $vector) AS score WHERE score > 0 RETURN m.file AS file, collect(DISTINCT f.text) AS facts, max(score) AS score ORDER BY score DESC LIMIT $limit", serde_json::json!({"vector": vector, "limit": limit})).await
+    }
     pub async fn mark_native_triples_current(&self, file: &str) -> Result<(), GraphError> {
-        self.query("MATCH (m:EngramMemory {file: $file}) SET m.native_triple_version = 1, m.native_triples_synced_at = datetime() RETURN m.file", serde_json::json!({"file": file})).await?;
+        self.query("MATCH (m:EngramMemory {file: $file}) SET m.native_triple_version = 2, m.native_triples_synced_at = datetime() RETURN m.file", serde_json::json!({"file": file})).await?;
         Ok(())
     }
     async fn file_hits(
