@@ -115,6 +115,14 @@ impl GraphClient {
         ).await?;
         Ok(())
     }
+    pub async fn replace_native_facts(
+        &self,
+        file: &str,
+        facts: &[String],
+    ) -> Result<(), GraphError> {
+        self.query("MATCH (m:EngramMemory {file: $file}) OPTIONAL MATCH (m)-[old:HAS_FACT]->(:EngramFact) DELETE old WITH m UNWIND $facts AS fact MERGE (f:EngramFact {memory_file: $file, text: fact}) SET f.updated_at = datetime() MERGE (m)-[:HAS_FACT]->(f)", serde_json::json!({"file": file, "facts": facts})).await?;
+        Ok(())
+    }
     async fn file_hits(
         &self,
         statement: &str,

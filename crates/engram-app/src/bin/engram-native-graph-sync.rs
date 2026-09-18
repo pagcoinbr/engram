@@ -53,6 +53,10 @@ async fn main() -> ExitCode {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
+            client
+                .replace_native_facts(&memory.file, &facts(&memory.description, &memory.body))
+                .await
+                .map_err(|error| error.to_string())?;
         }
         Ok::<_, String>(memories.len())
     }
@@ -67,4 +71,14 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn facts(description: &str, body: &str) -> Vec<String> {
+    format!("{description} {body}")
+        .split(['.', '!', '?', '\n'])
+        .map(str::trim)
+        .filter(|fact| fact.len() >= 20)
+        .take(12)
+        .map(str::to_string)
+        .collect()
 }
