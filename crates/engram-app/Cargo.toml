@@ -16,6 +16,7 @@ engram-store = { path = "../engram-store" }
 engram-vector = { path = "../engram-vector" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 regex = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
