@@ -334,6 +334,7 @@ dependencies = [
  "engram-store",
  "engram-vector",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -93,6 +93,11 @@ embed:
   fastembed_model: "nomic-ai/nomic-embed-text-v1.5"
   dim: 768
 
+# Graph recall backend. Keep graphiti_compat during the parity window; it invokes
+# the pinned Graphiti recall path while Rust services handle the rest of Engram.
+graph:
+  backend: graphiti_compat       # graphiti_compat | native
+
 # OPTIONAL per-role model override. Leave empty to let `tier` decide. Pin a role
 # only if you want a specific model regardless of tier, e.g.:
 # experts:

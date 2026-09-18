@@ -5,7 +5,7 @@ use engram_retrieval::{bm25, rrf};
 use engram_store::{Memory, load};
 use engram_vector::QdrantClient;
 use serde::Serialize;
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, process::Command};
 
 #[derive(Serialize)]
 pub struct ResultItem {
@@ -37,29 +37,49 @@ pub async fn recall(
         .join("memory");
     let memories = load(store).map_err(|error| error.to_string())?;
     let mut legs = HashMap::new();
-    let keyword = bm25(&memories, query, k * 2)
-        .into_iter()
-        .map(|hit| hit.file)
-        .collect::<Vec<_>>();
-    legs.insert("keyword".into(), "ok".into());
-    let vector = vector_leg(&config, query, slug, k * 2, &mut legs).await;
-    let (graph, facts) = graph_leg(&config, query, k * 2, &mut legs).await;
+    let graphiti_compat = graph_backend(&config) == "graphiti_compat";
+    let keyword = if graphiti_compat {
+        legs.insert("keyword".into(), "disabled by graphiti_compat".into());
+        Vec::new()
+    } else {
+        legs.insert("keyword".into(), "ok".into());
+        bm25(&memories, query, k * 2)
+            .into_iter()
+            .map(|hit| hit.file)
+            .collect::<Vec<_>>()
+    };
+    let vector = if graphiti_compat {
+        legs.insert("vector".into(), "disabled by graphiti_compat".into());
+        Vec::new()
+    } else {
+        vector_leg(&config, query, slug, k * 2, &mut legs).await
+    };
+    let graph_limit = if graphiti_compat { k } else { k * 2 };
+    let (graph, facts) = graph_leg(&config, query, graph_limit, &mut legs).await;
     let by_file: HashMap<String, &Memory> = memories
         .iter()
         .map(|memory| (memory.file.clone(), memory))
         .collect();
-    let results = rrf(&[keyword.clone(), vector.clone(), graph.clone()], k, 60.0)
+    let ranked = if graphiti_compat {
+        graph.clone()
+    } else {
+        rrf(&[keyword.clone(), vector.clone(), graph.clone()], k, 60.0)
+            .into_iter()
+            .map(|hit| hit.file)
+            .collect()
+    };
+    let results = ranked
         .into_iter()
-        .filter_map(|hit| {
-            let memory = by_file.get(&hit.file)?;
+        .filter_map(|file| {
+            let memory = by_file.get(&file)?;
             let mut sources = Vec::new();
-            if keyword.contains(&hit.file) {
+            if keyword.contains(&file) {
                 sources.push("keyword".into());
             }
-            if vector.contains(&hit.file) {
+            if vector.contains(&file) {
                 sources.push("vector".into());
             }
-            if graph.contains(&hit.file) {
+            if graph.contains(&file) {
                 sources.push("graph".into());
             }
             Some(ResultItem {
@@ -76,6 +96,10 @@ pub async fn recall(
         facts,
         legs,
     })
+}
+
+fn graph_backend(config: &Config) -> String {
+    std::env::var("ENGRAM_GRAPH_BACKEND").unwrap_or_else(|_| config.graph.backend.clone())
 }
 
 async fn vector_leg(
@@ -119,6 +143,50 @@ async fn graph_leg(
     k: usize,
     legs: &mut HashMap<String, String>,
 ) -> (Vec<String>, Vec<String>) {
+    let backend = graph_backend(config);
+    if backend == "graphiti_compat" {
+        let graph_dir =
+            std::env::var("ENGRAM_GRAPH").unwrap_or_else(|_| "/root/.claude/graph".into());
+        let python = format!("{graph_dir}/venv/bin/python");
+        let interpreter = if Path::new(&python).is_file() {
+            python
+        } else {
+            "python3".into()
+        };
+        let output = Command::new(interpreter)
+            .arg(format!("{graph_dir}/memory_graph_recall.py"))
+            .arg(query)
+            .arg("--k")
+            .arg(k.to_string())
+            .arg("--json")
+            .output();
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let records = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+                .unwrap_or_default();
+            let files = records
+                .iter()
+                .filter_map(|row| row.get("file").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect();
+            let facts = records
+                .iter()
+                .flat_map(|row| {
+                    row.get("facts")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect();
+            legs.insert("graph".into(), "graphiti_compat".into());
+            return (files, facts);
+        }
+        legs.insert("graph".into(), "graphiti_compat unavailable".into());
+        return (Vec::new(), Vec::new());
+    }
     let password = std::env::var("NEO4J_PASSWORD").unwrap_or_default();
     if password.is_empty() {
         legs.insert("graph".into(), "password unavailable".into());

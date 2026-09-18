@@ -17,6 +17,8 @@ pub struct Config {
     pub embed: Embed,
     #[serde(default)]
     pub vector_store: VectorStore,
+    #[serde(default)]
+    pub graph: Graph,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -72,6 +74,24 @@ pub struct VectorStore {
     pub url: String,
     #[serde(default = "default_collection")]
     pub collection: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Graph {
+    #[serde(default = "default_graph_backend")]
+    pub backend: String,
+}
+
+fn default_graph_backend() -> String {
+    "native".into()
+}
+
+impl Default for Graph {
+    fn default() -> Self {
+        Self {
+            backend: default_graph_backend(),
+        }
+    }
 }
 
 fn default_qdrant_url() -> String {
@@ -173,6 +193,11 @@ impl Config {
         {
             return Err(ConfigError::Invalid(
                 "embed.url is required for llama_cpp/openai embeddings".into(),
+            ));
+        }
+        if !matches!(self.graph.backend.as_str(), "native" | "graphiti_compat") {
+            return Err(ConfigError::Invalid(
+                "graph.backend must be native or graphiti_compat".into(),
             ));
         }
         Ok(())

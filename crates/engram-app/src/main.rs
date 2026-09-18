@@ -67,6 +67,7 @@ struct RecallQuery {
 #[derive(Clone, Deserialize, Serialize)]
 struct EditableConfig {
     backend: String,
+    graph: GraphEdit,
     llama_cpp: LlamaCppEdit,
     embed: EmbedEdit,
 }
@@ -84,6 +85,11 @@ struct EmbedEdit {
     url: String,
     model: String,
     dim: u32,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct GraphEdit {
+    backend: String,
 }
 
 #[derive(Deserialize)]
@@ -257,6 +263,9 @@ fn editable(config: &Config) -> EditableConfig {
             model: config.embed.model.clone(),
             dim: config.embed.dim,
         },
+        graph: GraphEdit {
+            backend: config.graph.backend.clone(),
+        },
     }
 }
 
@@ -271,6 +280,7 @@ fn validate_edit(
     edit.llama_cpp.model = edit.llama_cpp.model.trim().to_string();
     edit.embed.model = edit.embed.model.trim().to_string();
     edit.embed.provider = edit.embed.provider.trim().to_lowercase();
+    edit.graph.backend = edit.graph.backend.trim().to_lowercase();
     if !matches!(
         edit.backend.as_str(),
         "ollama" | "claude" | "ccg" | "llama_cpp"
@@ -282,6 +292,9 @@ fn validate_edit(
         "" | "ollama" | "fastembed" | "llama_cpp" | "openai"
     ) {
         return Err("unsupported embedding provider".into());
+    }
+    if !matches!(edit.graph.backend.as_str(), "native" | "graphiti_compat") {
+        return Err("unsupported graph backend".into());
     }
     if edit.embed.dim == 0 || edit.llama_cpp.timeout_seconds == 0 {
         return Err("embedding dimension and timeout must be positive".into());
@@ -300,6 +313,9 @@ fn validate_edit(
             dim: edit.embed.dim,
             query_prefix: current.embed.query_prefix.clone(),
             document_prefix: current.embed.document_prefix.clone(),
+        },
+        graph: engram_config::Graph {
+            backend: edit.graph.backend.clone(),
         },
         ..current.clone()
     };
@@ -330,6 +346,7 @@ fn write_edit(path: &PathBuf, edit: &EditableConfig) -> Result<String, String> {
     for (section, values) in [
         ("llama_cpp", serde_yaml::to_value(&edit.llama_cpp)),
         ("embed", serde_yaml::to_value(&edit.embed)),
+        ("graph", serde_yaml::to_value(&edit.graph)),
     ] {
         let section_map = root
             .entry(section.into())
