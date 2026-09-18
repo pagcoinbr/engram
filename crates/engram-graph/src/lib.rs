@@ -101,6 +101,20 @@ impl GraphClient {
             serde_json::json!({"query": query, "limit": limit}),
         ).await
     }
+    pub async fn upsert_native_memory(
+        &self,
+        file: &str,
+        name: &str,
+        description: &str,
+        body: &str,
+        sha: &str,
+    ) -> Result<(), GraphError> {
+        self.query(
+            "MERGE (m:EngramMemory {file: $file}) SET m.name = $name, m.description = $description, m.body = $body, m.sha = $sha, m.updated_at = datetime() RETURN m.file",
+            serde_json::json!({"file": file, "name": name, "description": description, "body": body, "sha": sha}),
+        ).await?;
+        Ok(())
+    }
     async fn file_hits(
         &self,
         statement: &str,
