@@ -269,6 +269,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-retrieval"
+version = "0.1.0"
+dependencies = [
+ "engram-store",
+]
+
+[[package]]
+name = "engram-store"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
