@@ -8,7 +8,11 @@ license.workspace = true
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 engram-config = { path = "../engram-config" }
+engram-graph = { path = "../engram-graph" }
 engram-models = { path = "../engram-models" }
+engram-retrieval = { path = "../engram-retrieval" }
+engram-store = { path = "../engram-store" }
+engram-vector = { path = "../engram-vector" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
