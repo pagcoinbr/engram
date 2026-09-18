@@ -177,7 +177,10 @@ def task_vector():
     if not _qdrant_up():
         log("vector: Qdrant down — skipping insert")
         return False
-    _run([_vector_python(), str(ENGRAM_VECTOR / "vector_sync.py"), "--insert"])
+    rust_index = ENGRAM_BIN / "rust" / "engram-index"
+    if rust_index.is_file() and os.access(rust_index, os.X_OK):
+        return _run([str(rust_index), "--config", str(ENGRAM_BIN / "engram.yaml")]) == 0
+    return _run([_vector_python(), str(ENGRAM_VECTOR / "vector_sync.py"), "--insert"]) == 0
 
 def _generate_available() -> bool:
     """Can the configured backend (or its fallback) actually generate right now?
