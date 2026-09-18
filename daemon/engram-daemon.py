@@ -168,10 +168,11 @@ def task_graph():
     # for 7 nights (2026-08-08..08-14). memory_graph_insert commits per memory, so a
     # kill costs the in-flight memory, not the batch — size this for the cap, not for
     # safety. 25 @ ~40s measured (think:false, 2026-08-14) ~= 17 min, 3x headroom.
-    rust_sync = ENGRAM_BIN / "rust" / "engram-graph-sync"
+    rust_sync = ENGRAM_BIN / "rust" / "engram-native-graph-sync"
     if rust_sync.is_file() and os.access(rust_sync, os.X_OK):
+        slug = os.environ.get("CLAUDE_MEMORY_SLUG") or str(HOME).replace("/", "-")
         return _run([str(rust_sync), "--config", str(ENGRAM_BIN / "engram.yaml"),
-                     "--graph-dir", str(ENGRAM_GRAPH), "--limit", "25"]) == 0
+                     "--slug", slug, "--limit", "25"]) == 0
     return _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"),
                  "--insert", "--limit", "25"]) == 0
 

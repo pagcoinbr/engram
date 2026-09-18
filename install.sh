@@ -148,7 +148,7 @@ if command -v cargo >/dev/null; then
   say "building Rust API and recall tools"
   if (cd "$REPO" && cargo build --release -q -p engram-app --bins); then
     mkdir -p "$CLAUDE/rust"
-    for rust_bin in engram-app engram-graph-sync engram-index engram-lifecycle engram-mcp engram-native-graph-sync engram-recall engram-recall-hook; do
+    for rust_bin in engram-app engram-graph-sync engram-graph-recall-eval engram-index engram-lifecycle engram-mcp engram-native-graph-sync engram-recall engram-recall-hook; do
       [[ -x "$REPO/target/release/$rust_bin" ]] && install -m 0755 "$REPO/target/release/$rust_bin" "$CLAUDE/rust/$rust_bin"
     done
     say "Rust executables installed into $CLAUDE/rust"
