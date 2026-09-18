@@ -137,8 +137,8 @@ for f in "$REPO"/graph/*.py "$REPO"/graph/*.md "$REPO"/graph/docker-compose.yml;
 for f in "$REPO"/vector/*.py "$REPO"/vector/docker-compose.yml; do [[ -e "$f" ]] && install -m 0644 "$f" "$CLAUDE/vector/"; done
 install -m 0755 "$REPO"/daemon/engram-daemon.py "$CLAUDE"/ 2>/dev/null || true
 mkdir -p "$CLAUDE/hooks"; install -m 0755 "$REPO"/bin/hooks/*.py "$CLAUDE/hooks/" 2>/dev/null || true
-# the GUI (FastAPI + SPA) was replaced by engram-tui.py — clear it out on update
-rm -rf "$CLAUDE/ui" "$CLAUDE/engram_api.py" "$CLAUDE/engram-ui.sh" 2>/dev/null || true
+# Remove the legacy SPA; the optional Atlas imports the installed API module.
+rm -rf "$CLAUDE/ui" "$CLAUDE/engram-ui.sh" 2>/dev/null || true
 say "engine installed into $CLAUDE (console: run $CLAUDE/engram-tui.py)"
 
 # ---- engram.yaml ----

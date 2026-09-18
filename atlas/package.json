@@ -1,0 +1,19 @@
+{
+  "name": "engram-atlas",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite --host 127.0.0.1"
+  },
+  "dependencies": {
+    "cytoscape": "latest",
+    "cytoscape-fcose": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "vite": "latest"
+  }
+}
