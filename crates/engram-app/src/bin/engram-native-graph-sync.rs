@@ -5,7 +5,7 @@ use engram_models::OpenAiCompatibleClient;
 use engram_store::load;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, process::ExitCode};
+use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 #[derive(Parser)]
 struct Args {
@@ -88,7 +88,7 @@ async fn main() -> ExitCode {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            let extraction = reasoning.chat(&config.llama_cpp.model, &format!("Extract durable facts and typed triples. Return JSON only: {{\"facts\":[\"claim\"],\"triples\":[{{\"subject\":\"x\",\"relation\":\"uses\",\"object\":\"y\",\"confidence\":0.9,\"temporal\":\"current\"}}]}}. Relations must be one of: {}. Infer temporal as current when present tense applies, formerly for past or replaced states, and use supersedes when wording says replacement, migration, or succession. Confidence is 0 to 1; preserve uncertain triples.\n{}\n{}", RELATION_TAXONOMY.join(", "), memory.description, memory.body)).await.ok().and_then(|raw| serde_json::from_str::<Extraction>(&raw).ok()).unwrap_or(Extraction { facts: facts(&memory.description, &memory.body), triples: Vec::new() });
+            let extraction = tokio::time::timeout(Duration::from_secs(90), reasoning.chat(&config.llama_cpp.model, &format!("Extract durable facts and typed triples. Return JSON only: {{\"facts\":[\"claim\"],\"triples\":[{{\"subject\":\"x\",\"relation\":\"uses\",\"object\":\"y\",\"confidence\":0.9,\"temporal\":\"current\"}}]}}. Relations must be one of: {}. Infer temporal as current when present tense applies, formerly for past or replaced states, and use supersedes when wording says replacement, migration, or succession. Confidence is 0 to 1; preserve uncertain triples.\n{}\n{}", RELATION_TAXONOMY.join(", "), memory.description, memory.body))).await.ok().and_then(Result::ok).and_then(|raw| serde_json::from_str::<Extraction>(&raw).ok()).unwrap_or(Extraction { facts: facts(&memory.description, &memory.body), triples: Vec::new() });
             let extracted = if extraction.facts.is_empty() { facts(&memory.description, &memory.body) } else { extraction.facts };
             let source = format!("{}\n{}", memory.description, memory.body);
             let triples = extraction
