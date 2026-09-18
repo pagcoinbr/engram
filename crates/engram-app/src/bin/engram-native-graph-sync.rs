@@ -104,6 +104,10 @@ async fn main() -> ExitCode {
                 .replace_native_triples(&memory.file, &triples)
                 .await
                 .map_err(|error| error.to_string())?;
+            client
+                .mark_native_triples_current(&memory.file)
+                .await
+                .map_err(|error| error.to_string())?;
             count += 1;
         }
         Ok::<_, String>(count)

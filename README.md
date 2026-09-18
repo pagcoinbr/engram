@@ -18,7 +18,7 @@ It's not a flat notes file. It's a pipeline modeled on how human memory actually
 | **Systems consolidation** (hippocampus → neocortex) | `/memory-curate` — cluster narrow facts into class-level "umbrella" memories |
 | **Long-term potentiation / reconsolidation** | `/memory-fixate` — memories graduate *suspect → provisional → corroborated → fixed* |
 | **The forgetting curve / schema abstraction** | `distill` — compress clusters, drop noise (verbatim hard-facts preserved) |
-| **Associative recall** | a **Neo4j knowledge graph** (Graphiti) + embeddings — semantic + multi-hop + temporal |
+| **Associative recall** | a **Neo4j knowledge graph** with native Rust triples + embeddings — semantic + multi-hop + temporal |
 | **Immune system** | an injection guard that quarantines suspicious/poisoned memories |
 
 Your memories are plain Markdown files (`.md`) — the source of truth, readable and
@@ -216,7 +216,7 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 
 ### Recall — how the right memories reach Claude
 - **Auto-recall** (the `UserPromptSubmit` hook): every prompt gets the memories that match it injected automatically — no waiting for Claude to think of calling a recall tool. Names + one-line descriptions only, **at most once per memory per session**, ~0.3s, fail-open. The installer uses the Rust hook when available. Off with `recall.inject.enabled: false`.
-- **Rust hybrid recall** (`engram-rust` MCP): `memory_recall_hybrid` fuses Markdown, Qdrant, and Neo4j rankings via Reciprocal Rank Fusion. It is registered alongside the legacy graph MCP during the staged migration.
+- **Rust hybrid recall** (`engram-rust` MCP): `memory_recall_hybrid` fuses Markdown, Qdrant, and Neo4j rankings via Reciprocal Rank Fusion. Native triples use a controlled relation taxonomy, temporal state, and confidence quarantine; the legacy Graphiti MCP remains available only while parity evaluation is in progress.
 - **Graph recall** (`engram-graph` MCP): `memory_recall`, `memory_search_facts`, `memory_neighbors`, `memory_stats` — Claude loads only the relevant memories on demand, instead of dumping the whole store into context.
 - **Hybrid recall** (`memory_recall_hybrid`, on `engram-graph`): the best single recall — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename. Each ranker degrades independently; optional `type` filter.
 - **Vector recall** (the optional `engram-vector` MCP): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search via Qdrant. Plus `memory_recall_fused` (vector+keyword) for no-graph installs. Off by default; enable with `./install.sh --vector`.
@@ -251,7 +251,7 @@ queues. Pure stdlib `curses`, no server and no browser; saves and deletes go thr
         │                                            │  ▲                     │
         │                                     insert │  │ export (byte-exact) │
         ▼                                            ▼  │                     │
-   recall (MCP) ◀──────── memory_recall ◀─── Neo4j graph (Graphiti) ──────────┘
+   recall (MCP) ◀──────── memory_recall ◀─── Neo4j native triples ────────────┘
         ▲                                     associative / temporal
         └──── memory_vector_recall ◀─── Qdrant vector index (OPTIONAL) ───────┘
                                         dense semantic search + fast dedup
@@ -262,6 +262,21 @@ queues. Pure stdlib `curses`, no server and no browser; saves and deletes go thr
 > Both the graph and the vector index are **optional, rebuildable indexes** over the
 > `.md` store. With neither (or with their services down), engram still runs on pure
 > markdown. Add the vector index with `./install.sh --vector` (see [vector/README.md](vector/README.md)).
+
+### Native graph parity
+
+The native synchronizer is the daemon's preferred graph writer. It records typed
+triples with confidence, preserves replaced claims as history, and excludes
+quarantined claims from recall. After a native reindex, compare its recall to the
+legacy Graphiti index with:
+
+```bash
+source ~/.claude/graph/.env
+~/.claude/rust/engram-graph-recall-eval --cases ~/.claude/rust/graph_recall_eval.json
+```
+
+The evaluator exits non-zero until native recall contains every Graphiti hit in the
+representative query set.
 
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full data flow and **[CONFIG.md](CONFIG.md)** for `engram.yaml`.
 

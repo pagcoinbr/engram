@@ -151,6 +151,7 @@ if command -v cargo >/dev/null; then
     for rust_bin in engram-app engram-graph-sync engram-graph-recall-eval engram-index engram-lifecycle engram-mcp engram-native-graph-sync engram-recall engram-recall-hook; do
       [[ -x "$REPO/target/release/$rust_bin" ]] && install -m 0755 "$REPO/target/release/$rust_bin" "$CLAUDE/rust/$rust_bin"
     done
+    install -m 0644 "$REPO/tests/graph_recall_eval.json" "$CLAUDE/rust/graph_recall_eval.json"
     say "Rust executables installed into $CLAUDE/rust"
   else
     warn "Rust build failed — retaining the installed Python services"
