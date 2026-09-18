@@ -28,6 +28,18 @@ struct Args {
 #[derive(Deserialize)]
 struct Extraction {
     facts: Vec<String>,
+    #[serde(default)]
+    triples: Vec<Triple>,
+}
+#[derive(Deserialize)]
+struct Triple {
+    subject: String,
+    relation: String,
+    object: String,
+    #[serde(default)]
+    confidence: f64,
+    #[serde(default)]
+    temporal: String,
 }
 
 #[tokio::main]
@@ -63,7 +75,7 @@ async fn main() -> ExitCode {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            let extracted = reasoning.chat(&config.llama_cpp.model, &format!("Extract durable factual claims from this memory. Return JSON only: {{\"facts\":[\"claim\"]}}.\n{}\n{}", memory.description, memory.body)).await.ok().and_then(|raw| serde_json::from_str::<Extraction>(&raw).ok()).map(|value| value.facts).filter(|facts| !facts.is_empty()).unwrap_or_else(|| facts(&memory.description, &memory.body));
+            let extracted = reasoning.chat(&config.llama_cpp.model, &format!("Extract durable facts and typed triples. Return JSON only: {{\"facts\":[\"claim\"],\"triples\":[{{\"subject\":\"x\",\"relation\":\"uses\",\"object\":\"y\",\"confidence\":0.9,\"temporal\":\"current\"}}]}}.\n{}\n{}", memory.description, memory.body)).await.ok().and_then(|raw| serde_json::from_str::<Extraction>(&raw).ok()).map(|value| { let mut facts = value.facts; facts.extend(value.triples.into_iter().filter(|triple| triple.confidence >= 0.7).map(|triple| format!("{} {} {} ({})", triple.subject, triple.relation, triple.object, triple.temporal))); facts }).filter(|facts| !facts.is_empty()).unwrap_or_else(|| facts(&memory.description, &memory.body));
             client
                 .replace_native_facts(&memory.file, &extracted)
                 .await
