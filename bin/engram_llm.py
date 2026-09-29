@@ -214,6 +214,16 @@ def _llamacpp_generate(prompt: str, role: str, cfg) -> str:
         "max_tokens": int(lc.get("max_tokens", oc.get("num_predict", 8000))),
         "stream": False,
     }
+    # Thinking OFF unless explicitly opted in. engram's roles are EXTRACTION, not
+    # reasoning, and an unbounded CoT eats the whole max_tokens budget BEFORE the
+    # answer starts. Measured on Flash-Next 2026-08-30, same 60-word prompt:
+    #   thinking on  -> 1200 tokens, 4055 chars of CoT, ZERO answer chars (capped)
+    #   thinking off ->   68 tokens,    0 chars of CoT,  418 answer chars
+    # That is the same empty-content failure the ollama path already guards with
+    # `think: false`; without this the llama_cpp backend silently reintroduces it.
+    # Honours ollama.think so the flag stays in one place; llama_cpp.think wins.
+    if not lc.get("think", oc.get("think", False)):
+        body["chat_template_kwargs"] = {"enable_thinking": False}
     headers = {"Content-Type": "application/json"}
     if lc.get("api_key"):
         headers["Authorization"] = f"Bearer {lc['api_key']}"
@@ -395,8 +405,38 @@ def _ollama_host(cfg) -> str:
 def _timeout(cfg) -> int:
     return int(cfg.get("ollama", {}).get("timeout_seconds", 600))
 
+_PROBE_STAMP = Path(os.environ.get("ENGRAM_LOG_DIR", str(Path.home() / ".claude" / "logs"))) / "generate_probe.ts"
+_PROBE_EVERY = int(os.environ.get("ENGRAM_GENERATE_PROBE_EVERY", "86400"))   # seconds
+
+def _probe_due() -> bool:
+    """True when the last SUCCESSFUL real generate probe is older than _PROBE_EVERY."""
+    try:
+        import time as _t
+        return (_t.time() - float(_PROBE_STAMP.read_text().strip())) >= _PROBE_EVERY
+    except Exception:
+        return True
 _HEALTH_CACHE = {"t": 0.0, "result": None}
 _HEALTH_TTL = int(os.environ.get("ENGRAM_HEALTH_TTL", "600"))   # seconds
+
+
+def _llamacpp_model_loaded(cfg):
+    """True / False if a llama-swap proxy told us whether our model is resident;
+    None if this is a plain llama-server (no swap) or the endpoint is unreachable.
+    Only False is actionable — it means the proxy is up and the model is
+    intentionally unloaded, so a health probe must NOT drag it back into VRAM."""
+    lc = cfg.get("llama_cpp", {})
+    url = (lc.get("url") or "http://localhost:8080/v1").rstrip("/")
+    want = lc.get("model") or "local"
+    try:
+        with urllib.request.urlopen(f"{url}/models", timeout=10) as r:
+            for m in json.loads(r.read().decode()).get("data", []):
+                if m.get("id") == want:
+                    # plain llama-server has no status field -> None (unknown)
+                    v = (m.get("status") or {}).get("value")
+                    return None if v is None else v != "unloaded"
+    except Exception:
+        return None
+    return None
 
 def health(cfg=None, force=False) -> dict:
     """Reachability of the active generation backend + the embedding path. For the
@@ -419,7 +459,25 @@ def health(cfg=None, force=False) -> dict:
             # real round-trip through the proxy — a --version check wouldn't exercise auth
             _ccg_generate("reply ok", "triage", cfg)
         elif b == "llama_cpp":
-            _llamacpp_generate("reply ok", "triage", cfg)
+            # NEVER unconditionally generate here. Since 2026-08-30 :8081 is
+            # llama-swap, which loads the 80 GB model ON DEMAND — so a probe that
+            # generates *forces a load*, every _HEALTH_TTL (600s), forever. That
+            # silently undoes the UI's Unload button and makes any `ttl:` useless,
+            # which is the whole reason llama-swap is there (8 GB card, ~5.4 GB
+            # held; a game needs it back).
+            # So: ask the proxy for status first, and only pay a real round-trip
+            # when the model is ALREADY resident.
+            # BUT "unloaded" is also what a model that CANNOT load looks like
+            # (2026-09-11..16: NCMOE=47 OOMed at load, llama-swap answered
+            # /v1/models fine, health said generate:true for two weeks while
+            # harvest ERRORed every transcript). So pay one real load per day
+            # even when unloaded — harvest loads it daily anyway.
+            if _llamacpp_model_loaded(cfg) is False and not _probe_due():
+                pass          # proxy answered, model deliberately unloaded — healthy
+            else:
+                _llamacpp_generate("reply ok", "triage", cfg)
+                _PROBE_STAMP.parent.mkdir(parents=True, exist_ok=True)
+                _PROBE_STAMP.write_text(str(int(_time.time())))
         else:
             _ollama_generate("reply ok", "triage", cfg)
         out["generate"] = True

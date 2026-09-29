@@ -19,6 +19,8 @@
 set -uo pipefail
 source "${HOME}/.claude/memory_lib.sh" 2>/dev/null || true
 AI="${HOME}/.claude/memory_ai.py"
+# Pipeline stages need fastembed (embed path since ollama was dropped 2026-08-30); only the venv has it.
+PY="${HOME}/.claude/graph/venv/bin/python"; [[ -x "$PY" ]] || PY=python3
 LOGROOT="${HOME}/.claude/logs/fixation"
 PIPELOG="${HOME}/.claude/logs/pipeline.log"
 mkdir -p "$LOGROOT" "$(dirname "$PIPELOG")"
@@ -26,7 +28,7 @@ mkdir -p "$LOGROOT" "$(dirname "$PIPELOG")"
 log() { echo "[$(date -Iseconds)] $*" >> "$PIPELOG"; }
 
 # Master local switch.
-if [[ "$(python3 "$AI" --get local_enabled 2>/dev/null)" != "true" ]]; then
+if [[ "$("$PY" "$AI" --get local_enabled 2>/dev/null)" != "true" ]]; then
     log "local_enabled=false — pipeline skipped"; exit 0
 fi
 
@@ -42,7 +44,7 @@ log "pipeline start (apply='${APPLY:-dry}')"
 
 # ① Harvest new transcript turns into .staging/ (local qwen3-coder:30b).
 log "stage ① harvest"
-python3 "${HOME}/.claude/memory_harvest.py" >>"$PIPELOG" 2>&1 \
+"$PY" "${HOME}/.claude/memory_harvest.py" >>"$PIPELOG" 2>&1 \
     || log "stage ① harvest errored (see pipeline.log)"
 
 if (( HARVEST_ONLY )); then
@@ -51,12 +53,12 @@ fi
 
 # ②/④ Graduate clean staged candidates (or dry-run if auto_graduate.enabled=false).
 log "stage ②/④ graduate"
-python3 "${HOME}/.claude/memory_stage_apply.py" $APPLY >>"$PIPELOG" 2>&1 \
+"$PY" "${HOME}/.claude/memory_stage_apply.py" $APPLY >>"$PIPELOG" 2>&1 \
     || log "stage ②/④ graduate errored"
 
 # ⑤ Guarded skill auto-install (or dry-run if skill_autoinstall.enabled=false).
 log "stage ⑤ skill auto-install"
-python3 "${HOME}/.claude/memory_skill_autoinstall.py" $APPLY >>"$PIPELOG" 2>&1 \
+"$PY" "${HOME}/.claude/memory_skill_autoinstall.py" $APPLY >>"$PIPELOG" 2>&1 \
     || log "stage ⑤ skill auto-install errored"
 
 log "pipeline done"
