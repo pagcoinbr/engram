@@ -61,9 +61,86 @@ ORDER = ["health", "approvals", "harvest", "graph", "vector", "maintenance",
 def cfg():
     return memory_ai.load() if memory_ai else {}
 
+ENGRAM_CONFIG = Path(os.environ.get("ENGRAM_CONFIG") or (ENGRAM_BIN / "engram.yaml"))
+
+
+def memory_slug() -> str:
+    """The store this daemon owns. Mirrors memory_recall.resolve_slug, minus the
+    cwd step: a scheduled job's working directory says nothing about which project
+    it is indexing."""
+    s = (os.environ.get("CLAUDE_MEMORY_SLUG") or "").strip()
+    if s:
+        return s
+    try:
+        for line in (ENGRAM_BIN / "engram.env").read_text().splitlines():
+            line = line.strip().removeprefix("export ").strip()
+            if line.startswith("CLAUDE_MEMORY_SLUG="):
+                v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if v:
+                    return v
+    except Exception:
+        pass
+    return str(HOME).replace("/", "-")
+
+
+def graph_backend() -> str:
+    """The graph backend, resolved the SAME way the Rust reader resolves it.
+
+    ENGRAM_GRAPH_BACKEND was honoured only on the read side, so exporting it moved
+    recall to one index while this daemon kept writing to the other. And a config
+    with no `graph:` block defaults to graphiti_compat here, matching
+    engram-config: almost every upgraded install has no such block, and switching
+    those writes to the unproven native path is not something a default should do.
+    """
+    env = (os.environ.get("ENGRAM_GRAPH_BACKEND") or "").strip()
+    if env:
+        return env
+    return ((cfg().get("graph", {}) or {}).get("backend") or "graphiti_compat").strip()
+
+
 def graphiti_compat_enabled() -> bool:
     """Keep the Graphiti writer and reader on the same index during migration."""
-    return (cfg().get("graph", {}) or {}).get("backend") == "graphiti_compat"
+    return graph_backend() == "graphiti_compat"
+
+
+def rust_embedding_supported() -> bool:
+    """Whether the Rust binaries can serve the configured embedding provider.
+
+    They implement exactly one transport: an OpenAI-compatible /v1/embeddings
+    endpoint. Ollama, FastEmbed and the auto-selected default are all supported
+    engram configurations that only the PYTHON path can index — but the Rust binary
+    was preferred whenever it merely existed, so those installs had their indexing
+    routed to a binary that could not perform it. Mirrors
+    Config::rust_embedding_supported.
+
+    Reads the RAW file, not memory_ai.load(): that merges in a default
+    `llama_cpp.url` of localhost:8080, which Rust's own config model does not have.
+    Deciding from the merged view would claim an endpoint the binary will reject.
+    """
+    c = _raw_cfg()
+    embed = c.get("embed", {}) or {}
+    provider = (embed.get("provider") or "").strip().lower()
+    if provider == "openai":
+        provider = "llama_cpp"
+    if not provider:
+        provider = "ollama" if (c.get("backend") or "") == "ollama" else "fastembed"
+    url = (embed.get("url") or (c.get("llama_cpp", {}) or {}).get("url") or "").strip()
+    return provider == "llama_cpp" and bool(url)
+
+
+def _raw_cfg() -> dict:
+    """engram.yaml exactly as written, with no defaults merged in."""
+    try:
+        import yaml
+        return yaml.safe_load(ENGRAM_CONFIG.read_text()) or {}
+    except Exception:
+        return {}
+
+
+def _rust(name: str):
+    """An executable Rust binary, or None. Callers fall back to Python."""
+    path = ENGRAM_BIN / "rust" / name
+    return path if path.is_file() and os.access(path, os.X_OK) else None
 
 def intervals():
     iv = dict(DEFAULT_INTERVALS)
@@ -172,11 +249,13 @@ def task_graph():
     # for 7 nights (2026-08-08..08-14). memory_graph_insert commits per memory, so a
     # kill costs the in-flight memory, not the batch — size this for the cap, not for
     # safety. 25 @ ~40s measured (think:false, 2026-08-14) ~= 17 min, 3x headroom.
-    rust_sync = ENGRAM_BIN / "rust" / "engram-native-graph-sync"
-    if not graphiti_compat_enabled() and rust_sync.is_file() and os.access(rust_sync, os.X_OK):
-        slug = os.environ.get("CLAUDE_MEMORY_SLUG") or str(HOME).replace("/", "-")
-        return _run([str(rust_sync), "--config", str(ENGRAM_BIN / "engram.yaml"),
-                     "--slug", slug, "--limit", "25"]) == 0
+    rust_sync = _rust("engram-native-graph-sync")
+    if not graphiti_compat_enabled() and rust_sync and rust_embedding_supported():
+        return _run([str(rust_sync), "--config", str(ENGRAM_CONFIG),
+                     "--slug", memory_slug(), "--limit", "25"]) == 0
+    if not graphiti_compat_enabled() and rust_sync:
+        log(f"graph: native backend selected but the Rust sync cannot serve the "
+            f"configured embedding provider — using the Python path")
     return _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"),
                  "--insert", "--limit", "25"]) == 0
 
@@ -186,10 +265,10 @@ def task_vector():
     if not _qdrant_up():
         log("vector: Qdrant down — skipping insert")
         return False
-    rust_index = ENGRAM_BIN / "rust" / "engram-index"
-    if rust_index.is_file() and os.access(rust_index, os.X_OK):
-        slug = os.environ.get("CLAUDE_MEMORY_SLUG") or str(HOME).replace("/", "-")
-        return _run([str(rust_index), "--config", str(ENGRAM_BIN / "engram.yaml"), "--slug", slug]) == 0
+    rust_index = _rust("engram-index")
+    if rust_index and rust_embedding_supported():
+        return _run([str(rust_index), "--config", str(ENGRAM_CONFIG),
+                     "--slug", memory_slug()]) == 0
     return _run([_vector_python(), str(ENGRAM_VECTOR / "vector_sync.py"), "--insert"]) == 0
 
 def _generate_available() -> bool:
@@ -215,9 +294,9 @@ def task_harvest():
             pipe = c; break
     if not pipe:
         log("harvest: memory_pipeline.sh not found"); return False
-    rust_lifecycle = ENGRAM_BIN / "rust" / "engram-lifecycle"
+    rust_lifecycle = _rust("engram-lifecycle")
     ok = (_run([str(rust_lifecycle), "--bin", str(ENGRAM_BIN), "--mode", "harvest"]) == 0
-          if rust_lifecycle.is_file() and os.access(rust_lifecycle, os.X_OK)
+          if rust_lifecycle
           else _run(["bash", str(pipe)]) == 0)
     if ((cfg().get("telegram") or {}).get("activity_log")):
         gate = ENGRAM_BIN / "engram_telegram_gate.py"
@@ -243,8 +322,8 @@ def task_maintenance():
         log(f"maintenance: no dedicated fixate script — {sh.name} already ran in harvest; skipping duplicate")
         return
     if sh:
-        rust_lifecycle = ENGRAM_BIN / "rust" / "engram-lifecycle"
-        if sh.name == "memory_fixate_cron.sh" and rust_lifecycle.is_file() and os.access(rust_lifecycle, os.X_OK):
+        rust_lifecycle = _rust("engram-lifecycle")
+        if sh.name == "memory_fixate_cron.sh" and rust_lifecycle:
             return _run([str(rust_lifecycle), "--bin", str(ENGRAM_BIN), "--mode", "maintenance"]) == 0
         return _run(["bash", str(sh)]) == 0   # activity notify lives in task_harvest (encode is where the news is)
     log("maintenance: no maintenance script found (memory_fixate_cron.sh / memory_pipeline.sh)")
@@ -262,8 +341,8 @@ def task_curate():
         return False
     ac = ENGRAM_BIN / "memory_auto_curate.py"
     if ac.exists():
-        rust_lifecycle = ENGRAM_BIN / "rust" / "engram-lifecycle"
-        if rust_lifecycle.is_file() and os.access(rust_lifecycle, os.X_OK):
+        rust_lifecycle = _rust("engram-lifecycle")
+        if rust_lifecycle:
             return _run([str(rust_lifecycle), "--bin", str(ENGRAM_BIN), "--mode", "curate"]) == 0
         _run([_vector_python(), str(ac), "--apply"])
 
@@ -271,17 +350,17 @@ def task_curate():
 def task_export():
     if not _neo4j_up():
         return False
-    rust_sync = ENGRAM_BIN / "rust" / "engram-graph-sync"
-    if not graphiti_compat_enabled() and rust_sync.is_file() and os.access(rust_sync, os.X_OK):
-        return _run([str(rust_sync), "--config", str(ENGRAM_BIN / "engram.yaml"), "--graph-dir", str(ENGRAM_GRAPH), "--mode", "export"]) == 0
+    rust_sync = _rust("engram-graph-sync")
+    if not graphiti_compat_enabled() and rust_sync:
+        return _run([str(rust_sync), "--config", str(ENGRAM_CONFIG), "--graph-dir", str(ENGRAM_GRAPH), "--mode", "export"]) == 0
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--export", "--verify"])
 
 def task_reconcile():
     if not _neo4j_up():
         return False
-    rust_sync = ENGRAM_BIN / "rust" / "engram-graph-sync"
-    if not graphiti_compat_enabled() and rust_sync.is_file() and os.access(rust_sync, os.X_OK):
-        return _run([str(rust_sync), "--config", str(ENGRAM_BIN / "engram.yaml"), "--graph-dir", str(ENGRAM_GRAPH), "--mode", "reconcile"]) == 0
+    rust_sync = _rust("engram-graph-sync")
+    if not graphiti_compat_enabled() and rust_sync:
+        return _run([str(rust_sync), "--config", str(ENGRAM_CONFIG), "--graph-dir", str(ENGRAM_GRAPH), "--mode", "reconcile"]) == 0
     _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--reconcile"])
 
 def task_approvals():

@@ -148,9 +148,13 @@ if command -v cargo >/dev/null; then
   say "building Rust API and recall tools"
   if (cd "$REPO" && cargo build --release -q -p engram-app --bins); then
     mkdir -p "$CLAUDE/rust"
-    for rust_bin in engram-app engram-graph-compat engram-graph-sync engram-graph-recall-eval engram-index engram-lifecycle engram-mcp engram-native-graph-sync engram-recall engram-recall-hook; do
+    for rust_bin in engram-app engram-graph-sync engram-graph-recall-eval engram-index engram-lifecycle engram-mcp engram-native-graph-sync engram-recall engram-recall-hook; do
       [[ -x "$REPO/target/release/$rust_bin" ]] && install -m 0755 "$REPO/target/release/$rust_bin" "$CLAUDE/rust/$rust_bin"
     done
+    # engram-graph-compat was removed: the bounded Graphiti spawn now lives inside
+    # engram-hybrid, so there is one compatibility implementation, not two. Drop a
+    # copy left behind by an earlier install.
+    rm -f "$CLAUDE/rust/engram-graph-compat"
     install -m 0644 "$REPO/tests/graph_recall_eval.json" "$CLAUDE/rust/graph_recall_eval.json"
     say "Rust executables installed into $CLAUDE/rust"
   else
@@ -173,6 +177,14 @@ if [[ -f "$CLAUDE/engram.yaml" ]]; then
   if [[ -n "$NEWKEYS" ]]; then
     warn "new config keys available since your engram.yaml was written:${NEWKEYS}"
     warn "  -> compare $REPO/engram.yaml.example and add the blocks you want (e.g. auto_curate, telegram)."
+  fi
+  # A missing `graph:` block means the graph backend comes from code defaults, and
+  # that default decides which INDEX recall reads. It is graphiti_compat on both
+  # sides (Rust and the daemon) precisely so an upgrade keeps using the Graphiti
+  # index it already populated, but say so rather than leaving it implicit.
+  if ! grep -qE '^graph:' "$CLAUDE/engram.yaml"; then
+    say "no 'graph:' block in engram.yaml — staying on graphiti_compat (your existing index)"
+    say "  -> to try the native graph, add:  graph:\\n  backend: native"
   fi
 else
   sed -e "s|^backend: .*|backend: $BACKEND|" \
@@ -255,7 +267,9 @@ if [[ "$WANT_GRAPH" == yes ]]; then
   fi
   if command -v claude >/dev/null && [[ -x "$VENV/bin/python" ]]; then
     if ! claude mcp list 2>/dev/null | grep -q engram-graph; then
-      claude mcp add --scope user engram-graph "$VENV/bin/python" "$CLAUDE/graph/mg_mcp_server.py" \
+      claude mcp add --scope user engram-graph \
+        -e "ENGRAM_BIN=$CLAUDE" -e "ENGRAM_CONFIG=$CLAUDE/engram.yaml" -e "ENGRAM_GRAPH=$CLAUDE/graph" \
+        -- "$VENV/bin/python" "$CLAUDE/graph/mg_mcp_server.py" \
         && say "registered engram-graph MCP server" || warn "claude mcp add failed (register manually later)"
     else say "engram-graph MCP already registered"; fi
   else warn "claude CLI or graph venv missing — skipping MCP registration (run 'claude mcp add' later)"; fi
@@ -264,9 +278,14 @@ if [[ "$WANT_GRAPH" == yes ]]; then
 fi
 
 # Register Rust hybrid recall while retaining the graph server's admin tools.
+# The INSTALLATION paths are pinned into the entry (this install's config and graph
+# dir, which the server cannot otherwise know); the memory slug deliberately is NOT,
+# because it is per-project and the server resolves it from the session's directory.
 if command -v claude >/dev/null && [[ -x "$CLAUDE/rust/engram-mcp" ]]; then
   if ! claude mcp list 2>/dev/null | grep -q '^engram-rust'; then
-    claude mcp add --scope user engram-rust "$CLAUDE/rust/engram-mcp" \
+    claude mcp add --scope user engram-rust \
+      -e "ENGRAM_BIN=$CLAUDE" -e "ENGRAM_CONFIG=$CLAUDE/engram.yaml" -e "ENGRAM_GRAPH=$CLAUDE/graph" \
+      -- "$CLAUDE/rust/engram-mcp" \
       && say "registered Rust hybrid recall MCP server" \
       || warn "could not register engram-rust MCP server"
   else say "engram-rust MCP already registered"; fi
@@ -320,16 +339,41 @@ if command -v jq >/dev/null; then
   merge_hook(){ jq --arg e "$1" --arg c "$2" '.hooks //= {} | .hooks[$e] //= [] |
       if ([.hooks[$e][]?|.hooks[]?|.command]|index($c))==null then .hooks[$e] += [{"hooks":[{"type":"command","command":$c}]}] else . end' \
       "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"; }
+  # replace_hook EVENT WANTED OBSOLETE...: add WANTED and remove the named
+  # alternatives in ONE atomic rewrite.
+  #
+  # merge_hook only ever appends. An install that registered the Python recall hook
+  # and later gained the Rust binary ended up running BOTH, each with its own
+  # dedup state — duplicate work and duplicate injection on every prompt.
+  replace_hook(){
+    local event="$1" wanted="$2"; shift 2
+    local drop; drop="$(printf '%s\n' "$@" | jq -R . | jq -s .)"
+    jq --arg e "$event" --arg c "$wanted" --argjson drop "$drop" '
+      .hooks //= {} | .hooks[$e] //= []
+      # drop the obsolete commands wherever they sit in the nested shape
+      | .hooks[$e] = [ .hooks[$e][]
+          | if type == "object" and has("hooks")
+            then .hooks = [ .hooks[] | select(.command as $cmd | ($drop | index($cmd)) == null) ]
+            else . end
+          | select((type == "object" and has("hooks") and (.hooks | length) == 0) | not) ]
+      | if ([.hooks[$e][]?|.hooks[]?|.command]|index($c))==null
+        then .hooks[$e] += [{"hooks":[{"type":"command","command":$c}]}] else . end' \
+      "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+  }
   merge_hook SessionStart "$CLAUDE/memory_curate_check.sh"
   merge_hook SessionStart "$CLAUDE/codex-availability-warn.sh"
   merge_hook Stop "$CLAUDE/memory_agent.sh"
   merge_hook Stop "$CLAUDE/memory_session_curate.sh"
   # auto-recall: inject the memories relevant to each prompt (deduped per session).
   # Turn off with `recall.inject.enabled: false` in engram.yaml — no need to unmerge.
+  # Exactly ONE recall hook must be registered. Whichever implementation is
+  # chosen, the other is removed in the same rewrite.
   if [[ -x "$CLAUDE/rust/engram-recall-hook" ]]; then
-    merge_hook UserPromptSubmit "$CLAUDE/rust/engram-recall-hook"
+    replace_hook UserPromptSubmit "$CLAUDE/rust/engram-recall-hook" \
+      "$CLAUDE/hooks/memory-recall-inject.py"
   else
-    merge_hook UserPromptSubmit "$CLAUDE/hooks/memory-recall-inject.py"
+    replace_hook UserPromptSubmit "$CLAUDE/hooks/memory-recall-inject.py" \
+      "$CLAUDE/rust/engram-recall-hook"
   fi
   say "hooks merged into settings.json"
 fi
@@ -350,7 +394,10 @@ case "$DAEMON" in
     # PRESERVE operator secrets across re-installs (do NOT clobber them): the ccg key
     # and the Telegram approval-gate token/chat id live here and must survive.
     PRESERVED="$(grep -E '^(ENGRAM_CCG_KEY|ANTHROPIC_BASE_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)=' "$DAEMON_ENV" 2>/dev/null || true)"
-    { echo "ENGRAM_BIN=$CLAUDE"; echo "ENGRAM_GRAPH=$CLAUDE/graph"; echo "ENGRAM_CONFIG=$CLAUDE/engram.yaml"; echo "ENGRAM_LOG_DIR=$CLAUDE/logs";
+    # CLAUDE_MEMORY_SLUG must be here too: without it the daemon re-derives the
+    # slug from $HOME and ignores an operator pin, so scheduled jobs index a
+    # different store than the one interactive recall searches.
+    { echo "ENGRAM_BIN=$CLAUDE"; echo "ENGRAM_GRAPH=$CLAUDE/graph"; echo "ENGRAM_CONFIG=$CLAUDE/engram.yaml"; echo "ENGRAM_LOG_DIR=$CLAUDE/logs"; echo "CLAUDE_MEMORY_SLUG=$SLUG";
       [[ -x "$CLAUDE/graph/venv/bin/python" ]] && echo "ENGRAM_GRAPH_PYTHON=$CLAUDE/graph/venv/bin/python";
       [[ -x "$CLAUDE/vector/venv/bin/python" ]] && echo "ENGRAM_VECTOR_PYTHON=$CLAUDE/vector/venv/bin/python"; } > "$DAEMON_ENV"
     if [[ -n "$PRESERVED" ]]; then
