@@ -93,7 +93,11 @@ grep -q -- "--no-hermes) WANT_HERMES=\"no\"" "$REPO/install.sh" \
     && ok "--hermes documented in --help" || bad "--hermes missing from --help output"
 
 # ── 6. the graph venv must install mcp (mg_mcp_server.py imports it) ─────────
-grep -q '"mcp\[cli\]" graphiti-core' "$REPO/install.sh" \
+# The assertion is "the graph venv installs both mcp and graphiti-core", not
+# "they appear in this exact spelling": the literal pattern this used to match
+# stopped matching when graphiti-core gained a version pin, so it reported a
+# missing dependency that was in fact installed.
+grep -qE '"mcp\[cli\]".*graphiti-core' "$REPO/install.sh" \
     && ok "graph venv build includes mcp" \
     || bad "graph venv still built without mcp — engram-graph dies at import"
 

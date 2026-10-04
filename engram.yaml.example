@@ -81,22 +81,58 @@ llama_cpp:
   timeout_seconds: 600
   max_tokens: 8000
   api_key: ""                       # only if your llama-server requires one
+  enable_thinking: false            # true to let a reasoning model emit <think>; engram
+                                    # callers want JSON, and thinking eats the budget
 
-# Embeddings — local, never a paid API. The provider is chosen INDEPENDENTLY of the
-# generation backend, so backend: llama_cpp (or claude) can still embed via Ollama.
-#   provider: "" (auto: ollama when backend=ollama, else fastembed) | ollama | fastembed
-#   model:    Ollama embedding model override, e.g. "bge-m3" (1024-dim). Blank = nomic.
-#   dim:      MUST match the embedding model's output (nomic/fastembed=768, bge-m3=1024).
+# Embeddings — local by default, never a paid API. The provider is chosen
+# INDEPENDENTLY of the generation backend, so backend: llama_cpp (or claude) can
+# still embed via Ollama.
+#   provider: "" (auto: ollama when backend=ollama, else fastembed)
+#             | ollama | fastembed          -> served by the PYTHON indexer
+#             | llama_cpp | openai          -> any OpenAI-compatible /v1 endpoint,
+#                                              and the only providers the RUST
+#                                              indexer/graph-sync implement
+#   url:      required for llama_cpp/openai; blank falls back to llama_cpp.url
+#   model:    embedding model, e.g. "bge-m3" (1024-dim). Blank = nomic.
+#   dim:      MUST match the model's output (nomic/fastembed=768, bge-m3=1024).
+#             A mismatch is now an error rather than a silently wrong vector.
+#   query_prefix / document_prefix: asymmetric models (bge, e5, nomic) need these.
+#             Applied to queries and indexed documents respectively; changing
+#             either changes the embedding space and requires a reindex.
+#
+# NOTE: an EXPLICIT provider never falls back. If you name llama_cpp and the server
+# is down, embedding fails loudly instead of quietly answering from a different
+# model in a different dimension and poisoning the index.
 embed:
   provider: ""
+  url: ""
   model: ""
+  api_key: ""                    # only if your embedding server requires one
+  timeout_seconds: 0             # 0 = inherit llama_cpp.timeout_seconds, else 90
   fastembed_model: "nomic-ai/nomic-embed-text-v1.5"
   dim: 768
+  query_prefix: ""
+  document_prefix: ""
 
-# Graph recall backend. Keep graphiti_compat during the parity window; it invokes
-# the pinned Graphiti recall path while Rust services handle the rest of Engram.
+# Graph recall backend.
+#
+# graphiti_compat (the default, including when this whole block is absent) invokes
+# the pinned Graphiti recall path and returns ITS ordering untouched — the outer
+# keyword and vector legs are deliberately disabled so compatibility mode cannot
+# change Graphiti's ranking. It is compatibility, not hybrid fusion.
+#
+# native uses the Rust/Neo4j schema. Node identity includes the memory slug, so
+# switching to it needs a rebuild; it is still the unproven path.
 graph:
   backend: graphiti_compat       # graphiti_compat | native
+  neo4j_uri: "bolt://127.0.0.1:7687"
+  neo4j_database: "neo4j"
+  neo4j_user: "neo4j"
+  # Password normally lives in graph/.env (mode 600), written by the installer.
+  neo4j_password: ""
+  # Required for a NON-loopback Neo4j: basic-auth credentials must not cross a
+  # network in plaintext, so a remote host needs an explicit https endpoint.
+  neo4j_http_url: ""             # e.g. "https://neo.example:7473"
 
 # OPTIONAL per-role model override. Leave empty to let `tier` decide. Pin a role
 # only if you want a specific model regardless of tier, e.g.:
@@ -218,21 +254,31 @@ vector_store:
 # Each ranker degrades independently — a disabled/down backend just drops out.
 recall:
   scope_to_slug: true            # restrict vector/hybrid recall to the current store's slug
+  # Ceiling for ONE recall, used to bound the Graphiti child process so a stalled
+  # Neo4j can never hang a caller forever. This is NOT the per-prompt budget —
+  # that is inject.timeout_ms below, and it is deliberately much shorter. An
+  # explicit CLI/MCP/API recall may wait for a ~4s Graphiti query; a prompt may not.
+  timeout_ms: 15000
   hybrid:
     enabled: true
     k_rrf: 60                    # RRF constant (standard 60); damps low-rank contributions
     default_k: 6                 # how many fused memories a recall returns
     weights: { graph: 1.0, vector: 1.0, keyword: 1.0 }   # per-ranker RRF weight
-  # Auto-recall: the UserPromptSubmit hook (hooks/memory-recall-inject.py) puts the
-  # memories relevant to each prompt in front of Claude without waiting for it to
-  # call a recall tool. It injects NAMES + DESCRIPTIONS ONLY (never memory bodies)
-  # and never repeats a memory or a fact within one session, so a long session costs
-  # a few hundred tokens in total rather than k memories x every prompt.
+  # Auto-recall: the UserPromptSubmit hook (hooks/memory-recall-inject.py, or
+  # rust/engram-recall-hook) puts the memories relevant to each prompt in front of
+  # Claude without waiting for it to call a recall tool. It injects NAMES +
+  # DESCRIPTIONS ONLY (never memory bodies) and never repeats a memory or a fact
+  # within one session, so a long session costs a few hundred tokens in total
+  # rather than k memories x every prompt.
+  #
+  # Both hooks run in FAST mode — local BM25 + vector + one graph fact query, never
+  # the Graphiti child — because the full path cannot fit in this budget. A prompt
+  # that waits is worse than a prompt without recall, so the hook always fails open.
   inject:
     enabled: true                # false = hook goes quiet (no need to unmerge it)
     k: 4                         # memories per injection (post-dedup)
     max_facts: 6                 # 1-hop graph facts per injection
-    timeout_ms: 2500             # per-leg HTTP budget; past it the leg drops out
+    timeout_ms: 2500             # WALL-CLOCK budget for the whole injection
 
 # Local MCP servers wired into interactive sessions. The graph recall server
 # (graph/mcp_server.py) is registered by the installer as `engram-graph`; the

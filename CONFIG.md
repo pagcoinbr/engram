@@ -110,14 +110,35 @@ graph:
   backend: graphiti_compat       # graphiti_compat | native
 ```
 
-`graphiti_compat` is the production-safe migration choice. It calls the installed,
-pinned Graphiti recall path and returns its ordered results without RRF, preserving
-Graphiti behaviour exactly. It fails closed if that path is unavailable. `native`
-uses Rust's typed-triple and embedding index together with the usual hybrid RRF;
-use it for shadow evaluation until its representative recall evaluation reaches
-parity. `ENGRAM_GRAPH_BACKEND` temporarily overrides this setting for a process.
-The daemon uses the matching Graphiti writer, export, and reconciliation jobs while
-this backend is selected, so new memories remain visible to Graphiti recall.
+`graphiti_compat` is the production-safe migration choice, **and the default when
+the `graph:` block is absent** — which is the case for almost every install
+upgraded in place, since the installer never adds one. It calls the installed,
+pinned Graphiti recall path and returns its ordered results untouched.
+
+Note what that means concretely: in compatibility mode the outer **keyword and
+vector legs are disabled and there is no RRF**. The whole point is that
+compatibility mode cannot change Graphiti's ranking, so it is *compatibility*, not
+hybrid fusion — the `legs` map in a recall response says so explicitly
+(`"disabled: graphiti_compat preserves Graphiti ordering"`). It fails closed if the
+Graphiti path is unavailable, and the child process is bounded by
+`recall.timeout_ms`.
+
+`native` uses Rust's typed-triple and embedding index together with the usual
+hybrid RRF; use it for shadow evaluation until its recall evaluation reaches
+parity. Native node identity includes the memory store slug, so switching to it
+requires a graph rebuild.
+
+`ENGRAM_GRAPH_BACKEND` temporarily overrides this setting for a process, and is
+honoured by the **reader and the writer alike** — a daemon that wrote to one index
+while recall read the other produced a split brain that looked like missing
+memories. The daemon uses the matching writer, export, and reconciliation jobs for
+whichever backend is selected, so new memories remain visible to the recall path in
+use.
+
+The prompt hook is separate: it always runs in fast mode (local BM25 + vector + one
+graph fact query, never the Graphiti child) under the much shorter
+`recall.inject.timeout_ms` budget, because a prompt that waits is worse than a
+prompt without recall.
 
 ```yaml
 recall:
