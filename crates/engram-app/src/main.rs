@@ -15,20 +15,18 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     net::SocketAddr,
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Parser)]
 struct Args {
-    #[arg(
-        long,
-        env = "ENGRAM_CONFIG",
-        default_value = "/root/.claude/engram.yaml"
-    )]
-    config: PathBuf,
+    /// Path to engram.yaml. Resolved via engram-paths when omitted, so this binary
+    /// works for any user instead of only the root-owned install it was written on.
+    #[arg(long, env = "ENGRAM_CONFIG")]
+    config: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:8787")]
     bind: SocketAddr,
 }
@@ -48,6 +46,12 @@ struct ModelStatus {
     observed_model: Option<String>,
     observed_dimension: Option<usize>,
     index_compatible: Option<bool>,
+    /// Whether this provider was actually contacted.
+    ///
+    /// Without it, a client cannot distinguish "healthy" from "never checked": an
+    /// endpoint we decline to probe has no error, and Atlas rendered
+    /// `endpoint && !error` as a green badge for a server nothing had spoken to.
+    probed: bool,
     error: Option<String>,
 }
 
@@ -76,6 +80,11 @@ struct EditableConfig {
 struct LlamaCppEdit {
     url: String,
     model: String,
+    /// `serde(default)` plus a lenient number reader: a browser `<input
+    /// type="number">` yields a STRING, which used to fail deserialization with a
+    /// 422 before any validation ran, so the field the user edited was the one that
+    /// broke the save.
+    #[serde(deserialize_with = "lenient_u64")]
     timeout_seconds: u64,
 }
 
@@ -84,12 +93,39 @@ struct EmbedEdit {
     provider: String,
     url: String,
     model: String,
+    #[serde(deserialize_with = "lenient_u32")]
     dim: u32,
+    /// Editable because asymmetric embedding models are unusable without them and
+    /// the UI previously had no way to set them.
+    #[serde(default)]
+    query_prefix: String,
+    #[serde(default)]
+    document_prefix: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 struct GraphEdit {
     backend: String,
+}
+
+/// Accept `600` or `"600"`. See [`LlamaCppEdit::timeout_seconds`].
+fn lenient_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    use serde::de::Error;
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .ok_or_else(|| D::Error::custom("must be a non-negative whole number")),
+        serde_json::Value::String(text) => text
+            .trim()
+            .parse()
+            .map_err(|_| D::Error::custom("must be a whole number")),
+        _ => Err(D::Error::custom("must be a number")),
+    }
+}
+
+fn lenient_u32<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    use serde::de::Error;
+    u32::try_from(lenient_u64(deserializer)?).map_err(|_| D::Error::custom("value too large"))
 }
 
 #[derive(Deserialize)]
@@ -107,7 +143,7 @@ struct SaveRequest {
 struct EditorResponse {
     path: String,
     revision: String,
-    config: Config,
+    config: serde_json::Value,
     editable: EditableConfig,
     read_only: bool,
 }
@@ -131,18 +167,17 @@ struct SaveResponse {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    let config = engram_paths::config_path(args.config);
     let app = Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/v1/status", get(status))
         .route("/api/v1/models/recommended", get(recommended_models))
         .route("/api/v1/index/status", get(index_status))
-        .route("/api/v1/config", get(config))
+        .route("/api/v1/config", get(full_config))
         .route("/api/v1/config/editor", get(editor).put(save_editor))
         .route("/api/v1/config/editor/validate", post(validate_editor))
         .route("/api/v1/recall", get(recall_api))
-        .with_state(Arc::new(AppState {
-            config: args.config,
-        }));
+        .with_state(Arc::new(AppState { config }));
     let listener = tokio::net::TcpListener::bind(args.bind).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
@@ -154,8 +189,10 @@ async fn recommended_models() -> Json<Vec<engram_config::RecommendedEmbedder>> {
 #[derive(Serialize)]
 struct IndexStatus {
     enabled: bool,
+    local_enabled: bool,
     collection: String,
     dimension: u32,
+    embedding_space: String,
     points: Option<u64>,
     error: Option<String>,
 }
@@ -165,18 +202,19 @@ async fn index_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         Ok(config) => config,
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     };
+    // local_enabled is the documented master switch: with it off there is no index
+    // work at all, whatever vector_store says.
     let mut status = IndexStatus {
-        enabled: config.vector_store.enabled,
+        enabled: config.local_enabled && config.vector_store.enabled,
+        local_enabled: config.local_enabled,
         collection: config.vector_store.collection.clone(),
         dimension: config.embed.dim,
+        embedding_space: config.embedding_space_id(),
         points: None,
         error: None,
     };
     if status.enabled {
-        match QdrantClient::new(config.vector_store.url, config.vector_store.collection)
-            .count(None)
-            .await
-        {
+        match QdrantClient::from_config(&config).count(None).await {
             Ok(points) => status.points = Some(points),
             Err(error) => status.error = Some(error.to_string()),
         }
@@ -185,14 +223,18 @@ async fn index_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn editor(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let revision = match revision(&state.config) {
+        Ok(revision) => revision,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response(),
+    };
     match Config::load(&state.config) {
         Ok(config) => (
             StatusCode::OK,
             Json(EditorResponse {
                 path: state.config.display().to_string(),
-                revision: revision(&state.config),
+                revision,
                 editable: editable(&config),
-                config,
+                config: redacted_file(&state.config).unwrap_or(serde_json::Value::Null),
                 read_only: false,
             }),
         )
@@ -223,22 +265,36 @@ async fn save_editor(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SaveRequest>,
 ) -> impl IntoResponse {
-    if request.revision != revision(&state.config) {
-        return (
-            StatusCode::CONFLICT,
-            "configuration changed on disk; reload before saving",
-        )
-            .into_response();
+    // Everything from here to the rename happens under an exclusive lock. The
+    // revision check used to sit outside it, so two concurrent saves could both
+    // pass the check and the second would silently discard the first.
+    let _lock = match ConfigLock::acquire(&state.config) {
+        Ok(lock) => lock,
+        Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    };
+    match revision(&state.config) {
+        Ok(current) if current != request.revision => {
+            return (
+                StatusCode::CONFLICT,
+                "configuration changed on disk; reload before saving",
+            )
+                .into_response();
+        }
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response(),
+        Ok(_) => {}
     }
-    let Ok((edit, requires_reindex)) = validate_edit(&state.config, request.config) else {
-        return (StatusCode::BAD_REQUEST, "invalid configuration").into_response();
+    // Report WHY a save was rejected. This used to collapse to "invalid
+    // configuration", so Save gave no hint where Validate would have explained it.
+    let (edit, requires_reindex) = match validate_edit(&state.config, request.config) {
+        Ok(result) => result,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
     };
     match write_edit(&state.config, &edit) {
         Ok(backup) => (
             StatusCode::OK,
             Json(SaveResponse {
                 ok: true,
-                revision: revision(&state.config),
+                revision: revision(&state.config).unwrap_or_default(),
                 backup,
                 requires_reindex,
                 restart_required: true,
@@ -262,6 +318,8 @@ fn editable(config: &Config) -> EditableConfig {
             url: config.embed.url.clone(),
             model: config.embed.model.clone(),
             dim: config.embed.dim,
+            query_prefix: config.embed.query_prefix.clone(),
+            document_prefix: config.embed.document_prefix.clone(),
         },
         graph: GraphEdit {
             backend: config.graph.backend.clone(),
@@ -269,10 +327,7 @@ fn editable(config: &Config) -> EditableConfig {
     }
 }
 
-fn validate_edit(
-    path: &PathBuf,
-    mut edit: EditableConfig,
-) -> Result<(EditableConfig, bool), String> {
+fn validate_edit(path: &Path, mut edit: EditableConfig) -> Result<(EditableConfig, bool), String> {
     let current = Config::load(path).map_err(|error| error.to_string())?;
     edit.backend = edit.backend.trim().to_string();
     edit.llama_cpp.url = edit.llama_cpp.url.trim_end_matches('/').to_string();
@@ -305,37 +360,90 @@ fn validate_edit(
             url: edit.llama_cpp.url.clone(),
             model: edit.llama_cpp.model.clone(),
             timeout_seconds: edit.llama_cpp.timeout_seconds,
+            ..current.llama_cpp.clone()
         },
         embed: engram_config::Embed {
             provider: edit.embed.provider.clone(),
             url: edit.embed.url.clone(),
             model: edit.embed.model.clone(),
             dim: edit.embed.dim,
-            query_prefix: current.embed.query_prefix.clone(),
-            document_prefix: current.embed.document_prefix.clone(),
+            query_prefix: edit.embed.query_prefix.clone(),
+            document_prefix: edit.embed.document_prefix.clone(),
+            ..current.embed.clone()
         },
         graph: engram_config::Graph {
             backend: edit.graph.backend.clone(),
+            ..current.graph.clone()
         },
         ..current.clone()
     };
     candidate.validate().map_err(|error| error.to_string())?;
-    let prior = editable(&current);
-    let reindex = prior.embed.provider != edit.embed.provider
-        || prior.embed.url != edit.embed.url
-        || prior.embed.model != edit.embed.model
-        || prior.embed.dim != edit.embed.dim;
+    // Reindex is required whenever the embedding SPACE changes, which is more than
+    // the four fields previously compared — a prefix change silently moves every
+    // query into a different region of the space.
+    let reindex = candidate.embedding_space_id() != current.embedding_space_id();
     Ok((edit, reindex))
 }
 
-fn revision(path: &PathBuf) -> String {
+/// A content hash of the config, used for optimistic concurrency.
+///
+/// This used to swallow read errors into `""`. A client that also sent `""` then
+/// passed the equality check, so an unreadable config disabled the protection
+/// entirely; it is now an error.
+fn revision(path: &Path) -> Result<String, String> {
     fs::read(path)
         .map(|bytes| format!("{:x}", Sha256::digest(bytes))[..16].to_string())
-        .unwrap_or_default()
+        .map_err(|error| format!("could not read {}: {error}", path.display()))
 }
 
-fn write_edit(path: &PathBuf, edit: &EditableConfig) -> Result<String, String> {
+/// An exclusive lock around the read-validate-write sequence.
+///
+/// `O_EXCL` on a sibling lockfile, so no new dependency. A lock older than
+/// [`ConfigLock::STALE`] is assumed to belong to a crashed process and is broken —
+/// a config editor must not be permanently wedged by one bad exit.
+struct ConfigLock(PathBuf);
+
+impl ConfigLock {
+    const STALE: Duration = Duration::from_secs(30);
+    const ATTEMPTS: u32 = 50;
+
+    fn acquire(config: &Path) -> Result<Self, String> {
+        let path = config.with_extension("yaml.lock");
+        for _ in 0..Self::ATTEMPTS {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                        .is_some_and(|age| age > Self::STALE)
+                    {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(format!("could not lock configuration: {error}")),
+            }
+        }
+        Err("configuration is locked by another save; try again".into())
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn write_edit(path: &Path, edit: &EditableConfig) -> Result<String, String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let mode = metadata.permissions().mode();
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let mut raw: serde_yaml::Value =
         serde_yaml::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -343,6 +451,8 @@ fn write_edit(path: &PathBuf, edit: &EditableConfig) -> Result<String, String> {
         .as_mapping_mut()
         .ok_or("configuration must be a YAML mapping")?;
     root.insert("backend".into(), edit.backend.clone().into());
+    // Merge per section, leaving every key we do not model — including the api_key
+    // entries, which the edit payload deliberately has no field for — untouched.
     for (section, values) in [
         ("llama_cpp", serde_yaml::to_value(&edit.llama_cpp)),
         ("embed", serde_yaml::to_value(&edit.embed)),
@@ -361,36 +471,88 @@ fn write_edit(path: &PathBuf, edit: &EditableConfig) -> Result<String, String> {
             section_map.insert(key.clone(), value.clone());
         }
     }
-    let backup_dir = path
-        .parent()
-        .ok_or("configuration path has no parent")?
-        .join("backups/config");
+
+    let parent = path.parent().ok_or("configuration path has no parent")?;
+    let unique = unique_suffix();
+    let backup_dir = parent.join("backups/config");
     fs::create_dir_all(&backup_dir).map_err(|error| error.to_string())?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
-        .as_secs();
-    let backup = backup_dir.join(format!("engram.yaml.{stamp}.bak"));
-    fs::write(&backup, &bytes).map_err(|error| error.to_string())?;
-    let temp = path.with_extension("yaml.tmp");
-    fs::write(
-        &temp,
-        serde_yaml::to_string(&raw).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    fs::set_permissions(
-        &temp,
-        fs::Permissions::from_mode(metadata.permissions().mode()),
-    )
-    .map_err(|error| error.to_string())?;
-    fs::rename(temp, path).map_err(|error| error.to_string())?;
+    // Unique to the nanosecond and the pid. Second-granularity names collided
+    // between concurrent saves, and the Python fallback wrote a different naming
+    // scheme into the same directory.
+    let backup = backup_dir.join(format!("engram.yaml.{unique}.bak"));
+    write_private(&backup, &bytes, mode)?;
+
+    let temp = parent.join(format!(
+        "{}.{unique}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let rendered = serde_yaml::to_string(&raw).map_err(|error| error.to_string())?;
+    write_private(&temp, rendered.as_bytes(), mode)?;
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        error.to_string()
+    })?;
+    // fsync the directory too: without it the rename itself can be lost on a crash,
+    // leaving no config where there used to be a valid one.
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(backup.display().to_string())
 }
 
-async fn config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match Config::load(&state.config) {
-        Ok(config) => (StatusCode::OK, Json(config)).into_response(),
-        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+/// Write, preserving the source mode, and fsync before returning.
+fn write_private(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    // create_new honours the umask, so set the mode explicitly as well.
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())
+}
+
+fn unique_suffix() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "{}.{:09}.{}",
+        now.as_secs(),
+        now.subsec_nanos(),
+        std::process::id()
+    )
+}
+
+/// The whole config file, with secret-looking values masked.
+///
+/// Atlas shows this under a "Full configuration / Secrets redacted" heading. The
+/// typed `Config` is neither: it models about six of the file's twenty-odd
+/// sections, and nothing redacted anything on this path. Serving the real file
+/// through the shared detector makes both halves of that label true.
+fn redacted_file(path: &Path) -> Option<serde_json::Value> {
+    let text = fs::read_to_string(path).ok()?;
+    let (masked, _) = engram_secrets::redact(&text);
+    let value: serde_yaml::Value = serde_yaml::from_str(&masked).ok()?;
+    serde_json::to_value(value).ok()
+}
+
+async fn full_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Load first, so an invalid config still reports as invalid rather than being
+    // echoed back as if it were fine.
+    if let Err(error) = Config::load(&state.config) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
+    }
+    match redacted_file(&state.config) {
+        Some(value) => (StatusCode::OK, Json(value)).into_response(),
+        None => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "could not read configuration".to_string(),
+        )
+            .into_response(),
     }
 }
 
@@ -401,7 +563,7 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     };
     let mut models = Vec::new();
     for profile in config.profiles() {
-        models.push(probe(profile).await);
+        models.push(probe(&config, profile).await);
     }
     (
         StatusCode::OK,
@@ -417,20 +579,23 @@ async fn recall_api(
     Query(query): Query<RecallQuery>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    // A `-root` default made this endpoint search a store that only exists on one
+    // machine; resolve it the same way every other entry point does.
+    let slug = engram_paths::resolve_slug(query.slug.as_deref());
     match recall(
         &state.config,
-        query.slug.as_deref().unwrap_or("-root"),
+        &slug,
         &query.q,
         query.k.unwrap_or(6).clamp(1, 20),
     )
     .await
     {
         Ok(output) => (StatusCode::OK, Json(output)).into_response(),
-        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
     }
 }
 
-async fn probe(profile: ModelProfile) -> ModelStatus {
+async fn probe(config: &Config, profile: ModelProfile) -> ModelStatus {
     let mut status = ModelStatus {
         role: profile.role.into(),
         provider: profile.provider.clone(),
@@ -440,12 +605,27 @@ async fn probe(profile: ModelProfile) -> ModelStatus {
         observed_model: None,
         observed_dimension: None,
         index_compatible: None,
+        probed: false,
         error: None,
     };
-    if !matches!(profile.provider.as_str(), "llama_cpp" | "openai") || profile.endpoint.is_empty() {
+    // Only OpenAI-compatible endpoints can be probed with this client. Everything
+    // else is reported honestly as unprobed rather than as healthy.
+    let openai_compatible = matches!(profile.provider.as_str(), "llama_cpp" | "openai")
+        || (profile.role == "embedding" && config.embed_provider() == "llama_cpp");
+    if !openai_compatible || profile.endpoint.is_empty() {
         return status;
     }
-    match OpenAiCompatibleClient::new(profile.endpoint) {
+    status.probed = true;
+    let key = if profile.role == "embedding" {
+        config.embed.api_key.clone()
+    } else {
+        config.llama_cpp.api_key.clone()
+    };
+    match OpenAiCompatibleClient::new(profile.endpoint).map(|client| {
+        client
+            .with_api_key(key.present())
+            .with_timeout(config.embed_timeout_seconds())
+    }) {
         Ok(client) if profile.role == "embedding" => match client
             .probe(&profile.model, profile.expected_dimension)
             .await
@@ -464,4 +644,172 @@ async fn probe(profile: ModelProfile) -> ModelStatus {
         Err(error) => status.error = Some(error.to_string()),
     }
     status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edit() -> EditableConfig {
+        EditableConfig {
+            backend: "llama_cpp".into(),
+            graph: GraphEdit {
+                backend: "graphiti_compat".into(),
+            },
+            llama_cpp: LlamaCppEdit {
+                url: "http://ai/v1".into(),
+                model: "qwen".into(),
+                timeout_seconds: 600,
+            },
+            embed: EmbedEdit {
+                provider: "llama_cpp".into(),
+                url: "http://e/v1".into(),
+                model: "bge-m3".into(),
+                dim: 1024,
+                query_prefix: String::new(),
+                document_prefix: String::new(),
+            },
+        }
+    }
+
+    fn scratch(name: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("engram-app-test-{name}-{}", unique_suffix()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("engram.yaml");
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// A browser number input sends a string. That used to 422 the whole save.
+    #[test]
+    fn numeric_editor_fields_accept_strings_from_the_browser() {
+        let request: SaveRequest = serde_json::from_str(
+            r#"{"revision":"abc","config":{"backend":"llama_cpp",
+                "graph":{"backend":"native"},
+                "llama_cpp":{"url":"http://ai/v1","model":"q","timeout_seconds":"600"},
+                "embed":{"provider":"llama_cpp","url":"http://e/v1","model":"bge-m3","dim":"1024"}}}"#,
+        )
+        .expect("string numbers must deserialize");
+        assert_eq!(request.config.llama_cpp.timeout_seconds, 600);
+        assert_eq!(request.config.embed.dim, 1024);
+
+        // and real numbers still work
+        let request: EditRequest = serde_json::from_str(
+            r#"{"config":{"backend":"llama_cpp","graph":{"backend":"native"},
+                "llama_cpp":{"url":"http://ai/v1","model":"q","timeout_seconds":600},
+                "embed":{"provider":"llama_cpp","url":"http://e/v1","model":"bge-m3","dim":1024}}}"#,
+        )
+        .unwrap();
+        assert_eq!(request.config.embed.dim, 1024);
+
+        // junk is still rejected, just with a message instead of a silent 422
+        assert!(
+            serde_json::from_str::<EditRequest>(
+                r#"{"config":{"backend":"llama_cpp","graph":{"backend":"native"},
+                "llama_cpp":{"url":"http://ai/v1","model":"q","timeout_seconds":"soon"},
+                "embed":{"provider":"llama_cpp","url":"http://e/v1","model":"bge-m3","dim":1024}}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_prefix_change_requires_a_reindex() {
+        let path = scratch(
+            "prefix",
+            "backend: llama_cpp\nllama_cpp: {url: 'http://ai/v1', model: qwen, timeout_seconds: 600}\nembed: {provider: llama_cpp, url: 'http://e/v1', model: bge-m3, dim: 1024}\n",
+        );
+        let (_, reindex) = validate_edit(&path, edit()).unwrap();
+        assert!(!reindex, "an unchanged embedding space needs no reindex");
+
+        let mut changed = edit();
+        changed.embed.query_prefix = "query: ".into();
+        let (_, reindex) = validate_edit(&path, changed).unwrap();
+        assert!(reindex, "changing a prefix moves every query in the space");
+
+        let mut changed = edit();
+        changed.embed.model = "qwen3-embedding-0.6b".into();
+        let (_, reindex) = validate_edit(&path, changed).unwrap();
+        assert!(
+            reindex,
+            "a same-dimension model swap still changes the space"
+        );
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// The save path must leave credentials, comments-adjacent keys and unmodelled
+    /// sections alone. The api_key below has no editor field at all; losing it would
+    /// silently unauthenticate every model call.
+    #[test]
+    fn saving_preserves_unmodelled_keys_and_credentials() {
+        let path = scratch(
+            "preserve",
+            "backend: llama_cpp\nlocal_enabled: true\n\
+             llama_cpp: {url: 'http://ai/v1', model: qwen, timeout_seconds: 600, api_key: 'sk-keepme'}\n\
+             embed: {provider: llama_cpp, url: 'http://e/v1', model: bge-m3, dim: 1024}\n\
+             telegram: {bot_token: 'keep-this-too'}\n",
+        );
+        let mut next = edit();
+        next.embed.dim = 768;
+        write_edit(&path, &next).unwrap();
+
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("sk-keepme"), "credential dropped: {saved}");
+        assert!(
+            saved.contains("keep-this-too"),
+            "unmodelled section dropped: {saved}"
+        );
+        assert!(
+            saved.contains("local_enabled"),
+            "master switch dropped: {saved}"
+        );
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.embed.dim, 768, "the edit did not apply");
+        assert_eq!(reloaded.llama_cpp.api_key.present(), Some("sk-keepme"));
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn the_lock_is_exclusive_and_released_on_drop() {
+        let path = scratch("lock", "backend: ollama\n");
+        let first = ConfigLock::acquire(&path).unwrap();
+        assert!(
+            ConfigLock::acquire(&path).is_err(),
+            "two writers held the lock at once"
+        );
+        drop(first);
+        assert!(
+            ConfigLock::acquire(&path).is_ok(),
+            "the lock was not released"
+        );
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn an_unreadable_config_is_an_error_not_an_empty_revision() {
+        let missing = std::env::temp_dir().join("engram-app-test-absent/engram.yaml");
+        assert!(
+            revision(&missing).is_err(),
+            "a missing config must not hash to \"\", which any client could match"
+        );
+    }
+
+    #[test]
+    fn the_full_config_view_masks_secrets_across_every_section() {
+        let path = scratch(
+            "redact",
+            "backend: llama_cpp\n\
+             llama_cpp: {url: 'http://ai/v1', api_key: 'sk-abcdefghijklmnopqrstuv'}\n\
+             telegram: {bot_token: '123456:AAEkjhsdfkjhsdfkjhsdfkjhsdfkjhsdfkjh'}\n",
+        );
+        let rendered = serde_json::to_string(&redacted_file(&path).unwrap()).unwrap();
+        assert!(
+            !rendered.contains("sk-abcdefghijklmnopqrstuv"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("backend"), "non-secret keys must survive");
+        // and unmodelled sections are present, which the typed view dropped entirely
+        assert!(rendered.contains("telegram"), "{rendered}");
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
 }

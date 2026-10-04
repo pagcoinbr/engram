@@ -8,17 +8,21 @@ use std::{
 
 #[derive(Parser)]
 struct Args {
-    #[arg(
-        long,
-        env = "ENGRAM_CONFIG",
-        default_value = "/root/.claude/engram.yaml"
-    )]
-    config: PathBuf,
+    #[arg(long, env = "ENGRAM_CONFIG")]
+    config: Option<PathBuf>,
+    /// Default store for calls that do not name one. Resolved from the environment
+    /// and the session's working directory when omitted.
+    #[arg(long)]
+    slug: Option<String>,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    let config = engram_paths::config_path(args.config);
+    // An MCP server is started by the client inside the project directory, so the
+    // cwd-derived store is the right default; "-root" was correct on one machine.
+    let default_slug = engram_paths::resolve_slug_in_cwd(args.slug.as_deref());
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines().map_while(Result::ok) {
@@ -48,7 +52,8 @@ async fn main() {
                 call(
                     id,
                     request.get("params").unwrap_or(&Value::Null),
-                    &args.config,
+                    &config,
+                    &default_slug,
                 )
                 .await
             }
@@ -59,7 +64,7 @@ async fn main() {
     }
 }
 
-async fn call(id: &Value, params: &Value, config: &Path) -> Value {
+async fn call(id: &Value, params: &Value, config: &Path, default_slug: &str) -> Value {
     if !matches!(
         params.get("name").and_then(Value::as_str),
         Some("memory_recall" | "memory_recall_hybrid")
@@ -77,7 +82,9 @@ async fn call(id: &Value, params: &Value, config: &Path) -> Value {
     let slug = arguments
         .get("slug")
         .and_then(Value::as_str)
-        .unwrap_or("-root");
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or(default_slug);
     let k = arguments
         .get("k")
         .and_then(Value::as_u64)

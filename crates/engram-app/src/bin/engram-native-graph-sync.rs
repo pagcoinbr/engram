@@ -1,3 +1,12 @@
+//! Extract facts and typed triples from memories into the native Neo4j schema.
+//!
+//! Ordering matters here. The previous version stamped the memory's SHA in its
+//! FIRST write, before extraction, embeddings and triples had committed: a failure
+//! part-way through left the new SHA beside stale data, and the next run skipped the
+//! memory as current. Embedding errors were discarded outright, so a transient
+//! outage produced a permanently incomplete semantic index. The commit marker is
+//! now the last write, and a memory that fails any stage stays retryable.
+
 use clap::Parser;
 use engram_config::Config;
 use engram_graph::{GraphClient, NativeTriple, RELATION_TAXONOMY, is_valid_relation};
@@ -7,26 +16,27 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
+/// See `engram-index`: "this configuration is not mine to serve".
+const EXIT_UNSUPPORTED_PROVIDER: u8 = 3;
+
 #[derive(Parser)]
 struct Args {
-    #[arg(
-        long,
-        env = "ENGRAM_CONFIG",
-        default_value = "/root/.claude/engram.yaml"
-    )]
-    config: PathBuf,
-    #[arg(long, default_value = "-root")]
-    slug: String,
+    #[arg(long, env = "ENGRAM_CONFIG")]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    slug: Option<String>,
     #[arg(long, default_value_t = 25)]
     limit: usize,
     #[arg(long)]
     import_legacy_embeddings: bool,
-    #[arg(long, env = "NEO4J_URI", default_value = "bolt://127.0.0.1:7687")]
-    uri: String,
-    #[arg(long, env = "NEO4J_DATABASE", default_value = "neo4j")]
-    database: String,
+    /// Neo4j connection overrides. Omitted values come from engram.yaml and the
+    /// installer-managed graph/.env, so a normal install needs none of these.
+    #[arg(long)]
+    uri: Option<String>,
+    #[arg(long)]
+    database: Option<String>,
     #[arg(long, env = "NEO4J_PASSWORD")]
-    password: String,
+    password: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -35,6 +45,7 @@ struct Extraction {
     #[serde(default)]
     triples: Vec<Triple>,
 }
+
 #[derive(Deserialize)]
 struct Triple {
     subject: String,
@@ -49,115 +60,276 @@ struct Triple {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
-    let result = async {
-        let directory = args
-            .config
-            .parent()
-            .ok_or("configuration path has no parent")?
-            .join("projects")
-            .join(&args.slug)
-            .join("memory");
-        let client = GraphClient::new(&args.uri, &args.database, "neo4j", args.password)
-            .map_err(|error| error.to_string())?;
-        if args.import_legacy_embeddings {
-            client.import_legacy_fact_embeddings().await.map_err(|error| error.to_string())?;
-            return Ok::<_, String>(0);
-        }
-        let memories = load(directory).map_err(|error| error.to_string())?;
-        let config = Config::load(&args.config).map_err(|error| error.to_string())?;
-        let reasoning = OpenAiCompatibleClient::new(config.llama_cpp.url.clone()).map_err(|error| error.to_string())?;
-        let embeddings = OpenAiCompatibleClient::new(config.embed.url.clone()).map_err(|error| error.to_string())?;
-        let mut count = 0;
-        for memory in &memories {
-            if count >= args.limit {
-                break;
-            }
-            let sha = format!(
-                "{:x}",
-                Sha256::digest(
-                    format!("{}{}{}", memory.name, memory.description, memory.body).as_bytes()
-                )
-            );
-            if client
-                .native_memory_is_current(&memory.file, &sha)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                continue;
-            }
-            client
-                .upsert_native_memory(
-                    &memory.file,
-                    &memory.name,
-                    &memory.description,
-                    &memory.body,
-                    &sha,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            let extraction = tokio::time::timeout(Duration::from_secs(90), reasoning.chat(&config.llama_cpp.model, &format!("Extract durable facts and typed triples. Return JSON only: {{\"facts\":[\"claim\"],\"triples\":[{{\"subject\":\"x\",\"relation\":\"uses\",\"object\":\"y\",\"confidence\":0.9,\"temporal\":\"current\"}}]}}. Relations must be one of: {}. Infer temporal as current when present tense applies, formerly for past or replaced states, and use supersedes when wording says replacement, migration, or succession. Confidence is 0 to 1; preserve uncertain triples.\n{}\n{}", RELATION_TAXONOMY.join(", "), memory.description, memory.body))).await.ok().and_then(Result::ok).and_then(|raw| serde_json::from_str::<Extraction>(&raw).ok()).unwrap_or(Extraction { facts: facts(&memory.description, &memory.body), triples: Vec::new() });
-            let extracted = if extraction.facts.is_empty() { facts(&memory.description, &memory.body) } else { extraction.facts };
-            let source = format!("{}\n{}", memory.description, memory.body);
-            let triples = extraction
-                .triples
-                .into_iter()
-                .filter_map(|triple| normalize_triple(triple, &source))
-                .collect::<Vec<_>>();
-            client
-                .replace_native_facts(&memory.file, &extracted)
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut fact_vectors = Vec::new();
-            for fact in &extracted {
-                if let Ok(vector) = embeddings.embedding(&config.embed.model, fact).await {
-                    fact_vectors.push((fact.as_str(), vector));
-                }
-            }
-            client.set_native_fact_embeddings(&memory.file, &fact_vectors).await.map_err(|error| error.to_string())?;
-            client
-                .replace_native_triples(&memory.file, &triples)
-                .await
-                .map_err(|error| error.to_string())?;
-            client
-                .mark_native_triples_current(&memory.file)
-                .await
-                .map_err(|error| error.to_string())?;
-            count += 1;
-        }
-        Ok::<_, String>(count)
-    }
-    .await;
-    match result {
+    match run(args).await {
         Ok(count) => {
             println!("synced {count} native graph memories");
             ExitCode::SUCCESS
         }
-        Err(error) => {
+        Err(SyncError::UnsupportedProvider(message)) => {
+            eprintln!("engram-native-graph-sync: {message}");
+            ExitCode::from(EXIT_UNSUPPORTED_PROVIDER)
+        }
+        Err(SyncError::Other(error)) => {
             eprintln!("engram-native-graph-sync: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn normalize_triple(triple: Triple, source: &str) -> Option<NativeTriple> {
+enum SyncError {
+    UnsupportedProvider(String),
+    Other(String),
+}
+
+impl<T: Into<String>> From<T> for SyncError {
+    fn from(value: T) -> Self {
+        Self::Other(value.into())
+    }
+}
+
+async fn run(args: Args) -> Result<usize, SyncError> {
+    let config_path = engram_paths::config_path(args.config);
+    let slug = engram_paths::resolve_slug(args.slug.as_deref());
+    let config = Config::load(&config_path).map_err(|error| error.to_string())?;
+    if !config.local_enabled {
+        return Err("local_enabled is false".into());
+    }
+    // Fact embeddings go through the same OpenAI-compatible client as the indexer,
+    // so the same provider restriction applies. Refuse clearly instead of writing
+    // facts with no embeddings at all.
+    if !config.rust_embedding_supported() {
+        return Err(SyncError::UnsupportedProvider(format!(
+            "embedding provider '{}' is not implemented in Rust; use the Python graph sync",
+            config.embed_provider()
+        )));
+    }
+
+    // Credentials from config + graph/.env, with the CLI able to override.
+    let mut creds = config.graph.credentials();
+    if let Some(uri) = args.uri {
+        creds.uri = uri;
+    }
+    if let Some(database) = args.database {
+        creds.database = database;
+    }
+    if let Some(password) = args.password.filter(|value| !value.trim().is_empty()) {
+        creds.password = engram_config::Secret::new(password);
+    }
+    if creds.password.is_empty() {
+        return Err(
+            "no Neo4j password: set NEO4J_PASSWORD, graph.neo4j_password, or graph/.env".into(),
+        );
+    }
+    let client = GraphClient::from_credentials(&creds).map_err(|error| error.to_string())?;
+
+    if args.import_legacy_embeddings {
+        client
+            .import_legacy_fact_embeddings(&slug)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(0);
+    }
+
+    let memories =
+        load(engram_paths::store_dir(&config_path, &slug)).map_err(|error| error.to_string())?;
+    let reasoning = OpenAiCompatibleClient::new(config.llama_cpp.url.clone())
+        .map_err(|error| error.to_string())?
+        .with_api_key(config.llama_cpp.api_key.present())
+        .with_timeout(config.llama_cpp.timeout_seconds)
+        .with_max_tokens(config.llama_cpp.max_tokens);
+    let embeddings = OpenAiCompatibleClient::new(config.embed_endpoint())
+        .map_err(|error| error.to_string())?
+        .with_api_key(config.embed.api_key.present())
+        .with_timeout(config.embed_timeout_seconds());
+    let space = config.embedding_space_id();
+
+    // Retire graph data for memories that left the store. Only on a full pass:
+    // a --limit run has not looked at everything, so it cannot conclude a file is
+    // gone.
+    let full_pass = args.limit >= memories.len();
+    if full_pass {
+        let present: Vec<String> = memories.iter().map(|memory| memory.file.clone()).collect();
+        client
+            .prune_missing_memories(&slug, &present)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    let mut count = 0;
+    let mut failures = Vec::new();
+    for memory in &memories {
+        if count >= args.limit {
+            break;
+        }
+        // The embedding space is part of the freshness key: a model swap at the
+        // same dimension must invalidate stored fact vectors.
+        let sha = format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "{space}\u{0}{}\u{0}{}\u{0}{}",
+                    memory.name, memory.description, memory.body
+                )
+                .as_bytes()
+            )
+        );
+        if client
+            .native_memory_is_current(&slug, &memory.file, &sha, &space)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            continue;
+        }
+        // One memory's failure must not abandon the batch, and must not mark it
+        // current. It is simply retried on the next run.
+        match sync_memory(
+            &client,
+            &config,
+            &reasoning,
+            &embeddings,
+            &slug,
+            &space,
+            &sha,
+            memory,
+        )
+        .await
+        {
+            Ok(()) => count += 1,
+            Err(error) => failures.push(format!("{}: {error}", memory.file)),
+        }
+    }
+    if !failures.is_empty() {
+        eprintln!(
+            "engram-native-graph-sync: {} memory(ies) left for retry — {}",
+            failures.len(),
+            failures.join("; ")
+        );
+    }
+    Ok(count)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_memory(
+    client: &GraphClient,
+    config: &Config,
+    reasoning: &OpenAiCompatibleClient,
+    embeddings: &OpenAiCompatibleClient,
+    slug: &str,
+    space: &str,
+    sha: &str,
+    memory: &engram_store::Memory,
+) -> Result<(), String> {
+    // Redact before anything leaves the box. The reasoning endpoint may be remote
+    // and Neo4j keeps whatever it is given; imported and hand-edited memories never
+    // passed the save-time guard, so this is the only place that can catch them.
+    let (safe_description, _) = engram_secrets::redact(&memory.description);
+    let (safe_body, _) = engram_secrets::redact(&memory.body);
+
+    let prompt = format!(
+        "Extract durable facts and typed triples. Return JSON only: \
+         {{\"facts\":[\"claim\"],\"triples\":[{{\"subject\":\"x\",\"relation\":\"uses\",\"object\":\"y\",\"confidence\":0.9,\"temporal\":\"current\"}}]}}. \
+         Relations must be one of: {}. Infer temporal as current when present tense applies, formerly for past or replaced states, \
+         and use supersedes when wording says replacement, migration, or succession. Confidence is 0 to 1; preserve uncertain triples.\n{}\n{}",
+        RELATION_TAXONOMY.join(", "),
+        safe_description,
+        safe_body
+    );
+    let extraction = tokio::time::timeout(
+        Duration::from_secs(90),
+        reasoning.chat(&config.llama_cpp.model, &prompt),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(|raw| serde_json::from_str::<Extraction>(&raw).ok())
+    .unwrap_or(Extraction {
+        facts: facts(&safe_description, &safe_body),
+        triples: Vec::new(),
+    });
+    let extracted = if extraction.facts.is_empty() {
+        facts(&safe_description, &safe_body)
+    } else {
+        extraction.facts
+    };
+    let triples = extraction
+        .triples
+        .into_iter()
+        .filter_map(normalize_triple)
+        .collect::<Vec<_>>();
+
+    client
+        .upsert_native_memory(
+            slug,
+            &memory.file,
+            &memory.name,
+            &safe_description,
+            &safe_body,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    client
+        .replace_native_facts(slug, &memory.file, &extracted)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    // Every fact must embed. Discarding failures here is what produced a
+    // permanently half-indexed memory that nothing would revisit.
+    let mut fact_vectors = Vec::new();
+    for fact in &extracted {
+        let vector = embeddings
+            .embedding(&config.embed.model, &config.document_text(fact))
+            .await
+            .map_err(|error| format!("embedding failed: {error}"))?;
+        fact_vectors.push((fact.as_str(), vector));
+    }
+    client
+        .set_native_fact_embeddings(slug, &memory.file, &fact_vectors)
+        .await
+        .map_err(|error| error.to_string())?;
+    client
+        .replace_native_triples(slug, &memory.file, &triples)
+        .await
+        .map_err(|error| error.to_string())?;
+    // Last: everything above committed, so this memory really is current.
+    client
+        .mark_native_memory_current(slug, &memory.file, sha, space)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Clean up one extracted triple and settle its tense.
+///
+/// The tense heuristic reads the TRIPLE, not the whole memory. Scanning the entire
+/// body for `"was "` or `"previously"` marked every triple in that memory as a past
+/// state — one historical sentence in a long memory retired all of its current
+/// claims.
+fn normalize_triple(triple: Triple) -> Option<NativeTriple> {
     let relation = triple
         .relation
         .trim()
         .to_lowercase()
         .replace([' ', '-'], "_");
-    let source = source.to_lowercase();
+    let text = format!(
+        "{} {} {}",
+        triple.subject.trim(),
+        relation,
+        triple.object.trim()
+    )
+    .to_lowercase();
     let temporal = match triple.temporal.trim().to_lowercase().as_str() {
-        "formerly" | "former" | "past" => "formerly",
+        "formerly" | "former" | "past" | "historical" => "formerly",
         "superseded" | "supersedes" => "supersedes",
+        "current" | "present" => "current",
+        // No usable tense from the model: fall back to the triple's own wording.
         _ if ["superseded", "replaced by", "migrated to", "succeeded by"]
             .iter()
-            .any(|phrase| source.contains(phrase)) =>
+            .any(|phrase| text.contains(phrase)) =>
         {
             "supersedes"
         }
         _ if ["formerly", "previously", "used to", "was "]
             .iter()
-            .any(|phrase| source.contains(phrase)) =>
+            .any(|phrase| text.contains(phrase)) =>
         {
             "formerly"
         }
@@ -194,25 +366,75 @@ fn facts(description: &str, body: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn triple(
+        subject: &str,
+        relation: &str,
+        object: &str,
+        temporal: &str,
+        confidence: f64,
+    ) -> Triple {
+        Triple {
+            subject: subject.into(),
+            relation: relation.into(),
+            object: object.into(),
+            confidence,
+            temporal: temporal.into(),
+        }
+    }
+
     #[test]
-    fn normalizes_temporal_language_and_quarantines_invalid_relations() {
-        let triple = Triple {
-            subject: "Engram".into(),
-            relation: "uses".into(),
-            object: "Neo4j".into(),
-            confidence: 0.4,
-            temporal: String::new(),
-        };
-        let value = normalize_triple(triple, "Engram previously used Neo4j.").unwrap();
+    fn keeps_the_models_tense_when_it_gives_one() {
+        let value = normalize_triple(triple("Engram", "uses", "Neo4j", "formerly", 0.4)).unwrap();
         assert_eq!(value.temporal, "formerly");
         assert_eq!(value.confidence, 0.4);
-        let invalid = Triple {
-            subject: "Engram".into(),
-            relation: "guesses".into(),
-            object: "Neo4j".into(),
-            confidence: 1.0,
-            temporal: String::new(),
-        };
-        assert!(normalize_triple(invalid, "").is_none());
+
+        let current = normalize_triple(triple("Engram", "uses", "Neo4j", "current", 0.9)).unwrap();
+        assert_eq!(current.temporal, "current");
+    }
+
+    #[test]
+    fn rejects_relations_outside_the_taxonomy() {
+        assert!(normalize_triple(triple("Engram", "guesses", "Neo4j", "", 1.0)).is_none());
+        // and incomplete triples
+        assert!(normalize_triple(triple("", "uses", "Neo4j", "", 1.0)).is_none());
+        assert!(normalize_triple(triple("Engram", "uses", "  ", "", 1.0)).is_none());
+    }
+
+    #[test]
+    fn normalizes_relation_spelling() {
+        let value = normalize_triple(triple("a", "Runs-On", "b", "current", 0.9)).unwrap();
+        assert_eq!(value.relation, "runs_on");
+    }
+
+    /// The scoping bug: the tense heuristic must read the triple, not the memory.
+    /// A memory containing one "was ..." sentence used to have EVERY triple marked
+    /// historical, retiring claims that were still true.
+    #[test]
+    fn the_tense_heuristic_reads_only_the_triple() {
+        // The model gave no tense, and nothing in the triple says "past".
+        let current = normalize_triple(triple("api", "runs_on", "host-b", "", 0.9)).unwrap();
+        assert_eq!(
+            current.temporal, "current",
+            "an unrelated past-tense sentence elsewhere must not age this claim"
+        );
+
+        // Wording inside the triple itself still works.
+        let past =
+            normalize_triple(triple("api", "runs_on", "host-a (previously)", "", 0.9)).unwrap();
+        assert_eq!(past.temporal, "formerly");
+    }
+
+    #[test]
+    fn replacement_wording_in_the_triple_becomes_supersedes() {
+        let value = normalize_triple(triple(
+            "postgres-16",
+            "uses",
+            "replaced by nothing",
+            "",
+            0.9,
+        ))
+        .unwrap();
+        assert_eq!(value.relation, "supersedes");
+        assert_eq!(value.temporal, "supersedes");
     }
 }

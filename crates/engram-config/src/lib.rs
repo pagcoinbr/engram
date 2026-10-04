@@ -1,14 +1,37 @@
+//! The typed view of `engram.yaml`.
+//!
+//! Only part of the file is modelled — the rest stays in the YAML and is preserved
+//! verbatim on save — but everything the Rust binaries *act on* has to be here.
+//! Fields that were missing caused real failures rather than mere omissions:
+//! `local_enabled` is the documented master kill-switch and was ignored; the
+//! `api_key` entries were in the shipped example and dropped, so authenticated
+//! model and Qdrant Cloud calls went out unauthenticated; `recall.inject` was
+//! parsed by the Python hook and hard-coded in the Rust one.
+
+mod secret;
+pub use secret::Secret;
+
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, fs, path::Path};
 use thiserror::Error;
 use url::Url;
 
 pub const CONFIG_VERSION: u32 = 1;
 
+/// Embedding providers implemented by the Rust crates. Anything else is a valid
+/// engram configuration that the *Python* path has to serve — see
+/// [`Config::rust_embedding_supported`].
+pub const RUST_EMBED_PROVIDERS: [&str; 2] = ["llama_cpp", "openai"];
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Config {
     #[serde(default)]
     pub config_version: u32,
+    /// The master switch. False means "do no automated memory work", and it
+    /// outranks `vector_store.enabled` and everything else.
+    #[serde(default = "default_true")]
+    pub local_enabled: bool,
     #[serde(default = "default_backend")]
     pub backend: String,
     #[serde(default)]
@@ -19,6 +42,8 @@ pub struct Config {
     pub vector_store: VectorStore,
     #[serde(default)]
     pub graph: Graph,
+    #[serde(default)]
+    pub recall: Recall,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -29,6 +54,10 @@ pub struct LlamaCpp {
     pub model: String,
     #[serde(default)]
     pub timeout_seconds: u64,
+    #[serde(default)]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub api_key: Secret,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -41,29 +70,16 @@ pub struct Embed {
     pub model: String,
     #[serde(default = "default_dimension")]
     pub dim: u32,
+    /// Asymmetric models (bge, e5, nomic) need these, and applying them to only one
+    /// side indexes documents and queries into different sub-spaces.
     #[serde(default)]
     pub query_prefix: String,
     #[serde(default)]
     pub document_prefix: String,
-}
-
-fn default_backend() -> String {
-    "ollama".into()
-}
-fn default_dimension() -> u32 {
-    768
-}
-impl Default for Embed {
-    fn default() -> Self {
-        Self {
-            provider: String::new(),
-            url: String::new(),
-            model: String::new(),
-            dim: default_dimension(),
-            query_prefix: String::new(),
-            document_prefix: String::new(),
-        }
-    }
+    #[serde(default)]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub api_key: Secret,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -74,40 +90,264 @@ pub struct VectorStore {
     pub url: String,
     #[serde(default = "default_collection")]
     pub collection: String,
+    #[serde(default)]
+    pub timeout_seconds: u64,
+    /// Qdrant Cloud. Sent as the `api-key` header.
+    #[serde(default)]
+    pub api_key: Secret,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Graph {
+    /// Defaults to `graphiti_compat`, NOT `native`.
+    ///
+    /// `install.sh` never adds a `graph:` block to an existing `engram.yaml`, so
+    /// almost every upgraded install reaches this default. Defaulting to `native`
+    /// silently moved those users off their populated Graphiti index and onto the
+    /// unproven native path; the safe default is the one they were already running.
     #[serde(default = "default_graph_backend")]
     pub backend: String,
+    #[serde(default = "default_neo4j_uri")]
+    pub neo4j_uri: String,
+    #[serde(default = "default_neo4j_database")]
+    pub neo4j_database: String,
+    #[serde(default = "default_neo4j_user")]
+    pub neo4j_user: String,
+    /// Normally left unset: the installer writes the password to `graph/.env`.
+    /// [`Graph::credentials`] reads both.
+    #[serde(default)]
+    pub neo4j_password: Secret,
+    /// An explicit HTTPS transaction endpoint, required for a non-loopback Neo4j
+    /// because basic-auth credentials must not cross a network in plaintext.
+    #[serde(default)]
+    pub neo4j_http_url: String,
 }
 
-fn default_graph_backend() -> String {
-    "native".into()
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Recall {
+    #[serde(default = "default_true")]
+    pub scope_to_slug: bool,
+    /// Ceiling for one recall, used to bound the Graphiti child process.
+    ///
+    /// Distinct from `inject.timeout_ms`: that is the per-PROMPT budget the hook
+    /// enforces on top of this, and it is deliberately much shorter (a prompt that
+    /// waits is a worse outcome than a prompt without recall). An explicit CLI,
+    /// MCP or API call is allowed to wait — real Graphiti recall measures ~4s on a
+    /// populated graph, so sharing the hook's 2.5s would have made every one of
+    /// those calls fail.
+    #[serde(default = "default_recall_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub hybrid: Hybrid,
+    #[serde(default)]
+    pub inject: Inject,
 }
 
-impl Default for Graph {
+impl Default for Recall {
     fn default() -> Self {
         Self {
-            backend: default_graph_backend(),
+            scope_to_slug: true,
+            timeout_ms: default_recall_timeout_ms(),
+            hybrid: Hybrid::default(),
+            inject: Inject::default(),
         }
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Hybrid {
+    #[serde(default = "default_k_rrf")]
+    pub k_rrf: f64,
+    #[serde(default = "default_k")]
+    pub default_k: usize,
+    /// Per-leg RRF weights, e.g. `{graph: 1.0, vector: 1.0, keyword: 0.8}`.
+    #[serde(default)]
+    pub weights: BTreeMap<String, f64>,
+}
+
+/// `recall.inject` — the prompt hook's budget. The hook runs on EVERY prompt, so
+/// these are the numbers that decide whether a stalled backend delays the user.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Inject {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_inject_k")]
+    pub k: usize,
+    #[serde(default = "default_max_facts")]
+    pub max_facts: usize,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_backend() -> String {
+    "ollama".into()
+}
+fn default_dimension() -> u32 {
+    768
+}
+fn default_graph_backend() -> String {
+    "graphiti_compat".into()
+}
+fn default_neo4j_uri() -> String {
+    "bolt://127.0.0.1:7687".into()
+}
+fn default_neo4j_database() -> String {
+    "neo4j".into()
+}
+fn default_neo4j_user() -> String {
+    "neo4j".into()
+}
 fn default_qdrant_url() -> String {
     "http://127.0.0.1:6333".into()
 }
 fn default_collection() -> String {
     "engram_memory".into()
 }
+fn default_k_rrf() -> f64 {
+    60.0
+}
+fn default_k() -> usize {
+    6
+}
+fn default_inject_k() -> usize {
+    4
+}
+fn default_max_facts() -> usize {
+    6
+}
+fn default_timeout_ms() -> u64 {
+    2500
+}
+fn default_recall_timeout_ms() -> u64 {
+    15_000
+}
+
+impl Default for Embed {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            url: String::new(),
+            model: String::new(),
+            dim: default_dimension(),
+            query_prefix: String::new(),
+            document_prefix: String::new(),
+            timeout_seconds: 0,
+            api_key: Secret::default(),
+        }
+    }
+}
+
 impl Default for VectorStore {
     fn default() -> Self {
         Self {
             enabled: false,
             url: default_qdrant_url(),
             collection: default_collection(),
+            timeout_seconds: 0,
+            api_key: Secret::default(),
         }
     }
+}
+
+impl Default for Graph {
+    fn default() -> Self {
+        Self {
+            backend: default_graph_backend(),
+            neo4j_uri: default_neo4j_uri(),
+            neo4j_database: default_neo4j_database(),
+            neo4j_user: default_neo4j_user(),
+            neo4j_password: Secret::default(),
+            neo4j_http_url: String::new(),
+        }
+    }
+}
+
+impl Default for Hybrid {
+    fn default() -> Self {
+        Self {
+            k_rrf: default_k_rrf(),
+            default_k: default_k(),
+            weights: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for Inject {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            k: default_inject_k(),
+            max_facts: default_max_facts(),
+            timeout_ms: default_timeout_ms(),
+        }
+    }
+}
+
+/// Resolved Neo4j connection details, including the password from `graph/.env`.
+#[derive(Clone, Debug)]
+pub struct GraphCredentials {
+    pub uri: String,
+    pub database: String,
+    pub user: String,
+    pub password: Secret,
+    pub http_url: Option<String>,
+}
+
+impl Graph {
+    /// Resolve Neo4j credentials the way the rest of the system does.
+    ///
+    /// Precedence per field: environment (`NEO4J_URI`, `NEO4J_DATABASE`,
+    /// `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_HTTP_URL`), then `engram.yaml`, then
+    /// the installer-managed `graph/.env` for the password. The user was previously
+    /// hard-coded to `"neo4j"` and the password read from the environment only,
+    /// which fails under the standard installer layout where it lives in
+    /// `graph/.env`.
+    pub fn credentials(&self) -> GraphCredentials {
+        let env = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let password = env("NEO4J_PASSWORD")
+            .or_else(|| self.neo4j_password.present().map(str::to_string))
+            .or_else(password_from_graph_env)
+            .unwrap_or_default();
+        let http_url = env("NEO4J_HTTP_URL").or_else(|| {
+            let configured = self.neo4j_http_url.trim();
+            (!configured.is_empty()).then(|| configured.to_string())
+        });
+        GraphCredentials {
+            uri: env("NEO4J_URI").unwrap_or_else(|| self.neo4j_uri.clone()),
+            database: env("NEO4J_DATABASE").unwrap_or_else(|| self.neo4j_database.clone()),
+            user: env("NEO4J_USER").unwrap_or_else(|| self.neo4j_user.clone()),
+            password: Secret::new(password),
+            http_url,
+        }
+    }
+}
+
+/// Parse `NEO4J_PASSWORD=` out of `<graph dir>/.env`, which `install.sh` writes
+/// with mode 600. Mirrors `bin/memory_recall.py::_neo4j_password`.
+fn password_from_graph_env() -> Option<String> {
+    let text = fs::read_to_string(engram_paths::graph_dir().join(".env")).ok()?;
+    for line in text.lines() {
+        let line = line
+            .trim()
+            .strip_prefix("export ")
+            .unwrap_or(line.trim())
+            .trim();
+        if let Some(value) = line.strip_prefix("NEO4J_PASSWORD=") {
+            let value = value.trim().trim_matches('"').trim_matches('\'').trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -188,6 +428,9 @@ impl Config {
         if !self.llama_cpp.url.is_empty() {
             endpoint(&self.llama_cpp.url, "llama_cpp.url")?;
         }
+        if !self.vector_store.url.is_empty() {
+            endpoint(&self.vector_store.url, "vector_store.url")?;
+        }
         if matches!(self.embed.provider.as_str(), "llama_cpp" | "openai")
             && self.embed.url.is_empty()
         {
@@ -200,27 +443,98 @@ impl Config {
                 "graph.backend must be native or graphiti_compat".into(),
             ));
         }
+        if !self.graph.neo4j_http_url.is_empty() {
+            endpoint(&self.graph.neo4j_http_url, "graph.neo4j_http_url")?;
+        }
         Ok(())
     }
 
+    /// The effective embedding provider, matching `engram_llm._embed_provider`:
+    /// an explicit `embed.provider` wins (with `openai` an alias for `llama_cpp`),
+    /// otherwise Ollama when generating via Ollama, else the CPU fastembed path.
+    pub fn embed_provider(&self) -> &str {
+        match self.embed.provider.trim() {
+            "openai" | "llama_cpp" => "llama_cpp",
+            "ollama" => "ollama",
+            "fastembed" => "fastembed",
+            _ if self.backend == "ollama" => "ollama",
+            _ => "fastembed",
+        }
+    }
+
+    /// Whether the Rust indexer and native graph sync can serve this config.
+    ///
+    /// They implement exactly one embedding transport: an OpenAI-compatible
+    /// `/v1/embeddings` endpoint. The daemon and save hook used to prefer the Rust
+    /// binary whenever it merely existed, so an Ollama or FastEmbed install — both
+    /// fully supported configurations — had its indexing routed to a binary that
+    /// could not perform it. Callers gate on this and fall back to Python.
+    pub fn rust_embedding_supported(&self) -> bool {
+        RUST_EMBED_PROVIDERS.contains(&self.embed_provider()) && !self.embed_endpoint().is_empty()
+    }
+
+    /// Where embeddings are requested: `embed.url`, else the generation endpoint.
+    pub fn embed_endpoint(&self) -> &str {
+        if self.embed.url.is_empty() {
+            &self.llama_cpp.url
+        } else {
+            &self.embed.url
+        }
+    }
+
+    pub fn embed_timeout_seconds(&self) -> u64 {
+        match (self.embed.timeout_seconds, self.llama_cpp.timeout_seconds) {
+            (0, 0) => 90,
+            (0, fallback) => fallback,
+            (configured, _) => configured,
+        }
+    }
+
+    /// An identity for the embedding space, so a model swap invalidates the index.
+    ///
+    /// Freshness used to hash only memory content. Switching to a different model
+    /// of the SAME dimension therefore left every stored vector looking current:
+    /// the UI warned about reindexing, but an ordinary run still skipped every
+    /// record, leaving two models' vectors mixed in one collection. Anything that
+    /// changes what a vector *means* has to be in here.
+    pub fn embedding_space_id(&self) -> String {
+        let mut hasher = Sha256::new();
+        for part in [
+            self.embed_provider(),
+            self.embed_endpoint(),
+            self.embed.model.as_str(),
+            self.embed.query_prefix.as_str(),
+            self.embed.document_prefix.as_str(),
+        ] {
+            hasher.update(part.as_bytes());
+            hasher.update([0u8]);
+        }
+        hasher.update(self.embed.dim.to_le_bytes());
+        format!("{:x}", hasher.finalize())[..16].to_string()
+    }
+
+    /// Prefix a document before indexing it.
+    pub fn document_text(&self, text: &str) -> String {
+        format!("{}{}", self.embed.document_prefix, text)
+    }
+
+    /// Prefix a query before searching with it.
+    pub fn query_text(&self, text: &str) -> String {
+        format!("{}{}", self.embed.query_prefix, text)
+    }
+
     pub fn profiles(&self) -> Vec<ModelProfile> {
-        let generation_endpoint = self.llama_cpp.url.clone();
         let generation = ModelProfile {
             role: "reasoning",
             provider: self.backend.clone(),
-            endpoint: generation_endpoint,
+            endpoint: self.llama_cpp.url.clone(),
             model: self.llama_cpp.model.clone(),
             expected_dimension: None,
-        };
-        let embed_endpoint = if self.embed.url.is_empty() {
-            self.llama_cpp.url.clone()
-        } else {
-            self.embed.url.clone()
         };
         let embedding = ModelProfile {
             role: "embedding",
             provider: self.embed.provider.clone(),
-            endpoint: embed_endpoint,
+            endpoint: self.embed_endpoint().to_string(),
             model: self.embed.model.clone(),
             expected_dimension: Some(self.embed.dim),
         };
@@ -240,6 +554,7 @@ fn endpoint(value: &str, name: &str) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn llama_cpp_embedding_profile_keeps_its_space() {
         let config: Config = serde_yaml::from_str("backend: llama_cpp\nllama_cpp: {url: http://ai/v1, model: qwen}\nembed: {provider: llama_cpp, url: http://embed/v1, model: bge-m3, dim: 1024}\n").unwrap();
@@ -247,6 +562,7 @@ mod tests {
         assert_eq!(config.profiles()[1].expected_dimension, Some(1024));
         assert_eq!(config.profiles()[1].endpoint, "http://embed/v1");
     }
+
     #[test]
     fn llama_cpp_embeddings_require_an_endpoint() {
         let config: Config =
@@ -254,6 +570,7 @@ mod tests {
                 .unwrap();
         assert!(config.validate().is_err());
     }
+
     #[test]
     fn catalog_includes_the_bge_m3_baseline() {
         assert!(
@@ -261,5 +578,153 @@ mod tests {
                 .iter()
                 .any(|item| item.id == "bge-m3" && item.dimension == 1024)
         );
+    }
+
+    /// An upgraded install has no `graph:` block. It must keep reading the Graphiti
+    /// index it already populated, not silently switch to the native path.
+    #[test]
+    fn a_missing_graph_block_stays_on_graphiti() {
+        let config: Config = serde_yaml::from_str("backend: ollama\n").unwrap();
+        assert_eq!(config.graph.backend, "graphiti_compat");
+        assert!(config.local_enabled, "the master switch defaults on");
+        assert!(config.recall.inject.enabled);
+        assert_eq!(config.recall.inject.timeout_ms, 2500);
+        assert_eq!(config.recall.inject.k, 4);
+    }
+
+    #[test]
+    fn rust_indexing_is_only_claimed_for_providers_it_implements() {
+        let openai: Config =
+            serde_yaml::from_str("embed: {provider: llama_cpp, url: http://e/v1, dim: 1024}\n")
+                .unwrap();
+        assert!(openai.rust_embedding_supported());
+
+        for yaml in [
+            "embed: {provider: ollama, dim: 768}\n",
+            "embed: {provider: fastembed, dim: 768}\n",
+            // auto-selected: no provider named at all
+            "backend: ollama\n",
+            // llama_cpp with no endpoint cannot be served either
+            "embed: {provider: llama_cpp, dim: 1024}\n",
+        ] {
+            let config: Config = serde_yaml::from_str(yaml).unwrap();
+            assert!(
+                !config.rust_embedding_supported(),
+                "claimed support for {yaml:?} (provider {})",
+                config.embed_provider()
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_space_changes_with_anything_that_changes_a_vector() {
+        let base: Config = serde_yaml::from_str(
+            "embed: {provider: llama_cpp, url: http://e/v1, model: bge-m3, dim: 1024}\n",
+        )
+        .unwrap();
+        let id = base.embedding_space_id();
+
+        // same dimension, different model — the case content hashing missed
+        let other_model: Config = serde_yaml::from_str(
+            "embed: {provider: llama_cpp, url: http://e/v1, model: qwen3-embedding-0.6b, dim: 1024}\n",
+        )
+        .unwrap();
+        assert_ne!(id, other_model.embedding_space_id());
+
+        for yaml in [
+            "embed: {provider: llama_cpp, url: http://other/v1, model: bge-m3, dim: 1024}\n",
+            "embed: {provider: llama_cpp, url: http://e/v1, model: bge-m3, dim: 768}\n",
+            "embed: {provider: llama_cpp, url: http://e/v1, model: bge-m3, dim: 1024, query_prefix: 'query: '}\n",
+            "embed: {provider: llama_cpp, url: http://e/v1, model: bge-m3, dim: 1024, document_prefix: 'passage: '}\n",
+        ] {
+            let changed: Config = serde_yaml::from_str(yaml).unwrap();
+            assert_ne!(
+                id,
+                changed.embedding_space_id(),
+                "space unchanged for {yaml:?}"
+            );
+        }
+
+        // and it is stable for an identical configuration
+        let same: Config = serde_yaml::from_str(
+            "embed: {provider: openai, url: http://e/v1, model: bge-m3, dim: 1024}\n",
+        )
+        .unwrap();
+        assert_eq!(id, same.embedding_space_id(), "openai aliases to llama_cpp");
+    }
+
+    #[test]
+    fn prefixes_are_applied_per_side() {
+        let config: Config = serde_yaml::from_str(
+            "embed: {provider: llama_cpp, url: http://e/v1, dim: 1024, query_prefix: 'query: ', document_prefix: 'passage: '}\n",
+        )
+        .unwrap();
+        assert_eq!(config.query_text("hello"), "query: hello");
+        assert_eq!(config.document_text("hello"), "passage: hello");
+    }
+
+    /// The API serializes the config straight to the browser under a "secrets
+    /// redacted" heading. This is that promise, enforced.
+    #[test]
+    fn credentials_never_appear_in_a_serialized_config() {
+        let config: Config = serde_yaml::from_str(
+            "llama_cpp: {url: 'http://ai/v1', api_key: 'sk-generation'}\n\
+             embed: {provider: llama_cpp, url: 'http://e/v1', dim: 1024, api_key: 'sk-embed'}\n\
+             vector_store: {enabled: true, url: 'https://q.cloud:6333', api_key: 'qdrant-cloud-key'}\n\
+             graph: {backend: native, neo4j_password: 'neo-secret'}\n",
+        )
+        .unwrap();
+        // they parsed...
+        assert_eq!(config.embed.api_key.present(), Some("sk-embed"));
+        assert_eq!(
+            config.vector_store.api_key.present(),
+            Some("qdrant-cloud-key")
+        );
+
+        // ...and they do not come back out
+        for rendered in [
+            serde_json::to_string(&config).unwrap(),
+            serde_yaml::to_string(&config).unwrap(),
+            format!("{config:?}"),
+        ] {
+            for secret in [
+                "sk-generation",
+                "sk-embed",
+                "qdrant-cloud-key",
+                "neo-secret",
+            ] {
+                assert!(!rendered.contains(secret), "leaked {secret} in {rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn graph_credentials_prefer_the_environment_then_yaml() {
+        let config: Config = serde_yaml::from_str(
+            "graph: {backend: native, neo4j_uri: 'bolt://db:7687', neo4j_user: 'svc', neo4j_password: 'from-yaml'}\n",
+        )
+        .unwrap();
+        let creds = config.graph.credentials();
+        assert_eq!(creds.uri, "bolt://db:7687");
+        assert_eq!(
+            creds.user, "svc",
+            "the user is no longer hard-coded to neo4j"
+        );
+        assert_eq!(creds.password.expose(), "from-yaml");
+        assert_eq!(creds.http_url, None);
+    }
+
+    #[test]
+    fn embed_timeout_falls_back_to_the_generation_timeout() {
+        let explicit: Config = serde_yaml::from_str(
+            "embed: {dim: 1024, timeout_seconds: 30}\nllama_cpp: {timeout_seconds: 600}\n",
+        )
+        .unwrap();
+        assert_eq!(explicit.embed_timeout_seconds(), 30);
+        let inherited: Config =
+            serde_yaml::from_str("llama_cpp: {timeout_seconds: 600}\n").unwrap();
+        assert_eq!(inherited.embed_timeout_seconds(), 600);
+        let neither: Config = serde_yaml::from_str("backend: ollama\n").unwrap();
+        assert_eq!(neither.embed_timeout_seconds(), 90);
     }
 }

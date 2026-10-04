@@ -5,7 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+engram-paths = { path = "../engram-paths" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+sha2 = "0.10"
 thiserror = "2"
 url = "2"
+
+[dev-dependencies]
+serde_json = "1"

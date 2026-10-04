@@ -42,6 +42,11 @@ pub struct IndexPoint<'a> {
     pub memory_type: &'a str,
     pub slug: &'a str,
     pub sha: &'a str,
+    /// Which embedding space produced `vector` — see
+    /// `Config::embedding_space_id`. Stored so an operator can see at a glance
+    /// whether a collection holds vectors from more than one model; freshness is
+    /// enforced through `sha`, which the space id is folded into.
+    pub space: &'a str,
     pub vector: Vec<f32>,
 }
 
@@ -80,10 +85,50 @@ struct Payload {
 
 impl QdrantClient {
     pub fn new(base_url: impl Into<String>, collection: impl Into<String>) -> Self {
+        Self::with_credentials(base_url, collection, None, 0)
+    }
+
+    /// Build a client from the active config, so the Qdrant API key and timeout
+    /// are picked up at every call site instead of at none of them.
+    ///
+    /// `vector_store.api_key` is documented and shipped in `engram.yaml.example`
+    /// for Qdrant Cloud; it was not modelled in Rust, so a Cloud deployment got
+    /// unauthenticated requests and a 401 with no explanation.
+    pub fn from_config(config: &engram_config::Config) -> Self {
+        Self::with_credentials(
+            config.vector_store.url.clone(),
+            config.vector_store.collection.clone(),
+            config.vector_store.api_key.present(),
+            config.vector_store.timeout_seconds,
+        )
+    }
+
+    pub fn with_credentials(
+        base_url: impl Into<String>,
+        collection: impl Into<String>,
+        api_key: Option<&str>,
+        timeout_seconds: u64,
+    ) -> Self {
+        // The key is attached as a default header rather than per request: every
+        // method below builds its own request, and one missed call site is an
+        // unauthenticated query.
+        let mut builder = Client::builder();
+        if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(key) {
+                let mut value = value;
+                value.set_sensitive(true);
+                headers.insert("api-key", value);
+            }
+            builder = builder.default_headers(headers);
+        }
+        if timeout_seconds > 0 {
+            builder = builder.timeout(std::time::Duration::from_secs(timeout_seconds));
+        }
         Self {
             base_url: base_url.into().trim_end_matches('/').into(),
             collection: collection.into(),
-            client: Client::new(),
+            client: builder.build().unwrap_or_else(|_| Client::new()),
         }
     }
     pub async fn search(
@@ -178,6 +223,7 @@ impl QdrantClient {
                     "type": point.memory_type,
                     "slug": point.slug,
                     "sha": point.sha,
+                    "space": point.space,
                 }
             }]}))
             .send()

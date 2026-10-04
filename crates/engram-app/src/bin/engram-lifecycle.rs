@@ -6,8 +6,8 @@ use std::{
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long, env = "ENGRAM_BIN", default_value = "/root/.claude")]
-    bin: PathBuf,
+    #[arg(long, env = "ENGRAM_BIN")]
+    bin: Option<PathBuf>,
     #[arg(long, value_parser = ["harvest", "maintenance", "curate"])]
     mode: String,
     #[arg(long, env = "ENGRAM_VECTOR_PYTHON")]
@@ -16,24 +16,25 @@ struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    let bin = args.bin.unwrap_or_else(engram_paths::engram_home);
     let status = match args.mode.as_str() {
         "harvest" => Command::new("bash")
-            .arg(args.bin.join("memory_pipeline.sh"))
+            .arg(bin.join("memory_pipeline.sh"))
             .status(),
         "maintenance" => Command::new("bash")
-            .arg(args.bin.join("memory_fixate_cron.sh"))
+            .arg(bin.join("memory_fixate_cron.sh"))
             .status(),
         "curate" => {
             let python = args
                 .vector_python
-                .unwrap_or_else(|| args.bin.join("vector/venv/bin/python"));
+                .unwrap_or_else(|| bin.join("vector/venv/bin/python"));
             let interpreter = if python.is_file() {
                 python
             } else {
                 PathBuf::from("python3")
             };
             Command::new(interpreter)
-                .arg(args.bin.join("memory_auto_curate.py"))
+                .arg(bin.join("memory_auto_curate.py"))
                 .arg("--apply")
                 .status()
         }

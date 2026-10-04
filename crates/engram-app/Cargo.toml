@@ -11,7 +11,9 @@ engram-config = { path = "../engram-config" }
 engram-graph = { path = "../engram-graph" }
 engram-hybrid = { path = "../engram-hybrid" }
 engram-models = { path = "../engram-models" }
+engram-paths = { path = "../engram-paths" }
 engram-retrieval = { path = "../engram-retrieval" }
+engram-secrets = { path = "../engram-secrets" }
 engram-store = { path = "../engram-store" }
 engram-vector = { path = "../engram-vector" }
 serde = { version = "1", features = ["derive"] }

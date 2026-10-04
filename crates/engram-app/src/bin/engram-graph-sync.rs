@@ -6,13 +6,9 @@ use std::{
 
 #[derive(Parser)]
 struct Args {
-    #[arg(
-        long,
-        env = "ENGRAM_CONFIG",
-        default_value = "/root/.claude/engram.yaml"
-    )]
-    config: PathBuf,
-    #[arg(long, env = "ENGRAM_GRAPH")]
+    #[arg(long, env = "ENGRAM_CONFIG")]
+    config: Option<PathBuf>,
+    #[arg(long)]
     graph_dir: Option<PathBuf>,
     #[arg(long, env = "ENGRAM_GRAPH_PYTHON")]
     python: Option<PathBuf>,
@@ -24,13 +20,8 @@ struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    let graph_dir = args.graph_dir.unwrap_or_else(|| {
-        args.config
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("graph")
-    });
+    let config = engram_paths::config_path(args.config);
+    let graph_dir = args.graph_dir.unwrap_or_else(engram_paths::graph_dir);
     let python = args
         .python
         .unwrap_or_else(|| graph_dir.join("venv/bin/python"));
@@ -41,6 +32,11 @@ fn main() -> ExitCode {
     };
     let mut command = Command::new(interpreter);
     command.arg(graph_dir.join("graph_sync.py"));
+    // Hand the child the SAME resolved paths rather than letting it re-derive them.
+    // A parent and child disagreeing about which engram.yaml is active is how one
+    // installation's daemon ended up acting on another's store.
+    command.env("ENGRAM_CONFIG", &config);
+    command.env("ENGRAM_GRAPH", &graph_dir);
     match args.mode.as_str() {
         "insert" => {
             command
