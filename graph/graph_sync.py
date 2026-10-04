@@ -49,7 +49,7 @@ def _slug() -> str:
 MEM_DIR = Path.home() / ".claude" / "projects" / _slug() / "memory"
 EXTRACT_DIR = HERE / "extractions"
 INSERT_STATE = HERE / "insert_state.json"
-SYNC_STATE = HERE / "sync_state.json"          # file -> sha256(.md) last extracted
+SYNC_STATE = HERE / "sync_state.json"          # file -> sha256(.md) last INSERTED (written by memory_graph_insert.py)
 SPEC = HERE / "extract_spec.md"
 
 # graphiti lives in an isolated venv; run the insert/export/reconcile subprocesses
@@ -76,8 +76,6 @@ def _sha(p: Path) -> str:
 def _load_sync() -> dict:
     return json.loads(SYNC_STATE.read_text()) if SYNC_STATE.exists() else {}
 
-def _save_sync(d: dict):
-    SYNC_STATE.write_text(json.dumps(d, indent=1))
 
 
 def _parse_json(raw: str) -> dict:
@@ -134,8 +132,8 @@ def cmd_insert(limit=None):
     changed = [p for p in files if p.name in done and sync.get(p.name) != _sha(p)]
     if changed:
         head = ", ".join(p.name for p in changed[:5]) + (" ..." if len(changed) > 5 else "")
-        print(f"[sync] {len(changed)} changed memory(ies) — re-run "
-              f"`memory_graph_insert.py --rebuild` to refresh: {head}")
+        print(f"[sync] {len(changed)} changed memory(ies) — run "
+              f"`graph_maint.py --refresh-changed --apply`, then `graph_sync.py --insert`: {head}")
     if limit:
         new = new[:limit]
     if not new:
@@ -146,12 +144,13 @@ def cmd_insert(limit=None):
         try:
             data = extract(p)
             (EXTRACT_DIR / (p.stem + ".json")).write_text(json.dumps(data, indent=1))
-            sync[p.name] = _sha(p)
             extracted.append(p.name)
             print(f"[sync] extracted {p.name}: {len(data['entities'])} entities, {len(data['edges'])} edges")
         except Exception as e:
             print(f"[sync] extract FAILED {p.name}: {e}", file=sys.stderr)
-    _save_sync(sync)
+    # sync_state is stamped by memory_graph_insert.py, per memory, AFTER the episode
+    # commits. Stamping it here (at extraction time) marked files as in-graph that
+    # the insert below might never reach, so a later edit to them looked unchanged.
     if not extracted:
         print("[sync] nothing extracted; skipping insert")
         return

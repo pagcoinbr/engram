@@ -20,6 +20,7 @@ Usage: python3 memory_graph_insert.py [--only FILE.md ...] [--rebuild [--force]]
 """
 import asyncio
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
@@ -38,6 +39,7 @@ HERE = Path(__file__).resolve().parent
 MEM_DIR = Path.home() / ".claude" / "projects" / (os.environ.get("CLAUDE_MEMORY_SLUG") or str(Path.home()).replace("/", "-")) / "memory"
 EXTRACT_DIR = HERE / "extractions"
 STATE = HERE / "insert_state.json"
+SYNC_STATE = HERE / "sync_state.json"
 LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 
@@ -65,6 +67,17 @@ def load_state():
 
 def save_state(st):
     STATE.write_text(json.dumps(st, indent=1))
+
+
+def load_sync_state() -> dict:
+    try:
+        return json.loads(SYNC_STATE.read_text())
+    except Exception:
+        return {}
+
+
+def save_sync_state(sync: dict):
+    SYNC_STATE.write_text(json.dumps(sync, indent=1, sort_keys=True))
 
 
 async def main():
@@ -131,6 +144,12 @@ async def main():
 
     total = len(jsons)
     ne_tot = ee_tot = 0
+    # sync_state records "the graph holds THIS version of the file". It must only
+    # ever be stamped for a memory whose insert actually committed: stamping every
+    # .md in the store (the obvious one-liner) silently marks files that were
+    # skipped, filtered out by --only, or killed mid-run as in-sync, which
+    # suppresses graph_sync's "changed memory" banner for genuinely stale files.
+    sync = load_sync_state()
     for i, p in enumerate(jsons, 1):
         ex = json.loads(p.read_text())
         fname = ex.get("file") or (p.stem + ".md")
@@ -198,6 +217,10 @@ async def main():
         st["done"][fname] = ep.uuid
         st["entities"] = ent_uuid
         save_state(st)
+        # Stamped per memory, next to insert_state, so a kill leaves the two files
+        # agreeing with each other instead of one ahead of the other.
+        sync[fname] = hashlib.sha256(mdfile.read_bytes()).hexdigest()  # bytes: matches graph_sync._sha
+        save_sync_state(sync)
         ne_tot += len(ents); ee_tot += nedges
         print(f"[{i}/{total}] {fname}: {len(ents)} entities, {nedges} edges", flush=True)
 

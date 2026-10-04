@@ -130,12 +130,29 @@ def _post(url: str, body: dict, headers: dict | None = None, timeout: float = 5.
         return json.load(r)
 
 
-def embed(text: str, cfg: dict, timeout: float = 5.0) -> list[float]:
-    """Embed via Ollama's HTTP API. NOT engram_llm.embed(): that pulls in fastembed
-    on non-Ollama backends, and importing it costs more than every round trip here
-    combined. A box with no reachable Ollama simply loses the vector leg."""
+def embed(text: str, cfg: dict, timeout: float = 5.0, kind: str = "query") -> list[float]:
+    """Embed through the configured HTTP provider without importing fastembed.
+
+    NOT engram_llm.embed(): that pulls in fastembed on the default path, and
+    importing it costs more than every round trip here combined. Asymmetric models
+    (bge, e5, nomic) need their query prefix or the query lands in a different
+    region of the space than the indexed documents, so `kind` picks the prefix.
+    Raises on failure — vector_leg() decides whether a dead endpoint is fatal; it
+    must never be papered over with a vector from some other model.
+    """
+    ec = cfg.get("embed") or {}
+    prefix = (ec.get("query_prefix") if kind == "query" else ec.get("document_prefix")) or ""
+    text = f"{prefix}{text}"
+    provider = (ec.get("provider") or "").strip().lower()
+    if provider in ("llama_cpp", "openai"):
+        base = (ec.get("url") or "http://127.0.0.1:8091/v1").rstrip("/")
+        headers = {}
+        if ec.get("api_key"):
+            headers["Authorization"] = f"Bearer {ec['api_key']}"
+        return _post(f"{base}/embeddings", {"model": ec.get("model") or "bge-m3",
+                                               "input": text}, headers, timeout)["data"][0]["embedding"]
     host = (cfg.get("ollama") or {}).get("host", "http://localhost:11434")
-    model = (cfg.get("expert_models") or {}).get("similarity") or "nomic-embed-text"
+    model = ec.get("model") or (cfg.get("experts") or {}).get("similarity") or "nomic-embed-text"
     return _post(f"{host.rstrip('/')}/api/embed", {"model": model, "input": text},
                  timeout=timeout)["embeddings"][0]
 

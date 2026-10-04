@@ -9,10 +9,13 @@ Two generation backends + one always-local embedding path:
                        scaled by a hardware TIER preset (cpu/small/medium/large).
   backend: claude   -> shells `claude -p` (no GPU; cost = Claude usage). Used by
                        the always-on loop container.
-  embed()           -> Ollama `nomic-embed-text` when on the ollama backend and
-                       reachable, ELSE CPU `fastembed` (nomic-embed-text-v1.5).
-                       Both are 768-dim, so the graph's vector space is stable
-                       across backends and never needs a paid embeddings API.
+  embed()           -> the provider named in `embed.provider` (ollama, fastembed,
+                       or llama_cpp/openai for an OpenAI-compatible server such as
+                       bge-m3 under llama-server). With no provider set, Ollama
+                       `nomic-embed-text` when on the ollama backend and reachable,
+                       ELSE CPU `fastembed` — both 768-dim, so the auto path never
+                       changes the vector space and never needs a paid API. An
+                       EXPLICIT provider never falls back: see embed().
 
 Config is read via memory_ai.load() (engram.yaml). Relevant keys:
   backend: ollama|claude
@@ -20,7 +23,8 @@ Config is read via memory_ai.load() (engram.yaml). Relevant keys:
   experts: { <role>: { model: "<name>" } }  # OPTIONAL per-role override (wins over tier)
   ollama:  { host, timeout_seconds, num_ctx, num_predict, keep_alive, reasoning_effort }
   claude:  { bin, model, timeout_seconds, max_turns }
-  embed:   { fastembed_model, dim }
+  embed:   { provider, url, model, api_key, timeout_seconds, fastembed_model, dim,
+             query_prefix, document_prefix }
 
 CLI:
   engram_llm.py --check                 # probe the active backend + embeddings
@@ -214,6 +218,12 @@ def _llamacpp_generate(prompt: str, role: str, cfg) -> str:
         "max_tokens": int(lc.get("max_tokens", oc.get("num_predict", 8000))),
         "stream": False,
     }
+    # engram callers want structured/JSON output, never chain-of-thought. Qwen3 and
+    # other reasoning models emit <think> by default, which can exhaust the token
+    # budget (truncated JSON) or return pure reasoning (empty after stripping).
+    # Disable thinking via the chat template unless cfg explicitly opts in.
+    if not bool(lc.get("enable_thinking", False)):
+        body["chat_template_kwargs"] = {"enable_thinking": False}
     headers = {"Content-Type": "application/json"}
     if lc.get("api_key"):
         headers["Authorization"] = f"Bearer {lc['api_key']}"
@@ -339,23 +349,64 @@ def _claude_generate(prompt: str, role: str, cfg, env_extra=None, label="claude 
 # ---------------------------------------------------------------------------
 _FE_MODEL = None
 
+PROVIDERS = ("ollama", "fastembed", "llama_cpp", "openai")
+
 def _embed_provider(cfg) -> str:
     """Embedding provider, chosen INDEPENDENTLY of the generation backend so a
     llama.cpp/claude backend can still embed via Ollama. Explicit `embed.provider`
     wins; otherwise default to ollama when the generation backend is ollama, else
     the local CPU fastembed path."""
     p = (cfg.get("embed", {}).get("provider") or "").strip().lower()
-    if p in ("ollama", "fastembed"):
-        return p
+    if p in PROVIDERS:
+        return "llama_cpp" if p == "openai" else p
     return "ollama" if backend(cfg) == "ollama" else "fastembed"
 
+def _embed_provider_is_explicit(cfg) -> bool:
+    """True when the operator named a provider in `embed.provider`. An explicit
+    choice is binding: we fail rather than silently answering from another one."""
+    return (cfg.get("embed", {}).get("provider") or "").strip().lower() in PROVIDERS
+
+def _check_embed_dim(vec, cfg):
+    """Refuse a vector that does not belong to the configured embedding space.
+
+    Qdrant and the graph both store one dimension per collection. Returning a
+    768-dim vector into a 1024-dim index does not fail loudly at the call site —
+    it fails much later as unexplainably bad recall, or as a rejected upsert — so
+    the mismatch is caught here, where the cause is still visible.
+    """
+    want = (cfg.get("embed") or {}).get("dim")
+    if want and int(want) != len(vec):
+        raise RuntimeError(f"embedding dimension mismatch: got {len(vec)}, "
+                           f"embed.dim is {int(want)} — check embed.model/provider")
+    return vec
+
 def embed(text: str, cfg=None):
+    """Embed `text` in the configured space.
+
+    An explicitly configured provider NEVER falls back: a dead llama-server used to
+    silently hand back CPU fastembed vectors from a different model, in a different
+    dimension, poisoning the index with no error anywhere. Only the auto-selected
+    default (no `embed.provider` set) is allowed to degrade to fastembed.
+    """
     cfg = _cfg(cfg)
-    if _embed_provider(cfg) == "ollama":
+    prov = _embed_provider(cfg)
+    explicit = _embed_provider_is_explicit(cfg)
+    if prov == "llama_cpp":
+        if explicit:
+            return _check_embed_dim(_llama_embed(text, cfg), cfg)
         try:
-            return _ollama_embed(text, cfg)
+            return _check_embed_dim(_llama_embed(text, cfg), cfg)
         except Exception:
-            pass  # Ollama unreachable -> fall back to CPU fastembed
+            pass
+    elif prov == "ollama":
+        if explicit:
+            return _check_embed_dim(_ollama_embed(text, cfg), cfg)
+        try:
+            return _check_embed_dim(_ollama_embed(text, cfg), cfg)
+        except Exception:
+            pass
+    elif prov == "fastembed" and explicit:
+        return _check_embed_dim(_fastembed_embed(text, cfg), cfg)
     return _fastembed_embed(text, cfg)
 
 def embed_dim(cfg=None) -> int:
@@ -372,6 +423,21 @@ def _ollama_embed(text: str, cfg):
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=_timeout(cfg)) as r:
         return json.loads(r.read().decode())["embedding"]
+
+def _llama_embed(text: str, cfg):
+    """Embeddings via a llama.cpp / OpenAI-compatible server (POST {url}/embeddings).
+    Used when embed.provider is 'llama_cpp' (e.g. bge-m3 served by llama-server)."""
+    ec = cfg.get("embed", {})
+    base = (ec.get("url") or "http://127.0.0.1:8091/v1").rstrip("/")
+    payload = {"model": ec.get("model") or "bge-m3", "input": text}
+    headers = {"Content-Type": "application/json"}
+    if ec.get("api_key"):
+        headers["Authorization"] = f"Bearer {ec['api_key']}"
+    req = urllib.request.Request(f"{base}/embeddings",
+                                 data=json.dumps(payload).encode(), headers=headers)
+    with urllib.request.urlopen(req, timeout=int(ec.get("timeout_seconds", 120))) as r:
+        return json.loads(r.read().decode())["data"][0]["embedding"]
+
 
 def _fastembed_embed(text: str, cfg):
     global _FE_MODEL
