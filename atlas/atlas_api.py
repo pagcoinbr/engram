@@ -315,12 +315,17 @@ def _write_config(editable: dict) -> str:
     raw.setdefault("llama_cpp", {}).update(editable["llama_cpp"])
     raw.setdefault("embed", {}).update(editable["embed"])
     raw.setdefault("graph", {}).update(editable["graph"])
-    backup_dir = ENGRAM_BIN / "backups" / "config"
+    # Same directory and the same naming scheme as the Rust writer
+    # (`engram.yaml.<secs>.<nanos>.<pid>.bak`). Two conventions in one directory
+    # made the backup history unreadable, and second-granularity names collided
+    # between concurrent saves.
+    backup_dir = path.parent / "backups" / "config"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
+    now = time.time_ns()
+    stamp = f"{now // 1_000_000_000}.{now % 1_000_000_000:09d}.{os.getpid()}"
     backup = backup_dir / f"engram.yaml.{stamp}.bak"
     backup.write_bytes(path.read_bytes())
-    temp = path.with_suffix(".yaml.tmp")
+    temp = path.with_suffix(f".yaml.{stamp}.tmp")
     temp.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
     os.chmod(temp, path.stat().st_mode)
     temp.replace(path)
@@ -352,7 +357,17 @@ def _atlas_model_status(status: dict) -> dict:
         item["observedModel"] = item.pop("observed_model", None)
         item["observedDimension"] = item.pop("observed_dimension", None)
         item["indexCompatible"] = item.pop("index_compatible", None)
-        item["reachable"] = not bool(item.get("error")) if item.get("endpoint") else None
+        # Only an ACTUAL probe may report reachability. The old rule — endpoint
+        # present and no error — painted a green "Healthy" badge for providers the
+        # Rust status endpoint explicitly declines to probe (anything not
+        # OpenAI-compatible returns untouched, hence no error). `probed` comes from
+        # the Rust ModelStatus; `None` keeps the UI's "Not probed" state honest.
+        probed = item.pop("probed", None)
+        if probed is None:
+            probed = bool(item.get("endpoint")) and (
+                item.get("observedModel") is not None or bool(item.get("error"))
+            )
+        item["reachable"] = (not bool(item.get("error"))) if probed else None
         item["latencyMs"] = None
     return status
 
@@ -441,6 +456,21 @@ def atlas_models():
         status = _models_status()
     _model_cache = (time.monotonic(), status)
     return _model_cache[1]
+
+
+@app.get("/api/atlas/models/recommended")
+def atlas_models_recommended():
+    """Proxy the embedder catalog the Rust API already serves.
+
+    The frontend used to hardcode its own copy of this list, which had already
+    drifted in wording from `engram_config::recommended_embedders`. The Rust
+    endpoint existed but nothing routed to it. The fallback keeps the panel alive
+    when the Rust API is down — it is informational only.
+    """
+    try:
+        return _rust_json("/api/v1/models/recommended")
+    except (OSError, ValueError, urllib.error.URLError):
+        return []
 
 
 @app.get("/api/atlas/config")
