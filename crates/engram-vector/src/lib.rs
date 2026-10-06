@@ -83,6 +83,22 @@ struct Payload {
     description: Option<String>,
 }
 
+/// The payload filter for a search: slug and embedding space, either optional.
+/// Extracted so its shape can be asserted without a live Qdrant.
+fn search_filter(slug: Option<&str>, space: Option<&str>) -> serde_json::Value {
+    let mut must = Vec::new();
+    if let Some(slug) = slug {
+        must.push(serde_json::json!({"key": "slug", "match": {"value": slug}}));
+    }
+    if let Some(space) = space {
+        must.push(serde_json::json!({"key": "space", "match": {"value": space}}));
+    }
+    if must.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({"must": must})
+}
+
 impl QdrantClient {
     pub fn new(base_url: impl Into<String>, collection: impl Into<String>) -> Self {
         Self::with_credentials(base_url, collection, None, 0)
@@ -131,16 +147,27 @@ impl QdrantClient {
             client: builder.build().unwrap_or_else(|_| Client::new()),
         }
     }
+    /// `space` is the active [`engram_config::Config::embedding_space_id`].
+    ///
+    /// Filtering on it is not optional hygiene. Indexing is incremental, so during
+    /// a reindex after a same-dimension model change the collection holds points
+    /// from BOTH spaces at once — and vectors from two models are not comparable,
+    /// so scoring a new query against old points produces confident nonsense with
+    /// nothing to indicate it. Writing the space onto the payload without reading
+    /// it back here left exactly that window open. A query returns fewer results
+    /// until the reindex finishes, which is the right failure: incomplete beats
+    /// wrongly ranked.
     pub async fn search(
         &self,
         vector: Vec<f32>,
         limit: usize,
         slug: Option<&str>,
+        space: Option<&str>,
     ) -> Result<Vec<Hit>, VectorError> {
         let mut body = serde_json::json!({"query": vector, "limit": limit, "with_payload": true});
-        if let Some(slug) = slug {
-            body["filter"] =
-                serde_json::json!({"must": [{"key": "slug", "match": {"value": slug}}]});
+        let filter = search_filter(slug, space);
+        if !filter.is_null() {
+            body["filter"] = filter;
         }
         let response = self
             .client
@@ -323,5 +350,38 @@ impl QdrantClient {
             .pointer("/result/count")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The search filter must pin the embedding space, not just the slug.
+    ///
+    /// Indexing is incremental, so a same-dimension model change leaves points
+    /// from two spaces in one collection, and vectors from different models are
+    /// not comparable — scoring a new query against old points produces
+    /// confident nonsense. The `space` payload was being written and never read
+    /// back, which left exactly that window open.
+    #[test]
+    fn the_search_filter_pins_the_embedding_space() {
+        let body = search_filter(Some("-home-alice"), Some("b941b4f74fc6de19"));
+        let must = body["must"].as_array().expect("a must clause");
+        let keys = must
+            .iter()
+            .filter_map(|clause| clause["key"].as_str())
+            .collect::<Vec<_>>();
+        assert!(keys.contains(&"space"), "space is not filtered: {body}");
+        assert!(keys.contains(&"slug"), "slug is not filtered: {body}");
+
+        // Either may be absent on its own, and with neither there is no filter.
+        assert_eq!(
+            search_filter(None, Some("s"))["must"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(search_filter(None, None).is_null());
     }
 }

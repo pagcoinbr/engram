@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -255,7 +256,13 @@ def _editable_config(cfg: dict) -> dict:
         "backend": cfg.get("backend", ""),
         "llama_cpp": {key: llama.get(key, "") for key in ("url", "model", "timeout_seconds")},
         "embed": {key: embed.get(key, "") for key in ("provider", "url", "model", "dim")},
-        "graph": {"backend": graph.get("backend", "native")},
+        # graphiti_compat, matching Config::default_graph_backend and the daemon.
+        # Defaulting to "native" here meant that saving ANY unrelated setting
+        # through this fallback materialised a `graph:` block that moved an
+        # upgraded install off its populated Graphiti index — the same bug the
+        # Rust default was changed to fix, reintroduced on the path taken when
+        # the Rust API is down.
+        "graph": {"backend": graph.get("backend", "graphiti_compat")},
     }
 
 
@@ -279,6 +286,17 @@ def _validate_config_patch(patch: dict, current: dict) -> tuple[dict, bool]:
         url = str(normalized[section].get("url", "")).strip()
         if url and not re.match(r"^https?://[^\s]+/v1/?$", url):
             raise HTTPException(400, f"{section}.url must be an HTTP(S) /v1 endpoint")
+        # Credentials belong in api_key, which is redacted everywhere it is
+        # served. A URL carrying userinfo is published verbatim by the model
+        # status and editor views, so it routes a password around that. Rust's
+        # endpoint() rejects it; this fallback accepted it, which is worse than
+        # either — the bypass only appears when the Rust API is down.
+        if url:
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.username or parsed.password:
+                raise HTTPException(
+                    400,
+                    f"{section}.url must not embed credentials; use {section}.api_key")
         normalized[section]["url"] = url.rstrip("/")
         normalized[section]["model"] = str(normalized[section].get("model", "")).strip()
     incoming_graph = patch.get("graph", {})

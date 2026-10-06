@@ -349,8 +349,12 @@ async fn vector_leg(
             .embedding(&config.embed.model, &config.query_text(query))
             .await?;
         let scope = config.recall.scope_to_slug.then_some(slug);
+        // Scope to the active embedding space too: a reindex after a model change
+        // leaves both spaces in the collection at once, and vectors from two
+        // models cannot be compared.
+        let space = config.embedding_space_id();
         let hits = QdrantClient::from_config(config)
-            .search(vector, k, scope)
+            .search(vector, k, scope, Some(&space))
             .await?;
         Ok::<_, Box<dyn std::error::Error>>(hits)
     }

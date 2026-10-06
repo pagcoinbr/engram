@@ -155,6 +155,34 @@ def test_native_backend_never_falls_back_to_the_graphiti_writer(home):
     print("ok — a native backend that Rust cannot serve skips instead of writing Graphiti")
 
 
+def test_graphiti_maintenance_never_runs_under_a_native_reader(home):
+    """Export and reconcile write the LEGACY Graphiti schema.
+
+    `engram-graph-sync` is a wrapper around graph/graph_sync.py, so both branches
+    of these jobs wrote Graphiti. The old condition had it backwards — it reached
+    for the wrapper precisely when the backend was `native` — so a native reader
+    got a nightly Graphiti export, the same split brain task_graph was fixed for.
+    Operating on an index nothing reads is worse than not operating: it looks like
+    maintenance is happening.
+    """
+    mod = load_daemon(home, "backend: ollama\n")
+    mod._neo4j_up = lambda *a, **k: True
+    ran = []
+    mod._run = lambda cmd, **kw: ran.append(cmd) or 0
+
+    write_config(home, "backend: ollama\ngraph:\n  backend: native\n")
+    assert mod.task_export() is False, "a native backend must not export Graphiti"
+    assert mod.task_reconcile() is False, "a native backend must not reconcile Graphiti"
+    assert ran == [], f"it ran the legacy Graphiti writer anyway: {ran}"
+
+    # ...and compatibility mode still does both.
+    write_config(home, "backend: ollama\ngraph:\n  backend: graphiti_compat\n")
+    assert mod.task_export() is True
+    assert mod.task_reconcile() is True
+    assert len(ran) == 2, ran
+    print("ok — Graphiti export/reconcile only run when Graphiti is the reader")
+
+
 def test_config_path_and_slug_resolution(home):
     """Children must receive the config the daemon actually loaded, and the slug
     pinned by the operator — not re-derived values."""
@@ -180,6 +208,7 @@ def main():
         test_graph_backend_default_and_override(d)
         test_native_sync_needs_an_endpoint_for_each_half(d)
         test_native_backend_never_falls_back_to_the_graphiti_writer(d)
+        test_graphiti_maintenance_never_runs_under_a_native_reader(d)
         test_config_path_and_slug_resolution(d)
 
 

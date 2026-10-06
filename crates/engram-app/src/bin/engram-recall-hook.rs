@@ -9,7 +9,12 @@ use clap::Parser;
 use engram_config::Config;
 use engram_hybrid::recall_fast;
 use serde::Deserialize;
-use std::{collections::BTreeSet, io::Read, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeSet,
+    io::Read,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 /// Session dedup state older than this is swept. Matches
 /// `bin/hooks/memory-recall-inject.py`, which has always done this; the Rust hook
@@ -35,6 +40,8 @@ struct Args {
 struct Prompt {
     prompt: String,
     session_id: Option<String>,
+    /// The session's project directory, as Claude Code supplies it.
+    cwd: Option<String>,
 }
 
 #[tokio::main]
@@ -53,9 +60,22 @@ async fn main() {
     }
 
     let config_path = engram_paths::config_path(args.config);
-    // The hook runs inside a Claude Code session, so the working directory IS the
-    // project whose memories are wanted. The slug was hard-wired to "-root".
-    let slug = engram_paths::resolve_slug_in_cwd(args.slug.as_deref());
+    // The hook runs inside a Claude Code session, so the session's project
+    // directory IS the project whose memories are wanted — and that is the `cwd`
+    // in the payload, not the hook process's own working directory, which is
+    // whatever the harness happened to launch it in. The Python hook has always
+    // used the payload value; reading current_dir() here resolved a different
+    // store, and a store that does not exist injects nothing, silently. The slug
+    // was hard-wired to "-root" before that.
+    let slug = engram_paths::resolve_slug_in(
+        args.slug.as_deref(),
+        payload
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(Path::new),
+    );
 
     // recall.inject was read by the Python hook and ignored here: `enabled` had no
     // effect and `k` was the literal 4. A config that cannot be read leaves the

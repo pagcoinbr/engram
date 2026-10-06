@@ -280,6 +280,39 @@ turned up immediately.
   missing value followed by an unknown flag, and the documented invocation was
   unusable as typed.
 
+### Fixed — second Copilot review
+
+The fresh review resolved 24 of its earlier findings and raised five more. All
+five were real, and two of them were holes left by this remediation itself.
+
+- **Recall filters Qdrant by embedding space, not only by slug.** The `space`
+  payload was being written and never read back. Indexing is incremental, so a
+  same-dimension model change leaves points from two spaces in one collection —
+  and vectors from different models are not comparable, so scoring a new query
+  against old points produces confident nonsense with nothing to signal it. Fixed
+  on both the Rust and Python search paths, and in the Python near-duplicate
+  finder, where a cosine across two models is not a similarity at all. Recall
+  returns fewer results until a reindex completes, which is the right trade:
+  incomplete beats wrongly ranked.
+- **The daemon no longer runs a Graphiti export or reconcile under a native
+  reader.** `engram-graph-sync` is a wrapper around `graph/graph_sync.py`, so both
+  branches of those jobs wrote the legacy schema — and the condition was inverted,
+  reaching for the wrapper precisely when the backend was `native`. The same split
+  brain `task_graph` was fixed for, left in place on the other two jobs.
+- **The Atlas fallback defaults a missing `graph:` block to `graphiti_compat`.** It
+  fabricated `native`, so saving any unrelated setting through the fallback
+  materialised a block that moved an upgraded install off its populated index —
+  the bug the Rust default was changed to fix, reintroduced on the path taken when
+  the Rust API is down.
+- **The Atlas fallback rejects credential-bearing URLs,** like Rust's `endpoint()`.
+  Accepting them only when the Rust API is down is worse than accepting them
+  everywhere: the bypass appears exactly when nobody is looking.
+- **The recall hook resolves its slug from the payload `cwd`,** as the Python hook
+  always has, rather than from the hook process's own working directory — which is
+  whatever the harness launched it in. The two resolved different stores, and a
+  store that does not exist injects nothing, silently, with exit 0, looking exactly
+  like "no relevant memories".
+
 ### Known limitations
 
 Stated rather than silently carried:

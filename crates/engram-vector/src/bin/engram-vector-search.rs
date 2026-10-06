@@ -14,8 +14,13 @@ struct Args {
     collection: String,
     #[arg(long)]
     query: String,
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     slug: Option<String>,
+    /// Restrict to one embedding space. This binary is a low-level probe with no
+    /// config, so it cannot derive the active space itself — pass it to avoid
+    /// scoring against points written by a different model.
+    #[arg(long)]
+    space: Option<String>,
 }
 #[tokio::main]
 async fn main() {
@@ -24,7 +29,7 @@ async fn main() {
         let embeddings = OpenAiCompatibleClient::new(args.embed_endpoint)?;
         let vector = embeddings.embedding(&args.model, &args.query).await?;
         let hits = QdrantClient::new(args.qdrant_url, args.collection)
-            .search(vector, 6, args.slug.as_deref())
+            .search(vector, 6, args.slug.as_deref(), args.space.as_deref())
             .await?;
         Ok::<_, Box<dyn std::error::Error>>(hits)
     }

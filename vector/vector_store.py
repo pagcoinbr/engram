@@ -117,9 +117,17 @@ class EngramVectorStore:
         # kind="query" applies embed.query_prefix; indexing uses the document
         # prefix. Applying neither put documents and queries in different spaces.
         qv = engram_llm.embed(query, self.cfg, kind="query")
+        # Scope to the ACTIVE embedding space, always. Indexing is incremental, so
+        # after a same-dimension model change the collection holds points from two
+        # spaces at once, and vectors from different models are not comparable —
+        # scoring a new query against old points yields confident nonsense with
+        # nothing to signal it. Recall returns less until the reindex finishes,
+        # which is the right trade: incomplete beats wrongly ranked.
+        scoped = dict(filters or {})
+        scoped["space"] = engram_llm.embedding_space_id(self.cfg)
         res = self.client.query_points(
             collection_name=self.collection, query=qv, limit=k,
-            query_filter=self._build_filter(filters),
+            query_filter=self._build_filter(scoped),
             score_threshold=(threshold or None), with_payload=True).points
         return [self._hit(p) for p in res]
 
@@ -129,7 +137,13 @@ class EngramVectorStore:
         For each indexed point, ask Qdrant for its nearest neighbours and keep
         pairs scoring >= threshold (deduped, sorted high->low). Scoped to the
         current slug by default so a shared collection doesn't cross stores."""
-        qfilter = self._build_filter({"slug": slug()}) if scope_slug else None
+        # Space-scoped as well as slug-scoped: a cosine between vectors from two
+        # different models is not a similarity, so a mid-reindex collection would
+        # otherwise produce duplicate "pairs" that are artefacts of the model
+        # change rather than of the memories.
+        space = engram_llm.embedding_space_id(self.cfg)
+        qfilter = self._build_filter(
+            {"slug": slug(), "space": space} if scope_slug else {"space": space})
         seen = set()
         pairs = []
         for pt in self._scroll_all(with_vectors=True):

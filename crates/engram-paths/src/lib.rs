@@ -72,6 +72,21 @@ pub fn resolve_slug_in_cwd(cli: Option<&str>) -> String {
     resolve(cli, cwd.as_deref())
 }
 
+/// As [`resolve_slug_in_cwd`], but for a caller that is *told* the directory.
+///
+/// A hook's process cwd is not necessarily the session's project directory —
+/// Claude Code passes the session `cwd` in the hook payload, which is what
+/// `bin/hooks/memory-recall-inject.py` uses. Deriving it from
+/// `std::env::current_dir()` instead made the Rust hook resolve a different store
+/// than its Python sibling whenever the two differed, and a store that does not
+/// exist injects nothing at all, silently.
+pub fn resolve_slug_in(cli: Option<&str>, cwd: Option<&Path>) -> String {
+    match cwd {
+        Some(dir) => resolve(cli, Some(dir)),
+        None => resolve_slug_in_cwd(cli),
+    }
+}
+
 fn resolve(cli: Option<&str>, cwd: Option<&Path>) -> String {
     if let Some(slug) = cli.map(str::trim).filter(|s| !s.is_empty()) {
         return slug.to_string();
@@ -144,6 +159,36 @@ fn home_dir() -> PathBuf {
 mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// A hook is TOLD its project directory; it must not guess from its own cwd.
+    ///
+    /// Claude Code passes the session `cwd` in the hook payload, and the hook
+    /// process's working directory is whatever the harness launched it in. The
+    /// Python hook has always used the payload value. Reading `current_dir()`
+    /// instead resolved a different store, and a store that does not exist
+    /// injects nothing at all — silently, with exit 0, looking exactly like
+    /// "no relevant memories".
+    #[test]
+    fn a_supplied_directory_beats_the_process_cwd() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var("CLAUDE_MEMORY_SLUG");
+        }
+        let supplied = Path::new("/home/alice/projects/api");
+        assert_eq!(
+            resolve_slug_in(None, Some(supplied)),
+            "-home-alice-projects-api"
+        );
+        // No directory supplied: fall back to deriving one, not to a panic or a
+        // hard-coded store.
+        assert_eq!(
+            resolve_slug_in(None, None),
+            resolve_slug_in_cwd(None),
+            "an absent cwd must fall back to the cwd-derived slug"
+        );
+        // An explicit --slug still wins over both.
+        assert_eq!(resolve_slug_in(Some("-pinned"), Some(supplied)), "-pinned");
+    }
 
     /// Env vars are process-global and cargo runs tests on threads, so every test
     /// that touches them has to take the same lock.

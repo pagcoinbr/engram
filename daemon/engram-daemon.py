@@ -381,21 +381,38 @@ def task_curate():
         _run([_vector_python(), str(ac), "--apply"])
 
 
+def _graphiti_maintenance(mode: str, *python_args: str) -> bool:
+    """Run a Graphiti export/reconcile pass, or skip it under a native reader.
+
+    `engram-graph-sync` is a thin wrapper that shells out to graph/graph_sync.py,
+    so BOTH branches here write and verify the legacy Graphiti schema. The old
+    condition had it backwards: it reached for the wrapper precisely when the
+    backend was `native`, running a Graphiti export while recall read the native
+    index — the same split brain that task_graph was fixed for, left in place on
+    the export and reconcile jobs.
+
+    There is no native export or reconcile yet, and operating on an index nothing
+    reads is worse than not operating: it looks like maintenance is happening.
+    """
+    if not graphiti_compat_enabled():
+        log(f"{mode}: native backend selected and there is no native {mode} — "
+            f"SKIPPING (graph.backend: graphiti_compat enables the Graphiti one)")
+        return False
+    rust_sync = _rust("engram-graph-sync")
+    if rust_sync:
+        return _run([str(rust_sync), "--config", str(ENGRAM_CONFIG),
+                     "--graph-dir", str(ENGRAM_GRAPH), "--mode", mode]) == 0
+    return _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), *python_args]) == 0
+
 def task_export():
     if not _neo4j_up():
         return False
-    rust_sync = _rust("engram-graph-sync")
-    if not graphiti_compat_enabled() and rust_sync:
-        return _run([str(rust_sync), "--config", str(ENGRAM_CONFIG), "--graph-dir", str(ENGRAM_GRAPH), "--mode", "export"]) == 0
-    _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--export", "--verify"])
+    return _graphiti_maintenance("export", "--export", "--verify")
 
 def task_reconcile():
     if not _neo4j_up():
         return False
-    rust_sync = _rust("engram-graph-sync")
-    if not graphiti_compat_enabled() and rust_sync:
-        return _run([str(rust_sync), "--config", str(ENGRAM_CONFIG), "--graph-dir", str(ENGRAM_GRAPH), "--mode", "reconcile"]) == 0
-    _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--reconcile"])
+    return _graphiti_maintenance("reconcile", "--reconcile")
 
 def task_approvals():
     """Process the async human-approval queue: consume Telegram callbacks, expire
