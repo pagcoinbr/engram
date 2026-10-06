@@ -33,7 +33,7 @@ CLI:
   engram_llm.py --embed                 # read text on stdin, print JSON vector
 """
 from __future__ import annotations
-import json, os, re, shutil, subprocess, sys, urllib.request
+import hashlib, json, os, re, shutil, struct, subprocess, sys, urllib.request
 from pathlib import Path
 
 # Make sibling modules importable; the sibling (this dir) wins over ~/.claude so
@@ -380,15 +380,72 @@ def _check_embed_dim(vec, cfg):
                            f"embed.dim is {int(want)} — check embed.model/provider")
     return vec
 
-def embed(text: str, cfg=None):
+def _embed_endpoint(cfg) -> str:
+    """Where embeddings are requested: `embed.url`, else the generation endpoint.
+    Mirrors `Config::embed_endpoint` so both halves agree on the space."""
+    ec = cfg.get("embed") or {}
+    return (ec.get("url") or (cfg.get("llama_cpp") or {}).get("url") or "").strip()
+
+
+def embedding_space_id(cfg=None) -> str:
+    """Fingerprint the embedding space: provider, endpoint, model, prefixes, dim.
+
+    Byte-for-byte identical to `Config::embedding_space_id` in Rust — the two
+    implementations index the same Qdrant collection, so a disagreement here
+    would make each one consider the other's records stale forever. Pinned from
+    both sides by `tests/test_embed_space.py` and the Rust unit test of the same
+    name.
+
+    Content hashes alone could not tell that the *model* had changed, so swapping
+    to a different model of the same dimension left every record "current" while
+    the vectors were no longer comparable.
+    """
+    cfg = _cfg(cfg)
+    ec = cfg.get("embed") or {}
+    digest = hashlib.sha256()
+    for part in (_embed_provider(cfg), _embed_endpoint(cfg), ec.get("model") or "",
+                 ec.get("query_prefix") or "", ec.get("document_prefix") or ""):
+        digest.update(str(part).encode())
+        digest.update(b"\0")
+    digest.update(struct.pack("<I", int(ec.get("dim") or DEFAULT_EMBED_DIM)))
+    return digest.hexdigest()[:16]
+
+
+def document_text(text: str, cfg=None) -> str:
+    """Prefix a document before indexing it (asymmetric models need this)."""
+    return f"{(_cfg(cfg).get('embed') or {}).get('document_prefix') or ''}{text}"
+
+
+def query_text(text: str, cfg=None) -> str:
+    """Prefix a query before searching with it."""
+    return f"{(_cfg(cfg).get('embed') or {}).get('query_prefix') or ''}{text}"
+
+
+def embed(text: str, cfg=None, kind: str | None = None):
     """Embed `text` in the configured space.
 
     An explicitly configured provider NEVER falls back: a dead llama-server used to
     silently hand back CPU fastembed vectors from a different model, in a different
     dimension, poisoning the index with no error anywhere. Only the auto-selected
     default (no `embed.provider` set) is allowed to degrade to fastembed.
+
+    `kind` selects the asymmetric-model prefix: `"document"` applies
+    `embed.document_prefix`, `"query"` applies `embed.query_prefix`. Both keys
+    were configurable, round-tripped by the editor, and applied by nothing — so an
+    asymmetric model indexed and queried in two different spaces.
+
+    `kind=None` (the default) applies NEITHER, which is what callers that cannot
+    distinguish the two sides need. Defaulting to the document side instead would
+    have silently prefixed queries too: Graphiti's embedder and the reranker in
+    `graph/mg_config.py` route both passages and queries through one call, and
+    `memory_ai.ollama_embed` discards its role argument entirely. A wrong prefix
+    is worse than no prefix — it moves the query out of the index's space.
     """
     cfg = _cfg(cfg)
+    if kind == "document":
+        text = document_text(text, cfg)
+    elif kind == "query":
+        text = query_text(text, cfg)
     prov = _embed_provider(cfg)
     explicit = _embed_provider_is_explicit(cfg)
     if prov == "llama_cpp":

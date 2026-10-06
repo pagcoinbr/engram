@@ -26,6 +26,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "bin"))
 if str(Path.home() / ".claude") not in sys.path:
     sys.path.append(str(Path.home() / ".claude"))
+import engram_llm
 import memory_ai
 import vector_config as vc
 import engram_secrets
@@ -45,8 +46,36 @@ def _store_files() -> list[Path]:
         return []
     return sorted(p for p in MEM_DIR.glob("*.md") if p.name != "MEMORY.md")
 
+_CFG_CACHE: dict | None = None
+
+
+def _cfg() -> dict:
+    """One config read per process: `_sha` is called per file, and reloading
+    engram.yaml for each one turned a cheap hash into the sync's hot path."""
+    global _CFG_CACHE
+    if _CFG_CACHE is None:
+        _CFG_CACHE = memory_ai.load()
+    return _CFG_CACHE
+
+
 def _sha(p: Path) -> str:
-    return hashlib.sha256(p.read_bytes()).hexdigest()
+    """Freshness key: file content AND the embedding space it was indexed in.
+
+    Content alone could not see a model change. Pointing `embed.model` at a
+    different model of the same dimension left every record "current" while its
+    vectors were no longer comparable to new ones — the index looked healthy and
+    recall quietly degraded. Folding in the space id invalidates the whole store
+    on exactly the changes that make old vectors meaningless.
+
+    This matches what the Rust indexer does (`engram-index.rs`), which shares the
+    collection; `engram_llm.embedding_space_id` is pinned equal across both.
+    """
+    space = engram_llm.embedding_space_id(_cfg())
+    digest = hashlib.sha256()
+    digest.update(space.encode())
+    digest.update(b"\0")
+    digest.update(p.read_bytes())
+    return digest.hexdigest()
 
 def _load_sync() -> dict:
     return json.loads(SYNC_STATE.read_text()) if SYNC_STATE.exists() else {}

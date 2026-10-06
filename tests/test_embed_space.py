@@ -106,6 +106,65 @@ def test_provider_aliases(llm):
     print("ok — provider resolution: openai aliases to llama_cpp, junk falls to auto")
 
 
+#: `Config::embedding_space_id` of the reference config below, pinned in Rust as
+#: `engram_config::PINNED_EMBEDDING_SPACE_ID`. Both sides assert this literal, so
+#: neither can drift without a test failing.
+PINNED_EMBEDDING_SPACE_ID = "b941b4f74fc6de19"
+
+REFERENCE_CFG = {"embed": {"provider": "llama_cpp", "url": "http://127.0.0.1:8081/v1",
+                           "model": "bge-m3", "dim": 1024}}
+
+
+def test_space_id_matches_rust(llm):
+    """Rust and Python index the SAME Qdrant collection.
+
+    If their fingerprints differed, each would treat the other's records as
+    belonging to a foreign space and re-embed the entire store on every run,
+    forever. Pinned from both sides against a literal.
+    """
+    assert llm.embedding_space_id(REFERENCE_CFG) == PINNED_EMBEDDING_SPACE_ID, (
+        f"python fingerprint {llm.embedding_space_id(REFERENCE_CFG)} != "
+        f"rust {PINNED_EMBEDDING_SPACE_ID}")
+    print("ok — the embedding-space fingerprint agrees with the Rust implementation")
+
+
+def test_space_id_covers_every_vector_affecting_key(llm):
+    """Content hashing could not see these changes; the fingerprint must."""
+    base = llm.embedding_space_id(REFERENCE_CFG)
+    for change in ({"model": "qwen3-embedding-0.6b"},      # same dim, different model
+                   {"url": "http://elsewhere/v1"},
+                   {"dim": 768},
+                   {"query_prefix": "query: "},
+                   {"document_prefix": "passage: "}):
+        cfg = {"embed": dict(REFERENCE_CFG["embed"], **change)}
+        assert llm.embedding_space_id(cfg) != base, f"space unchanged for {change}"
+    # and stable for an equivalent config (openai aliases to llama_cpp)
+    same = {"embed": dict(REFERENCE_CFG["embed"], provider="openai")}
+    assert llm.embedding_space_id(same) == base
+    print("ok — the fingerprint moves on model/endpoint/dim/prefix changes only")
+
+
+def test_prefixes_are_applied_per_side(llm):
+    """Both keys were configurable, round-tripped by the editor, and applied by
+    nothing — so an asymmetric model indexed and queried in different spaces."""
+    cfg = {"embed": {"provider": "llama_cpp", "url": "http://e/v1", "dim": 4,
+                     "query_prefix": "query: ", "document_prefix": "passage: "}}
+    seen = []
+    restore = _stub(llm, _llama_embed=lambda text, c: seen.append(text) or [0.0] * 4)
+    try:
+        llm.embed("sharks", cfg, kind="document")
+        llm.embed("sharks", cfg, kind="query")
+        # No kind: NEITHER prefix. Callers that cannot tell the two sides apart
+        # (Graphiti's embedder, the reranker, memory_ai.ollama_embed) go through
+        # this path, and guessing "document" would move their queries out of the
+        # index's space — a wrong prefix is worse than none.
+        llm.embed("sharks", cfg)
+    finally:
+        restore()
+    assert seen == ["passage: sharks", "query: sharks", "sharks"], seen
+    print("ok — document and query prefixes are applied on their own side only")
+
+
 def main():
     with tempfile.TemporaryDirectory() as d:
         os.environ["HOME"] = d
@@ -114,6 +173,9 @@ def main():
         test_explicit_provider_never_falls_back(llm)
         test_auto_provider_still_degrades(llm)
         test_dim_guard(llm)
+        test_space_id_matches_rust(llm)
+        test_space_id_covers_every_vector_affecting_key(llm)
+        test_prefixes_are_applied_per_side(llm)
 
 
 if __name__ == "__main__":

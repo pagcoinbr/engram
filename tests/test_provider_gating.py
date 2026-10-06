@@ -94,6 +94,67 @@ def test_graph_backend_default_and_override(home):
     print("ok — graph backend: graphiti_compat by default, env override honored on the write side")
 
 
+def test_native_sync_needs_an_endpoint_for_each_half(home):
+    """A native sync embeds AND extracts, through two different services.
+
+    Gating on embeddings alone sent the binary off to fail on an empty generation
+    URL. But the requirement is `llama_cpp.url` — what the sync's reasoning client
+    is built from — and NOT `backend`, which selects the *Python pipeline's*
+    generation backend. A first attempt at this gate required both and declared an
+    ordinary `backend: ollama` install with an OpenAI-compatible `llama_cpp.url`
+    unserviceable, which it is not.
+
+    Must agree with Config::rust_native_sync_supported in Rust.
+    """
+    mod = load_daemon(home, "backend: ollama\n")
+    embed_ok = "embed:\n  provider: llama_cpp\n  url: \"http://e/v1\"\n"
+    generation = "llama_cpp:\n  url: \"http://g/v1\"\n"
+    cases = [
+        (f"backend: llama_cpp\n{generation}{embed_ok}", True, "both endpoints present"),
+        (f"backend: openai\n{generation}{embed_ok}", True, "both endpoints present"),
+        (f"backend: claude\n{generation}{embed_ok}", True,
+         "`backend` is the Python pipeline's choice; the sync uses llama_cpp.url"),
+        (f"backend: ollama\n{generation}{embed_ok}", True,
+         "same — an Ollama pipeline alongside an OpenAI-compatible endpoint works"),
+        (f"backend: llama_cpp\n{embed_ok}", False, "no generation endpoint configured"),
+    ]
+    for yaml_text, want, why in cases:
+        write_config(home, yaml_text)
+        got = mod.rust_native_sync_supported()
+        assert got == want, f"{why}: expected {want}, got {got} for {yaml_text!r}"
+        # The embedding half is satisfied throughout, which is why one combined
+        # check was not enough to catch the missing generation endpoint.
+        assert mod.rust_embedding_supported(), why
+    print(f"ok — native sync requires an endpoint for each half ({len(cases)} configs)")
+
+
+def test_native_backend_never_falls_back_to_the_graphiti_writer(home):
+    """Writing the index nobody is reading is worse than writing nothing.
+
+    When `graph.backend: native` is selected the reader queries the native index.
+    The old fallback ran graph_sync.py — the GRAPHITI writer — whenever the Rust
+    sync could not serve the config, so saves landed in one index while recall
+    queried the other. That presents as memories that were saved and then cannot
+    be recalled, with nothing in the logs connecting the two.
+    """
+    mod = load_daemon(home, "backend: ollama\n")
+    # native selected, but Rust cannot serve it (ollama generation)
+    # Unserviceable because there is no generation endpoint for extraction —
+    # NOT because of the `backend` value, which the Rust sync does not consult.
+    write_config(home, "backend: ollama\ngraph:\n  backend: native\n"
+                       "embed:\n  provider: llama_cpp\n  url: \"http://e/v1\"\n")
+    assert not mod.graphiti_compat_enabled()
+    assert not mod.rust_native_sync_supported()
+
+    ran = []
+    mod._run = lambda cmd, **kw: ran.append(cmd) or 0
+    mod._neo4j_up = lambda *a, **k: True
+    mod._graph_enabled = lambda *a, **k: True
+    assert mod.task_graph() is False, "an unserviceable native sync must report failure"
+    assert ran == [], f"it wrote to an index nothing is reading: {ran}"
+    print("ok — a native backend that Rust cannot serve skips instead of writing Graphiti")
+
+
 def test_config_path_and_slug_resolution(home):
     """Children must receive the config the daemon actually loaded, and the slug
     pinned by the operator — not re-derived values."""
@@ -117,6 +178,8 @@ def main():
     with tempfile.TemporaryDirectory() as d:
         test_provider_gating(d)
         test_graph_backend_default_and_override(d)
+        test_native_sync_needs_an_endpoint_for_each_half(d)
+        test_native_backend_never_falls_back_to_the_graphiti_writer(d)
         test_config_path_and_slug_resolution(d)
 
 

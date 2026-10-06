@@ -123,9 +123,32 @@ def rust_embedding_supported() -> bool:
     if provider == "openai":
         provider = "llama_cpp"
     if not provider:
-        provider = "ollama" if (c.get("backend") or "") == "ollama" else "fastembed"
+        # Case-insensitive, like engram_llm._embed_provider and Rust's
+        # Config::embed_provider. Comparing raw text made `backend: Ollama`
+        # resolve to Ollama in both implementations and FastEmbed in this gate.
+        provider = "ollama" if (c.get("backend") or "").strip().lower() == "ollama" else "fastembed"
     url = (embed.get("url") or (c.get("llama_cpp", {}) or {}).get("url") or "").strip()
     return provider == "llama_cpp" and bool(url)
+
+def rust_reasoning_supported() -> bool:
+    """Whether the Rust native sync has a generation endpoint to extract against.
+
+    Separate from the embedding question because a native sync needs both, and a
+    config can satisfy one and not the other: gating on embeddings alone sent the
+    binary off to fail on an empty URL.
+
+    The requirement is `llama_cpp.url` — what the sync's reasoning client is built
+    from — and NOT `backend`, which selects the *Python pipeline's* generation
+    backend. Requiring both declared an ordinary `backend: ollama` install with an
+    OpenAI-compatible `llama_cpp.url` unserviceable. Mirrors
+    Config::rust_reasoning_supported.
+    """
+    url = ((_raw_cfg().get("llama_cpp", {}) or {}).get("url") or "").strip()
+    return bool(url)
+
+def rust_native_sync_supported() -> bool:
+    """A native graph sync needs an embedding endpoint AND a reasoning endpoint."""
+    return rust_embedding_supported() and rust_reasoning_supported()
 
 
 def _raw_cfg() -> dict:
@@ -250,12 +273,23 @@ def task_graph():
     # kill costs the in-flight memory, not the batch — size this for the cap, not for
     # safety. 25 @ ~40s measured (think:false, 2026-08-14) ~= 17 min, 3x headroom.
     rust_sync = _rust("engram-native-graph-sync")
-    if not graphiti_compat_enabled() and rust_sync and rust_embedding_supported():
-        return _run([str(rust_sync), "--config", str(ENGRAM_CONFIG),
-                     "--slug", memory_slug(), "--limit", "25"]) == 0
-    if not graphiti_compat_enabled() and rust_sync:
-        log(f"graph: native backend selected but the Rust sync cannot serve the "
-            f"configured embedding provider — using the Python path")
+    if not graphiti_compat_enabled():
+        # The native backend is selected, so the READER queries the native index.
+        # Only the native writer may run here.
+        if rust_sync and rust_native_sync_supported():
+            return _run([str(rust_sync), "--config", str(ENGRAM_CONFIG),
+                         "--slug", memory_slug(), "--limit", "25"]) == 0
+        # Do NOT fall back to graph_sync.py: it writes the Graphiti index, which
+        # nothing is reading in this configuration. The old fallback produced a
+        # split brain — writes landing in one index while recall queried the
+        # other — and presented as memories that were saved and then could not be
+        # recalled. Skipping is visible and recoverable; writing to the wrong
+        # index is neither.
+        log("graph: native backend selected but the Rust sync cannot serve this "
+            "config (embeddings: %s, reasoning: %s) — SKIPPING. Set "
+            "graph.backend: graphiti_compat to use the Python writer."
+            % (rust_embedding_supported(), rust_reasoning_supported()))
+        return False
     return _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"),
                  "--insert", "--limit", "25"]) == 0
 
