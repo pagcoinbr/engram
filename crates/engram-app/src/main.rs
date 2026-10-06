@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     net::SocketAddr,
+    os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
@@ -398,48 +399,145 @@ fn revision(path: &Path) -> Result<String, String> {
 
 /// An exclusive lock around the read-validate-write sequence.
 ///
-/// `O_EXCL` on a sibling lockfile, so no new dependency. A lock older than
-/// [`ConfigLock::STALE`] is assumed to belong to a crashed process and is broken —
-/// a config editor must not be permanently wedged by one bad exit.
-struct ConfigLock(PathBuf);
+/// `flock(2)` on a persistent sibling lockfile, held by the kernel.
+///
+/// Two earlier designs were wrong in the same way. `O_EXCL` plus an
+/// unlink-if-old stale breaker races with its own cure — A sees an old lock, its
+/// owner exits, B creates a fresh one, and A's unlink deletes *B's* lock, putting
+/// two writers in the critical section. Adding an owner token and re-reading it
+/// before the unlink narrows that window but cannot close it: read-then-unlink is
+/// still two syscalls with no atomicity between them, in acquire and in `Drop`
+/// alike.
+///
+/// `flock` has no such window. Ownership lives in the kernel, not in the
+/// directory entry, so there is nothing to check-then-act on; the lock is
+/// released automatically when the fd closes, including on crash or `SIGKILL`,
+/// which removes the need for a staleness heuristic at all. The lockfile is never
+/// unlinked, so no process can delete a file another process holds.
+#[derive(Debug)]
+struct ConfigLock {
+    /// Held only for its side effect: closing this file releases the flock,
+    /// which is why there is no `Drop` impl and nothing to unlink.
+    _file: fs::File,
+}
 
 impl ConfigLock {
-    const STALE: Duration = Duration::from_secs(30);
-    const ATTEMPTS: u32 = 50;
+    /// How long to wait for a concurrent save before reporting contention.
+    /// Comfortably longer than a legitimate save (read, validate, fsync, rename).
+    const WAIT: Duration = Duration::from_secs(10);
+    const POLL: Duration = Duration::from_millis(20);
 
     fn acquire(config: &Path) -> Result<Self, String> {
+        Self::acquire_within(config, Self::WAIT)
+    }
+
+    fn acquire_within(config: &Path, wait: Duration) -> Result<Self, String> {
         let path = config.with_extension("yaml.lock");
-        for _ in 0..Self::ATTEMPTS {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Self(path)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if fs::metadata(&path)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                        .is_some_and(|age| age > Self::STALE)
-                    {
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(error) => return Err(format!("could not lock configuration: {error}")),
+        // Opened, never removed: the file is just a handle for the kernel lock.
+        //
+        // Group/other-writable, unlike the config itself. The file holds no
+        // content — all the state is the kernel's — so there is nothing to
+        // protect, and because it is persistent a restrictive mode outlives
+        // whoever created it: once the config changes hands to a service user,
+        // that user can own the config and the directory and still not be able to
+        // open a lockfile left by the old owner.
+        //
+        // `OpenOptions::mode` is not enough on its own — it is masked by the
+        // process umask, so the usual `0022` turns `0666` into `0644` and the
+        // lockout is unchanged. The mode is therefore set explicitly, through the
+        // open file descriptor rather than the path: a path-based `chmod` races
+        // with anything that replaces the entry between create and chmod, and
+        // would then re-permission the wrong file.
+        let file = match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o666)
+            .open(&path)
+        {
+            Ok(file) => {
+                // As the creator, failing to widen the mode is a real failure, not
+                // a detail to swallow: the lock would be acquired at the very mode
+                // this exists to avoid, and the next owner is locked out with no
+                // sign of why.
+                file.set_permissions(fs::Permissions::from_mode(0o666))
+                    .map_err(|error| {
+                        format!("could not set the mode on {}: {error}", path.display())
+                    })?;
+                file
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .map_err(|error| {
+                        format!(
+                            "could not open the config lock {}: {error}. If it was left by \
+                         another user, remove it — it carries no state.",
+                            path.display()
+                        )
+                    })?;
+                // Migrate a lockfile created before this mode was used. Best
+                // effort by necessity — it may belong to another user, in which
+                // case we could still open it and the lock works regardless.
+                let _ = file.set_permissions(fs::Permissions::from_mode(0o666));
+                file
+            }
+            Err(error) => {
+                return Err(format!("could not create {}: {error}", path.display()));
+            }
+        };
+        let deadline = SystemTime::now() + wait;
+        loop {
+            // SAFETY: a valid fd owned by `file` for the duration of the call.
+            let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if locked == 0 {
+                return Ok(Self { _file: file });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(format!("could not lock configuration: {error}"));
+            }
+            if SystemTime::now() >= deadline {
+                return Err("configuration is locked by another save; try again".into());
+            }
+            std::thread::sleep(Self::POLL);
+        }
+    }
+
+    /// Whether the lock is contended, probed through a *separate* open file
+    /// description — for tests, which cannot observe a kernel lock on disk.
+    ///
+    /// `flock` locks are held per open file description, not per process, so this
+    /// probe conflicts with a live `ConfigLock` exactly as another process's would.
+    /// It is still a weaker claim than a true cross-process test: it demonstrates
+    /// the mechanism, not a second `execve`.
+    #[cfg(test)]
+    fn is_contended(config: &Path) -> Result<bool, String> {
+        let path = config.with_extension("yaml.lock");
+        let file = fs::File::options()
+            .write(true)
+            .open(&path)
+            .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+        // SAFETY: a valid fd owned by `file` for the duration of both calls.
+        unsafe {
+            if libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+                return Ok(false);
             }
         }
-        Err("configuration is locked by another save; try again".into())
+        // Only contention means "held"; anything else is a real failure and must
+        // not be reported as a healthy lock.
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            Ok(true)
+        } else {
+            Err(format!("probe failed: {error}"))
+        }
     }
 }
 
-impl Drop for ConfigLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
+// Dropping the File closes the fd, which releases the flock. No unlink, so there
+// is no way to delete a lock another process is holding.
 
 fn write_edit(path: &Path, edit: &EditableConfig) -> Result<String, String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
@@ -650,6 +748,75 @@ async fn probe(config: &Config, profile: ModelProfile) -> ModelStatus {
 mod tests {
     use super::*;
 
+    /// Locking is exclusive between independent opens, released on drop, and
+    /// never deletes the lockfile.
+    ///
+    /// The lockfile is a handle for a kernel lock, not the lock itself. Two
+    /// earlier designs tried to encode ownership in the directory entry and raced
+    /// on check-then-unlink; there is nothing here to race on. Scope: `flock` is
+    /// per open file description, so the probe here conflicts exactly as another
+    /// process's would — but this is still an in-process demonstration of the
+    /// mechanism, not a cross-process test.
+    #[test]
+    fn the_config_lock_is_exclusive_between_independent_opens() {
+        let dir = std::env::temp_dir().join(format!("engram-lock-{}", unique_suffix()));
+        fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("engram.yaml");
+        fs::write(&config, "embed: {dim: 1024}\n").unwrap();
+        let lock_path = config.with_extension("yaml.lock");
+
+        let held = ConfigLock::acquire(&config).unwrap();
+        assert!(ConfigLock::is_contended(&config).unwrap());
+
+        // Genuinely group/other-writable, so a later service user can still open
+        // the persistent lockfile. `OpenOptions::mode` alone does not achieve
+        // this: the usual 0022 umask silently turns 0666 into 0644 and the
+        // ownership-change lockout stays exactly as it was.
+        let mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o666,
+            "lockfile mode is {mode:o}, umask was not overcome"
+        );
+
+        // A lockfile left at a restrictive mode by an earlier version is widened
+        // on the next acquisition, so an upgraded install does not inherit the
+        // lockout permanently.
+        drop(held);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let held = ConfigLock::acquire(&config).unwrap();
+        let mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o666,
+            "an existing lockfile was not migrated ({mode:o})"
+        );
+
+        // A second acquisition does not succeed, waits out its window rather
+        // than failing instantly, and gives up rather than hanging. Tested with
+        // a short window so CI does not pay the production one.
+        let window = Duration::from_millis(200);
+        let waited = SystemTime::now();
+        let error =
+            ConfigLock::acquire_within(&config, window).expect_err("lock was not exclusive");
+        let elapsed = waited.elapsed().unwrap();
+        assert!(error.contains("locked by another save"), "{error}");
+        assert!(elapsed >= window, "gave up early: {elapsed:?}");
+        assert!(elapsed < window * 10, "did not give up: {elapsed:?}");
+        // ...and the production window is long enough to outlast a real save.
+        assert!(ConfigLock::WAIT >= Duration::from_secs(5));
+
+        // Releasing hands it on, and the file survives — nothing unlinks it, so
+        // no process can remove a lock another process holds.
+        drop(held);
+        assert!(lock_path.exists(), "the lockfile must persist");
+        assert!(
+            !ConfigLock::is_contended(&config).unwrap(),
+            "drop must release the lock"
+        );
+        let next = ConfigLock::acquire(&config).expect("released lock is reusable");
+        drop(next);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn edit() -> EditableConfig {
         EditableConfig {
             backend: "llama_cpp".into(),
@@ -766,22 +933,6 @@ mod tests {
         let reloaded = Config::load(&path).unwrap();
         assert_eq!(reloaded.embed.dim, 768, "the edit did not apply");
         assert_eq!(reloaded.llama_cpp.api_key.present(), Some("sk-keepme"));
-        fs::remove_dir_all(path.parent().unwrap()).ok();
-    }
-
-    #[test]
-    fn the_lock_is_exclusive_and_released_on_drop() {
-        let path = scratch("lock", "backend: ollama\n");
-        let first = ConfigLock::acquire(&path).unwrap();
-        assert!(
-            ConfigLock::acquire(&path).is_err(),
-            "two writers held the lock at once"
-        );
-        drop(first);
-        assert!(
-            ConfigLock::acquire(&path).is_ok(),
-            "the lock was not released"
-        );
         fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

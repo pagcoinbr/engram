@@ -24,6 +24,12 @@ pub const CONFIG_VERSION: u32 = 1;
 /// [`Config::rust_embedding_supported`].
 pub const RUST_EMBED_PROVIDERS: [&str; 2] = ["llama_cpp", "openai"];
 
+/// [`Config::embedding_space_id`] of the reference configuration
+/// `{provider: llama_cpp, url: http://127.0.0.1:8081/v1, model: bge-m3, dim: 1024}`,
+/// pinned so Rust and `bin/engram_llm.py` cannot drift apart. See the test
+/// `embedding_space_id_matches_the_python_implementation`.
+pub const PINNED_EMBEDDING_SPACE_ID: &str = "b941b4f74fc6de19";
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Config {
     #[serde(default)]
@@ -431,11 +437,15 @@ impl Config {
         if !self.vector_store.url.is_empty() {
             endpoint(&self.vector_store.url, "vector_store.url")?;
         }
-        if matches!(self.embed.provider.as_str(), "llama_cpp" | "openai")
-            && self.embed.url.is_empty()
-        {
+        // `embed_endpoint()` documents a fallback to `llama_cpp.url`, so require
+        // the *effective* endpoint rather than `embed.url` specifically —
+        // rejecting an empty `embed.url` outright contradicted the fallback and
+        // made the documented single-endpoint setup unloadable.
+        // Through embed_provider() so the check is case-insensitive and sees
+        // the same provider the embedding call will actually use.
+        if self.embed_provider() == "llama_cpp" && self.embed_endpoint().is_empty() {
             return Err(ConfigError::Invalid(
-                "embed.url is required for llama_cpp/openai embeddings".into(),
+                "embed.url (or llama_cpp.url) is required for llama_cpp/openai embeddings".into(),
             ));
         }
         if !matches!(self.graph.backend.as_str(), "native" | "graphiti_compat") {
@@ -443,6 +453,19 @@ impl Config {
                 "graph.backend must be native or graphiti_compat".into(),
             ));
         }
+        // Deliberately NOT rejected here: `graph.backend: native` without the
+        // endpoints the Rust sync needs.
+        //
+        // That check lived here briefly and was a mistake. `validate()` runs on
+        // every load, so it did not merely warn about an unwritable index — it
+        // made the config unloadable for every Rust consumer, including read-only
+        // recall against an already-populated native index, the parity evaluator,
+        // and `ENGRAM_GRAPH_BACKEND=graphiti_compat`, which could no longer rescue
+        // the install because validation happens before the override is read. A
+        // load-time error is the wrong severity for a condition that only affects
+        // the nightly writer; the daemon reports it at task time, where the
+        // operator can act on it and nothing else breaks.
+        // See `task_graph` in daemon/engram-daemon.py.
         if !self.graph.neo4j_http_url.is_empty() {
             endpoint(&self.graph.neo4j_http_url, "graph.neo4j_http_url")?;
         }
@@ -452,12 +475,18 @@ impl Config {
     /// The effective embedding provider, matching `engram_llm._embed_provider`:
     /// an explicit `embed.provider` wins (with `openai` an alias for `llama_cpp`),
     /// otherwise Ollama when generating via Ollama, else the CPU fastembed path.
-    pub fn embed_provider(&self) -> &str {
-        match self.embed.provider.trim() {
+    ///
+    /// Case-insensitive, because `engram_llm._embed_provider` lowercases before
+    /// matching. Matching case-sensitively here made `provider: OpenAI` resolve to
+    /// `llama_cpp` in Python and `fastembed` in Rust — two different embedding
+    /// spaces, two different fingerprints, and an index each side believed the
+    /// other had corrupted.
+    pub fn embed_provider(&self) -> &'static str {
+        match self.embed.provider.trim().to_ascii_lowercase().as_str() {
             "openai" | "llama_cpp" => "llama_cpp",
             "ollama" => "ollama",
             "fastembed" => "fastembed",
-            _ if self.backend == "ollama" => "ollama",
+            _ if self.backend.trim().eq_ignore_ascii_case("ollama") => "ollama",
             _ => "fastembed",
         }
     }
@@ -471,6 +500,31 @@ impl Config {
     /// could not perform it. Callers gate on this and fall back to Python.
     pub fn rust_embedding_supported(&self) -> bool {
         RUST_EMBED_PROVIDERS.contains(&self.embed_provider()) && !self.embed_endpoint().is_empty()
+    }
+
+    /// Whether the Rust native graph sync can perform *fact extraction* here.
+    ///
+    /// Separate from [`Config::rust_embedding_supported`] because the two halves
+    /// of a native sync use different services and a config can satisfy one and
+    /// not the other: gating on embeddings alone let the sync run with no
+    /// generation endpoint at all and fail on the URL parse.
+    ///
+    /// The requirement is exactly `llama_cpp.url`, which is what the sync's
+    /// reasoning client is built from — NOT `backend`. Requiring
+    /// `backend: llama_cpp`/`openai` as well looked stricter and was simply wrong:
+    /// `backend` selects the *pipeline's* generation backend (the Python
+    /// harvest/distill path), while the Rust sync has always used `llama_cpp.url`
+    /// directly. A perfectly ordinary `backend: ollama` install with an
+    /// OpenAI-compatible `llama_cpp.url` alongside it was working, and that gate
+    /// declared it unserviceable.
+    pub fn rust_reasoning_supported(&self) -> bool {
+        !self.llama_cpp.url.trim().is_empty()
+    }
+
+    /// Whether the Rust native graph sync can serve this config at all: it needs
+    /// both legs.
+    pub fn rust_native_sync_supported(&self) -> bool {
+        self.rust_embedding_supported() && self.rust_reasoning_supported()
     }
 
     /// Where embeddings are requested: `embed.url`, else the generation endpoint.
@@ -547,6 +601,15 @@ fn endpoint(value: &str, name: &str) -> Result<(), ConfigError> {
         .map_err(|_| ConfigError::Invalid(format!("{name} must be an absolute HTTP(S) URL")))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(ConfigError::Invalid(format!("{name} must use HTTP(S)")));
+    }
+    // Credentials belong in `api_key`, which is wrapped in `Secret` and redacted
+    // on every serialization path. A URL carrying userinfo
+    // (`https://user:pass@host/v1`) smuggles a password past all of that: the
+    // endpoint is published verbatim by /api/v1/status and the model editor.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ConfigError::Invalid(format!(
+            "{name} must not embed credentials in the URL; use the matching api_key instead"
+        )));
     }
     Ok(())
 }
@@ -651,6 +714,145 @@ mod tests {
         )
         .unwrap();
         assert_eq!(id, same.embedding_space_id(), "openai aliases to llama_cpp");
+    }
+
+    /// The Rust and Python fingerprints must be byte-identical.
+    ///
+    /// Both implementations write freshness state for the SAME Qdrant collection,
+    /// so if they disagreed each would see the other's records as belonging to a
+    /// foreign space and re-embed everything on every run, forever. A literal
+    /// digest pinned from both sides is the only form of this check that cannot
+    /// drift: `tests/test_embed_space.py` asserts the same constant.
+    /// Credentials belong in `api_key`, which is wrapped in `Secret`. A URL
+    /// carrying userinfo smuggled a password past all of that — the endpoint is
+    /// published verbatim by /api/v1/status and the model editor, so the one
+    /// field guaranteed to be visible became a credential channel.
+    #[test]
+    fn urls_may_not_carry_credentials() {
+        for yaml in [
+            "embed: {provider: llama_cpp, url: 'https://user:pass@host/v1', dim: 1024}\n",
+            "embed: {provider: llama_cpp, url: 'https://token@host/v1', dim: 1024}\n",
+            "llama_cpp: {url: 'https://user:pass@host/v1'}\nembed: {dim: 1024}\n",
+            "vector_store: {url: 'http://user:pass@host:6333'}\nembed: {dim: 1024}\n",
+        ] {
+            let config: Config = serde_yaml::from_str(yaml).unwrap();
+            let error = config
+                .validate()
+                .expect_err(&format!("accepted credentials in {yaml:?}"));
+            assert!(
+                format!("{error}").contains("must not embed credentials"),
+                "{error}"
+            );
+        }
+        // the same URLs without userinfo are fine
+        let clean: Config = serde_yaml::from_str(
+            "embed: {provider: llama_cpp, url: 'https://host/v1', dim: 1024}\n",
+        )
+        .unwrap();
+        clean.validate().unwrap();
+    }
+
+    /// Native sync needs an embedding endpoint AND a generation endpoint.
+    ///
+    /// Gating on embeddings alone let the sync run with no generation endpoint and
+    /// fail on the URL parse. The requirement is `llama_cpp.url` specifically —
+    /// what the sync's reasoning client is actually built from — and NOT
+    /// `backend`, which selects the Python pipeline's generation backend. A first
+    /// attempt at this gate required both and wrongly declared an ordinary
+    /// `backend: ollama` install with an OpenAI-compatible `llama_cpp.url`
+    /// unserviceable.
+    #[test]
+    fn native_sync_requires_an_endpoint_for_each_half() {
+        let embed_ok = "embed: {provider: llama_cpp, url: 'http://e/v1', dim: 1024}";
+
+        for backend in ["llama_cpp", "openai", "ollama", "claude"] {
+            let config: Config = serde_yaml::from_str(&format!(
+                "backend: {backend}\nllama_cpp: {{url: 'http://g/v1'}}\n{embed_ok}\n"
+            ))
+            .unwrap();
+            assert!(
+                config.rust_native_sync_supported(),
+                "backend {backend:?} has both endpoints and must be serviceable:                  `backend` is the Python pipeline's generation choice, not the                  endpoint this sync extracts against"
+            );
+        }
+
+        // No generation endpoint: the half that would fail on a URL parse.
+        let no_generation: Config =
+            serde_yaml::from_str(&format!("backend: llama_cpp\n{embed_ok}\n")).unwrap();
+        assert!(!no_generation.rust_native_sync_supported());
+        assert!(!no_generation.rust_reasoning_supported());
+        assert!(
+            no_generation.rust_embedding_supported(),
+            "the embedding half alone is satisfied, which is why one check was not enough"
+        );
+
+        // No embedding endpoint Rust can use.
+        let no_embedding: Config = serde_yaml::from_str(
+            "backend: ollama\nllama_cpp: {url: 'http://g/v1'}\nembed: {provider: ollama, dim: 768}\n",
+        )
+        .unwrap();
+        assert!(!no_embedding.rust_native_sync_supported());
+        assert!(no_embedding.rust_reasoning_supported());
+        assert!(!no_embedding.rust_embedding_supported());
+    }
+
+    /// An unwritable native index must not make the config unloadable.
+    ///
+    /// Rejecting it in `validate()` broke read-only recall against an existing
+    /// native index, the parity evaluator, and the `ENGRAM_GRAPH_BACKEND` escape
+    /// hatch — validation runs before the override is consulted. The daemon
+    /// reports it at task time instead.
+    #[test]
+    fn a_native_backend_without_a_rust_writer_still_loads() {
+        let config: Config = serde_yaml::from_str(
+            "graph: {backend: native}\nbackend: ollama\nembed: {provider: ollama, dim: 768}\n",
+        )
+        .unwrap();
+        config
+            .validate()
+            .expect("an unwritable native index is a daemon-time concern, not a load error");
+        assert!(!config.rust_native_sync_supported());
+    }
+
+    #[test]
+    fn provider_resolution_is_case_insensitive() {
+        for spelling in ["openai", "OpenAI", "OPENAI", " llama_cpp ", "LLAMA_CPP"] {
+            let config: Config = serde_yaml::from_str(&format!(
+                "embed: {{provider: '{spelling}', url: 'http://e/v1', model: m, dim: 1024}}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                config.embed_provider(),
+                "llama_cpp",
+                "{spelling:?} did not resolve to llama_cpp"
+            );
+            assert!(config.rust_embedding_supported(), "{spelling:?}");
+        }
+        for spelling in ["Ollama", "OLLAMA"] {
+            let config: Config =
+                serde_yaml::from_str(&format!("embed: {{provider: '{spelling}', dim: 768}}\n"))
+                    .unwrap();
+            assert_eq!(config.embed_provider(), "ollama", "{spelling:?}");
+        }
+        // the generation backend too, for the reasoning gate
+        let config: Config = serde_yaml::from_str(
+            "backend: LLAMA_CPP\nllama_cpp: {url: 'http://g/v1'}\nembed: {dim: 1024}\n",
+        )
+        .unwrap();
+        assert!(config.rust_reasoning_supported());
+    }
+
+    #[test]
+    fn embedding_space_id_matches_the_python_implementation() {
+        let config: Config = serde_yaml::from_str(
+            "embed: {provider: llama_cpp, url: 'http://127.0.0.1:8081/v1', model: bge-m3, dim: 1024}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.embedding_space_id(),
+            PINNED_EMBEDDING_SPACE_ID,
+            "fingerprint drifted from bin/engram_llm.py::embedding_space_id"
+        );
     }
 
     #[test]

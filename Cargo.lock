@@ -295,6 +295,7 @@ dependencies = [
  "engram-secrets",
  "engram-store",
  "engram-vector",
+ "libc",
  "regex",
  "serde",
  "serde_json",
