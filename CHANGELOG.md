@@ -40,10 +40,14 @@ endpoint — and everything that was true there and false elsewhere was hard-cod
   tense heuristic also scanned the whole memory body, so one historical sentence
   retired every claim in that memory; it now reads the triple. Supersession
   identifies the prior claim by the superseded *object*.
-- **Native sync commits transactionally.** The SHA was stamped before extraction,
-  embeddings and triples had committed, and embedding failures were discarded — a
-  transient outage produced a permanently incomplete index that nothing revisited.
-  The commit marker is now the last write, and failed memories stay retryable.
+- **Native sync no longer marks an incomplete memory current.** The SHA was
+  stamped before extraction, embeddings and triples had committed, and embedding
+  failures were discarded — a transient outage produced a permanently incomplete
+  index that nothing revisited. The commit marker is now the last write and is
+  cleared when a generation opens, so failed memories stay retryable. This is not
+  full transactionality: the individual writes are still separate, and recall can
+  see partially replaced facts between a failure and its retry. See *Known
+  limitations*.
 - **Deleted and renamed memories are pruned** from the native graph.
 - **Nested `metadata.type` frontmatter is parsed.** The reader skipped indented
   lines, so every memory was typed `reference` and Qdrant type filters were wrong
@@ -118,7 +122,7 @@ endpoint — and everything that was true there and false elsewhere was hard-cod
   single entry point before. GitHub Actions (`.github/workflows/ci.yml`) runs fmt,
   clippy `-D warnings`, `cargo test --locked`, the Python and shell suites, and the
   no-host-specific-defaults check. The repository previously had no CI.
-- Rust tests: 11 → 60, covering path/slug precedence, the secret corpus, nested
+- Rust tests: 11 → 73, covering path/slug precedence, the secret corpus, nested
   frontmatter, Cypher shape, embedding-space fingerprints, secret non-serialization,
   provider gating, temporal/supersession semantics, the Graphiti deadline, and
   ordered (not set-based) recall parity.
@@ -126,6 +130,191 @@ endpoint — and everything that was true there and false elsewhere was hard-cod
   previously compared a raw full-text query against native recall as `HashSet`s, so
   it measured set overlap and could pass while the ordering — the only thing
   compatibility mode exists to preserve — was wrong.
+
+### Fixed — second review pass
+
+A follow-up review found that several of the fixes above were incomplete. What a
+fix *looks* like and what it *does* are different claims, and these were the gap.
+
+- **Every field sent off-box is redacted, not just the body.** `engram-index`
+  scrubbed `body` and then interpolated `name` and `description` raw into the
+  embedding request — and stored the raw description in the Qdrant payload. A
+  secret in frontmatter crossed the boundary twice. The Python indexer did not
+  redact at all.
+- **The last unscoped native query is scoped.** `NATIVE_KEYWORD_LEGACY_INDEX` had
+  no `slug` predicate and short-circuited the scoped path when it matched, so the
+  cross-store leak that every other statement was fixed for stayed open through
+  that one. The slug test now scans the source for statements touching `Engram*`
+  labels instead of enumerating a hand-written list — which is how the omission
+  survived in the first place.
+- **A failed fact extraction fails.** A timeout, HTTP error or malformed JSON all
+  collapsed into a heuristic facts-only result with zero triples, which the sync
+  then stamped `current` — one blip of reasoning downtime silently erased a
+  memory's triples and marked the result final.
+- **Opening a sync generation clears the commit marker.** Moving the stamp to the
+  end was not enough: an interrupted run left new content and new facts beside the
+  *previous* generation's SHA, so reverting the file to that prior content made the
+  freshness check match and the half-written generation was skipped forever.
+- **Supersession reaches other memories.** It was restricted to prior claims in
+  the same file, and a replacement almost never lives in the same file as the claim
+  it replaces, so the common case did nothing.
+- **Native sync is gated on reasoning *and* embeddings.** Checking only embeddings
+  declared a `backend: claude`/`ollama` install eligible and then extracted against
+  `llama_cpp.url` regardless.
+- **URLs may not carry credentials.** `https://user:pass@host/v1` passed validation
+  and was then published verbatim by `/api/v1/status` and the model editor, routing
+  a password around the `Secret` type.
+- **The config lock is owned by a token.** Breaking a stale lock by path alone
+  raced with its own cure: the breaker could delete a *fresh* lock taken in the
+  interim and put two writers in the critical section. The retry budget also gave
+  up after one second against a thirty-second stale window.
+- **The Python vector path got the fixes the Rust one did** — `document_prefix` and
+  `query_prefix` are applied per side, and freshness includes the embedding-space
+  fingerprint. These are the installs the provider gating deliberately *routes to
+  Python*, so leaving them out undid the fix for everyone it applied to. The two
+  fingerprint implementations are pinned equal by a literal asserted from both
+  sides.
+
+### Fixed — third review pass
+
+Two of the second-pass fixes were themselves wrong, and the review found a further
+set. The pattern worth naming: three of these were *over-corrections* — a fix that
+overshot the bug.
+
+- **The config lock is a kernel lock (`flock`), not a lockfile convention.**
+  O_EXCL-plus-stale-breaking raced with its own cure, and adding an owner token
+  only narrowed the window — read-then-unlink is two syscalls with nothing
+  atomic between them, in acquire and in `Drop` alike. `flock` has no such
+  window: ownership lives in the kernel, release is automatic on crash (so the
+  staleness heuristic is gone entirely), and the lockfile is never unlinked, so
+  no process can delete a lock another process holds.
+- **Supersession is ordered by the source file's mtime.** Three bounds were tried.
+  Restricting to one file missed the common case; removing the bound let an
+  extraction retire its own siblings (triples are written immediately before);
+  and ordering by the node timestamps looked like the fix but was not — those are
+  *ingestion* times, so whichever memory the sync reached first won and a
+  supersession would silently fail depending on filename order. `source_mtime` is
+  the operator's own ordering, stable across sync order and re-indexing. Because
+  mtime is whole seconds, the filename breaks ties: a plain `<=` made ties
+  symmetric, so two memories saved in one editor pass could each retire the
+  other's claims. `source_mtime` is deliberately *not* part of the freshness hash
+  (a `touch` must not cost a re-extraction), so a separate cheap write keeps it
+  current on memories the freshness check skips — without it the key only ever
+  landed on memories whose content changed, and every older node compared against
+  zero.
+- **The legacy-edge fulltext fast path is removed, not patched.** A Neo4j fulltext
+  index cannot be partitioned: it ranked across every store and applied its limit
+  *before* any slug filter, so other projects' edges crowded out this store's
+  hits — and because one surviving hit short-circuited the scoped query, recall
+  returned an under-filled result rather than the correct one. Over-fetching to
+  compensate made it several times costlier without making it correct. Abandoned
+  `EngramLegacyEdge` nodes from the old import are now deleted (batched and
+  capped), since they otherwise sat in the index forever.
+- **Removing it required two fixes to keep recall whole,** which the first attempt
+  missed while claiming "nothing is lost": the legacy fact import no longer
+  requires `fact_embedding IS NOT NULL` (the old edge cache carried unembedded
+  facts, and those would have been lost outright), and the keyword query no longer
+  hard-filters on a match in the memory's own text before examining its facts — a
+  memory whose only match was in an extracted fact or triple, exactly what the
+  graph adds over text search, was being discarded. `legacy_name` is searched too.
+  The trade is that the keyword leg now scans each memory's facts and triples
+  instead of pruning by memory text first, which costs more on a large store.
+- **`--import-legacy-embeddings` is no longer gated on the model providers.** It
+  runs pure Cypher, but the provider checks sat ahead of it, so the migration this
+  release documents was unreachable on precisely the read-only native install that
+  most needs it.
+- **`embed()` applies no prefix unless asked.** Defaulting to the document side
+  would have prefixed queries too — Graphiti's embedder and the reranker in
+  `graph/mg_config.py` route passages and queries through one call, and
+  `memory_ai.ollama_embed` discards its role argument. A wrong prefix is worse
+  than none: it moves the query out of the index's space.
+- **Provider resolution is case-insensitive, matching Python.** `provider: OpenAI`
+  — a spelling nothing rejects — resolved to `llama_cpp` in Python and
+  `fastembed` in Rust: two embedding spaces, two fingerprints, each engine
+  treating the other's records as foreign.
+- **The native-sync gate asks for `llama_cpp.url`, not for `backend`.** Requiring
+  `backend: llama_cpp`/`openai` as well was simply wrong: `backend` selects the
+  *Python pipeline's* generation backend, while the Rust sync has always built its
+  reasoning client from `llama_cpp.url` directly. An ordinary `backend: ollama`
+  install with an OpenAI-compatible endpoint alongside it was working, and that
+  gate declared it unserviceable.
+- **An unwritable native index is reported by the daemon, not rejected at config
+  load.** A `validate()` check for it was added and then removed: `validate()`
+  runs on every load, so it did not warn — it made the config unloadable for every
+  Rust consumer, including read-only recall against an already-populated native
+  index, the parity evaluator, and `ENGRAM_GRAPH_BACKEND=graphiti_compat`, which
+  could no longer rescue the install because validation runs before the override is
+  read. Wrong severity for a condition that only affects the nightly writer.
+- **The memory `name` is redacted before reaching Neo4j.** It is frontmatter like
+  the description, it is written by the upsert, and a remote Neo4j is now
+  supported — so a credential there crossed the network.
+- **The config lockfile is group/other-writable,** with the mode set explicitly
+  after creation. It holds no content — all the state is the kernel's — and it is
+  persistent, so a restrictive mode outlives its creator: after the config changes
+  hands to a service user, that user can own the config and the directory and
+  still not be able to open the old owner's lockfile. `OpenOptions::mode` alone
+  did not fix this, because the usual `0022` umask turns `0666` into `0644`.
+- **The daemon's provider gate compares the backend case-insensitively,** like the
+  two implementations it mirrors. `backend: Ollama` resolved to Ollama in both and
+  to FastEmbed in the gate.
+
+### Known limitations
+
+Stated rather than silently carried:
+
+- **Native fact replacement is not transactional.** Facts are replaced before
+  embeddings are computed, and recall does not require a current commit marker, so
+  a run that fails mid-way leaves recall able to see partially replaced facts until
+  the retry succeeds. Pre-existing; a proper fix is staged writes with an atomic
+  marker switch.
+- **Rust and Python compute the Qdrant freshness SHA over different inputs** (the
+  embedding input vs the raw file bytes), so switching an install between the two
+  engines re-indexes the store once. Harmless, and arguably correct given the
+  engines construct their embedding input differently.
+- **Filenames and types are not redacted** before going to Qdrant: the filename is
+  the record's identity, and redacting it would break lookup and pruning. A secret
+  in a *filename* is not covered.
+- **The embedding-space fingerprint can differ between Rust and Python for a
+  config neither shares.** `memory_ai.load()` merges a default `llama_cpp.url`
+  that Rust's config model does not have, so a config with no explicit endpoint
+  fingerprints differently on each side. Left alone deliberately: for the two to
+  collide they must write the same Qdrant collection, which requires
+  `provider: llama_cpp` with a non-empty endpoint — and in that case Rust either
+  reads the same explicit URL or refuses to load at all. Reachable only if that
+  validation changes.
+- **`flock` exclusion is proven in-process.** `flock` locks are per open file
+  description, so the test's probe conflicts exactly as another process's would,
+  but it is a demonstration of the mechanism rather than a second `execve`.
+- **Supersession is applied during the superseding memory's own sync.** A prior
+  claim that first enters the graph *after* that sync is not retroactively
+  retired, because nothing re-runs the earlier assertion. Re-syncing the
+  superseding memory (edit it, or clear its commit marker) applies it; an
+  incremental run over the new memory alone does not. There is no `--rebuild` flag
+  on `engram-native-graph-sync`.
+
+### Changed — operational notes for this release
+
+- **A native backend that Rust cannot serve now skips the graph sync** instead of
+  falling back to the Graphiti writer. Writing the index nothing is reading
+  presented as memories that saved fine and then could not be recalled. Set
+  `graph.backend: graphiti_compat` to use the Python writer deliberately.
+- **Re-run `engram-native-graph-sync --import-legacy-embeddings`** if you use the
+  native backend — recommended rather than optional now, since it is what carries
+  legacy facts (including unembedded ones) into the slug-scoped nodes that
+  replaced the removed fulltext path. It now also deletes the `EngramLegacyEdge`
+  cache the previous version created — those nodes are no longer read by anything
+  and otherwise stay in the fulltext index forever. Until it is re-run, recall sees
+  fewer legacy facts than before: the import is what carries them into the
+  slug-scoped `EngramFact` nodes that the removed fulltext path used to serve.
+- **`graph.backend: native` without an OpenAI-compatible `llama_cpp.url` and
+  embedding endpoint** logs a skip from the daemon's graph job each run rather
+  than writing anything. The config still loads (recall against an existing native
+  index keeps working); set `graph.backend: graphiti_compat` or configure both
+  endpoints.
+- **The first Python vector sync after upgrading re-indexes the whole store,**
+  because the freshness key now includes the embedding space. Expected once.
+- **A URL with embedded credentials is now a config error.** Move it to the
+  matching `api_key`.
 
 ## 1.1.0 — auto-recall, the console, and a graph that actually inserts
 
