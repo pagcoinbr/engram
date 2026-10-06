@@ -195,23 +195,64 @@ MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL \
 RETURN ep.file AS file, collect(DISTINCT rel.fact) AS facts, max(score) AS score \
 ORDER BY score DESC LIMIT $limit";
 
-const NATIVE_KEYWORD_LEGACY_INDEX: &str = "\
-CALL db.index.fulltext.queryNodes('engram_native_legacy_edges', $query, {limit: $limit}) \
-YIELD node AS edge, score \
-RETURN edge.file AS file, collect(DISTINCT edge.fact) AS facts, max(score) AS score \
-ORDER BY score DESC LIMIT $limit";
+// Legacy import. Schema DDL carries no slug; the data statement must.
 
+const CREATE_NATIVE_FACT_INDEX: &str = "\
+CREATE FULLTEXT INDEX engram_native_fact_text IF NOT EXISTS \
+FOR (f:EngramFact) ON EACH [f.text, f.legacy_name]";
+
+/// Remove the abandoned `EngramLegacyEdge` cache.
+///
+/// Installs that ran the old import carry unscoped edge nodes. They are filtered
+/// out of every current query, but a fulltext index ranks across all of them, so
+/// leaving them in place means permanent index bloat and crowd-out. Dropped in
+/// batches so a large legacy graph does not build one enormous transaction.
+const DROP_LEGACY_EDGE_CACHE: &str = "\
+MATCH (edge:EngramLegacyEdge) WITH edge LIMIT 10000 DETACH DELETE edge RETURN count(edge)";
+
+/// Scoped by slug like every other native write: an unscoped import attaches
+/// another project's legacy facts to this store's memories.
+///
+/// Embedding-optional. It used to require `r.fact_embedding IS NOT NULL`, which
+/// silently dropped every legacy fact Graphiti had not embedded — facts the old
+/// keyword cache *did* carry, so removing that cache without relaxing this would
+/// have lost them for good. An unembedded fact simply sits out the semantic leg
+/// (which requires `f.embedding IS NOT NULL`) and is still found by keyword.
+const IMPORT_NATIVE_LEGACY_FACTS: &str = "\
+MATCH (:Entity)-[r:RELATES_TO]->(:Entity) \
+UNWIND coalesce(r.episodes, []) AS episode \
+MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL \
+MATCH (m:EngramMemory {slug: $slug, file: ep.file}) \
+WHERE r.fact IS NOT NULL \
+MERGE (f:EngramFact {slug: $slug, memory_file: m.file, text: r.fact}) \
+ON CREATE SET f.created_at = datetime(), f.valid_from = datetime() \
+SET f.legacy_name = r.name, \
+    f.embedding = coalesce(r.fact_embedding, f.embedding), \
+    f.embedding_updated_at = CASE WHEN r.fact_embedding IS NULL THEN f.embedding_updated_at \
+                                  ELSE datetime() END, \
+    f.valid_until = null, f.updated_at = datetime() \
+MERGE (m)-[:HAS_FACT]->(f) \
+RETURN count(DISTINCT f)";
+
+/// Keyword recall over a memory's own text, its facts, and its active triples.
+///
+/// A match in ANY of the three qualifies the memory. The memory-text match used
+/// to be a hard pre-filter, so a memory whose only match was in an extracted fact
+/// or triple — exactly what the graph exists to add over plain text search — was
+/// discarded before its facts were ever examined. `legacy_name` is searched too,
+/// since imported Graphiti facts carry their relation name there.
 const NATIVE_KEYWORD_FILES: &str = "\
 MATCH (m:EngramMemory {slug: $slug}) \
 WITH m, [token IN $tokens WHERE toLower(coalesce(m.name, '') + ' ' + coalesce(m.description, '') + ' ' + coalesce(m.body, '')) CONTAINS token] AS memory_matches \
-WHERE size(memory_matches) > 0 \
 OPTIONAL MATCH (m)-[:HAS_FACT]->(f:EngramFact) \
-  WHERE f.valid_until IS NULL AND any(token IN $tokens WHERE toLower(f.text) CONTAINS token) \
+  WHERE f.valid_until IS NULL AND any(token IN $tokens \
+    WHERE toLower(coalesce(f.text, '') + ' ' + coalesce(f.legacy_name, '')) CONTAINS token) \
 WITH m, memory_matches, collect(DISTINCT f.text) AS fact_text, count(f) AS fact_score \
 OPTIONAL MATCH (m)-[:HAS_TRIPLE]->(t:EngramTriple {status: 'active'}) \
   WHERE t.valid_until IS NULL AND any(token IN $tokens WHERE toLower(t.subject + ' ' + t.relation + ' ' + t.object) CONTAINS token) \
 WITH m, memory_matches, fact_text, fact_score, collect(DISTINCT t.subject + ' ' + t.relation + ' ' + t.object) AS triple_text, count(t) AS triple_score \
 WITH m, fact_text + triple_text AS texts, size(memory_matches) + fact_score + triple_score AS score \
+WHERE score > 0 \
 RETURN m.file AS file, texts AS facts, score ORDER BY score DESC LIMIT $limit";
 
 const NATIVE_SEMANTIC_FILES: &str = "\
@@ -221,10 +262,41 @@ WITH m, f, vector.similarity.cosine(f.embedding, $vector) AS score WHERE score >
 RETURN m.file AS file, collect(DISTINCT f.text) AS facts, max(score) AS score \
 ORDER BY score DESC LIMIT $limit";
 
+/// Open a sync generation: write the new content and *clear the commit marker*.
+///
+/// Clearing is the point. Moving the stamp to the end of the sync was not enough
+/// on its own — an interrupted run left the new body and new facts sitting beside
+/// the PREVIOUS generation's `sha`, so if the file was later reverted to that
+/// prior content the freshness check matched and the half-written generation was
+/// skipped forever. With the marker nulled first, any interruption leaves the
+/// memory unstamped and therefore retryable, whatever the file does afterwards.
 const UPSERT_NATIVE_MEMORY: &str = "\
 MERGE (m:EngramMemory {slug: $slug, file: $file}) \
-SET m.name = $name, m.description = $description, m.body = $body, m.updated_at = datetime() \
+SET m.name = $name, m.description = $description, m.body = $body, \
+    m.source_mtime = $source_mtime, m.updated_at = datetime(), \
+    m.sha = null, m.embedding_space = null, \
+    m.native_triple_version = null, m.native_triples_synced_at = null \
 RETURN m.file";
+
+/// Backfill the supersession ordering key for the whole store, in one statement.
+///
+/// `source_mtime` is intentionally absent from the freshness hash — a `touch` must
+/// not cost a full re-extraction — which means the upsert that writes it only runs
+/// when content changed. Every node predating the field therefore stayed unset,
+/// and supersession compared against `coalesce(..., 0)`.
+///
+/// It has to cover the WHOLE store before any memory is synced, not each memory as
+/// the loop reaches it. Memories are processed in filename order, so a per-memory
+/// backfill still left later-sorting nodes unset while an earlier superseding
+/// memory was applying supersession against them — reading their mtime as zero and
+/// retiring claims that were in fact newer. One batched write beforehand removes
+/// the ordering dependence entirely. The guard makes it a no-op once values match.
+const SET_NATIVE_MEMORY_MTIMES: &str = "\
+UNWIND $memories AS entry \
+MATCH (m:EngramMemory {slug: $slug, file: entry.file}) \
+WHERE coalesce(m.source_mtime, 0) <> entry.source_mtime \
+SET m.source_mtime = entry.source_mtime \
+RETURN count(m)";
 
 /// The commit marker, written only after facts, embeddings and triples are all in.
 ///
@@ -284,10 +356,43 @@ MERGE (t)-[:SUBJECT]->(subject) MERGE (t)-[:OBJECT]->(object)";
 /// Close the claims named by a `supersedes` triple's object. Targets are computed
 /// in Rust ([`supersession_targets`]) instead of inferred from relation names
 /// inside the query.
+///
+/// Reaches across the store, but only to other memories and only to claims the
+/// operator wrote *earlier*.
+///
+/// Three attempts, because both obvious bounds are wrong:
+///
+/// - Restricting to `$file` missed the common case entirely. A memory recording
+///   "Postgres supersedes SQLite" almost never lives in the same file as the claim
+///   it replaces.
+/// - Removing the bound let an extraction retire its own siblings — triples are
+///   written immediately before this runs — hence `pm.file <> $file`.
+/// - Ordering by the node timestamps (`valid_from`, `created_at`, `updated_at`)
+///   looks like a fix and is not: those are *ingestion* times. Whichever memory
+///   the sync happened to process first wins, so on a first full sync a
+///   supersession would silently fail whenever its memory sorted ahead of the
+///   claim it supersedes — turning a wrong result into an unpredictable one.
+///
+/// So the comparison is on `source_mtime`, the source file's own mtime: the
+/// operator's ordering of events, independent of our sync order and stable across
+/// re-indexing.
+///
+/// mtime is whole seconds, so ties are common — two memories saved in one editor
+/// pass share a timestamp. A plain `<=` made ties *symmetric*: two memories with
+/// opposing supersessions could each retire the other's claims, so a single second
+/// of coincidence could retire both sides of a pair. The filename breaks the tie,
+/// which is arbitrary but gives a total order, so at most one direction ever
+/// applies and the outcome does not depend on sync order.
 const APPLY_SUPERSESSION: &str = "\
-MATCH (m:EngramMemory {slug: $slug, file: $file})-[:HAS_TRIPLE]->(prior:EngramTriple) \
+MATCH (sm:EngramMemory {slug: $slug, file: $file})-[:HAS_TRIPLE]->(sup:EngramTriple) \
+WHERE sup.relation = 'supersedes' AND toLower(sup.object) IN $targets \
+MATCH (pm:EngramMemory {slug: $slug})-[:HAS_TRIPLE]->(prior:EngramTriple) \
 WHERE prior.valid_until IS NULL AND prior.relation <> 'supersedes' \
-  AND toLower(prior.object) IN $targets \
+  AND toLower(prior.object) = toLower(sup.object) \
+  AND pm.file <> $file \
+  AND (coalesce(pm.source_mtime, 0) < coalesce(sm.source_mtime, 0) \
+       OR (coalesce(pm.source_mtime, 0) = coalesce(sm.source_mtime, 0) \
+           AND pm.file < $file)) \
 SET prior.valid_until = datetime(), prior.status = 'superseded'";
 
 const SET_NATIVE_FACT_EMBEDDINGS: &str = "\
@@ -416,21 +521,23 @@ impl GraphClient {
         query: &str,
         limit: usize,
     ) -> Result<Vec<RecallHit>, GraphError> {
-        // The legacy-edge fulltext index is an optimisation; a MISSING index is
-        // fine and we fall through, but a real failure (auth, network) must not be
-        // mistaken for "no hits" — it is propagated.
-        match self
-            .file_hits(
-                NATIVE_KEYWORD_LEGACY_INDEX,
-                serde_json::json!({"query": query, "limit": limit}),
-            )
-            .await
-        {
-            Ok(hits) if !hits.is_empty() => return Ok(hits),
-            Ok(_) => {}
-            Err(GraphError::Database(_)) => {}
-            Err(error) => return Err(error),
-        }
+        // There used to be a legacy-edge fulltext "fast path" ahead of this, and
+        // it was removed rather than repaired. A Neo4j fulltext index cannot be
+        // partitioned, so `queryNodes` ranked across every store and applied its
+        // limit BEFORE any slug filter: other projects' edges occupied the top
+        // positions, this store's hits were crowded out, and because a single
+        // surviving hit short-circuited the scoped query below, recall silently
+        // returned an under-filled result instead of the correct one. Over-fetching
+        // to compensate made the leg several times more expensive without making it
+        // correct.
+        //
+        // Legacy facts are not lost with it — they are imported as slug-scoped
+        // `EngramFact` nodes (see `import_legacy_fact_embeddings`, which no longer
+        // requires an embedding) and the query below searches facts, triples and
+        // `legacy_name`. Two differences remain, both deliberate: this is
+        // substring matching rather than Lucene ranking, and it ignores tokens
+        // shorter than four characters. An install that has not re-run the import
+        // will see fewer legacy facts until it does.
         let tokens = query
             .split(|ch: char| !ch.is_alphanumeric())
             .filter(|word| word.len() >= 4)
@@ -466,10 +573,40 @@ impl GraphClient {
         name: &str,
         description: &str,
         body: &str,
+        source_mtime: i64,
     ) -> Result<(), GraphError> {
         self.query(
             UPSERT_NATIVE_MEMORY,
-            serde_json::json!({"slug": slug, "file": file, "name": name, "description": description, "body": body}),
+            serde_json::json!({
+                "slug": slug,
+                "file": file,
+                "name": name,
+                "description": description,
+                "body": body,
+                "source_mtime": source_mtime,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// See [`SET_NATIVE_MEMORY_MTIMES`]: brings the supersession ordering key up
+    /// to date for the whole store. Call once, before syncing any memory.
+    pub async fn set_native_memory_mtimes(
+        &self,
+        slug: &str,
+        memories: &[(String, i64)],
+    ) -> Result<(), GraphError> {
+        if memories.is_empty() {
+            return Ok(());
+        }
+        let entries = memories
+            .iter()
+            .map(|(file, source_mtime)| serde_json::json!({"file": file, "source_mtime": source_mtime}))
+            .collect::<Vec<_>>();
+        self.query(
+            SET_NATIVE_MEMORY_MTIMES,
+            serde_json::json!({"slug": slug, "memories": entries}),
         )
         .await?;
         Ok(())
@@ -611,13 +748,39 @@ impl GraphClient {
         Ok(())
     }
 
+    /// Import legacy Graphiti facts as slug-scoped native facts, and clear out
+    /// the abandoned edge cache the previous version of this import created.
     pub async fn import_legacy_fact_embeddings(&self, slug: &str) -> Result<(), GraphError> {
-        self.query("CREATE FULLTEXT INDEX engram_native_legacy_edges IF NOT EXISTS FOR (e:EngramLegacyEdge) ON EACH [e.name, e.fact]", serde_json::json!({})).await?;
-        self.query("MATCH (:Entity)-[r:RELATES_TO]->(:Entity) UNWIND coalesce(r.episodes, []) AS episode MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL MERGE (edge:EngramLegacyEdge {key: elementId(r) + '|' + episode}) SET edge.file = ep.file, edge.name = r.name, edge.fact = r.fact, edge.embedding = r.fact_embedding, edge.updated_at = datetime() RETURN count(edge)", serde_json::json!({})).await?;
-        self.query("CREATE FULLTEXT INDEX engram_native_fact_text IF NOT EXISTS FOR (f:EngramFact) ON EACH [f.text, f.legacy_name]", serde_json::json!({})).await?;
-        // Scoped by slug like every other native write: an unscoped import
-        // attaches another project's legacy facts to this store's memories.
-        self.query("MATCH (:Entity)-[r:RELATES_TO]->(:Entity) UNWIND coalesce(r.episodes, []) AS episode MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL MATCH (m:EngramMemory {slug: $slug, file: ep.file}) WHERE r.fact IS NOT NULL AND r.fact_embedding IS NOT NULL MERGE (f:EngramFact {slug: $slug, memory_file: m.file, text: r.fact}) ON CREATE SET f.created_at = datetime(), f.valid_from = datetime() SET f.legacy_name = r.name, f.embedding = r.fact_embedding, f.embedding_updated_at = datetime(), f.valid_until = null, f.updated_at = datetime() MERGE (m)-[:HAS_FACT]->(f) RETURN count(DISTINCT f)", serde_json::json!({"slug": slug})).await?;
+        for statement in [CREATE_NATIVE_FACT_INDEX, IMPORT_NATIVE_LEGACY_FACTS] {
+            self.query(statement, serde_json::json!({"slug": slug}))
+                .await?;
+        }
+        // Batched, so a large legacy graph is cleaned without one transaction big
+        // enough to fail — and capped, because "loop until a batch deletes
+        // nothing" is only bounded if nothing is writing. An old importer still
+        // running elsewhere recreates these nodes, and an unbounded loop would
+        // then chase it forever inside a sync. Whatever is left is collected by
+        // the next run; this is cleanup, not a correctness requirement.
+        const MAX_BATCHES: usize = 100;
+        for _ in 0..MAX_BATCHES {
+            let response = self
+                .query(DROP_LEGACY_EDGE_CACHE, serde_json::json!({}))
+                .await?;
+            // A response we cannot read is treated as "stop", not "done": it may
+            // mean rows remain, so it must not be mistaken for a clean finish.
+            let Some(deleted) = response
+                .results
+                .iter()
+                .flat_map(|set| set.data.iter())
+                .filter_map(|row| row.row.first().and_then(serde_json::Value::as_u64))
+                .next()
+            else {
+                break;
+            };
+            if deleted == 0 {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -822,27 +985,157 @@ mod tests {
         );
     }
 
+    /// Opening a generation must CLEAR the commit marker.
+    ///
+    /// Moving the stamp to the end of the sync was not sufficient on its own: an
+    /// interrupted run left new content and new facts beside the previous
+    /// generation's `sha`, so reverting the file to that prior content made the
+    /// freshness check match and the half-written generation was skipped forever.
+    #[test]
+    fn opening_a_generation_invalidates_the_previous_marker() {
+        for field in [
+            "m.sha = null",
+            "m.embedding_space = null",
+            "m.native_triple_version = null",
+            "m.native_triples_synced_at = null",
+        ] {
+            assert!(
+                UPSERT_NATIVE_MEMORY.contains(field),
+                "upsert does not clear {field}: {UPSERT_NATIVE_MEMORY}"
+            );
+        }
+        // ...and the marker is written by exactly one statement, at the end.
+        assert!(MARK_NATIVE_MEMORY_CURRENT.contains("m.sha = $sha"));
+    }
+
+    /// Supersession reaches across the store, but only to other memories and only
+    /// to claims the operator wrote earlier.
+    ///
+    /// Restricting it to `$file` meant a memory recording "X supersedes Y" could
+    /// only retire a claim written in that same file — almost never where it
+    /// lives, so the common case did nothing. Widening it to the whole slug
+    /// unqualified then let it retire its own siblings (triples are written just
+    /// before this runs) and, on a re-index, claims newer than the event. Bounding
+    /// it by the node timestamps was wrong a third way: those are ingestion times,
+    /// so the result depended on sync order.
+    #[test]
+    fn supersession_is_bounded_in_both_directions() {
+        assert!(
+            APPLY_SUPERSESSION.contains("{slug: $slug}"),
+            "not slug-scoped: {APPLY_SUPERSESSION}"
+        );
+        for guard in [
+            // other memories, not the one asserting the supersession
+            "pm.file <> $file",
+            // and only claims the operator wrote earlier, by SOURCE mtime
+            "coalesce(pm.source_mtime, 0) < coalesce(sm.source_mtime, 0)",
+            // ...with the filename breaking whole-second ties into a total order,
+            // so two memories cannot each retire the other's claims
+            "AND pm.file < $file",
+            // anchored on the real superseding triple
+            "sup.relation = 'supersedes'",
+        ] {
+            assert!(
+                APPLY_SUPERSESSION.contains(guard),
+                "missing guard `{guard}`: {APPLY_SUPERSESSION}"
+            );
+        }
+        // Ingestion timestamps must never be the ordering key: whichever memory
+        // the sync happened to reach first would win, so a supersession would
+        // silently fail depending on filename order.
+        for ingestion in ["valid_from <", "created_at <", "updated_at <"] {
+            assert!(
+                !APPLY_SUPERSESSION.contains(ingestion),
+                "ordering on an ingestion timestamp (`{ingestion}`) makes this \
+                 sync-order dependent: {APPLY_SUPERSESSION}"
+            );
+        }
+        // ...and source_mtime has to actually be persisted for that to work —
+        // from the upsert when content changed, and from the backfill when it did
+        // not, since mtime is deliberately outside the freshness hash. Without
+        // the second write the key only ever landed on memories that happened to
+        // change, leaving every older node comparing against zero.
+        assert!(
+            UPSERT_NATIVE_MEMORY.contains("m.source_mtime = $source_mtime"),
+            "the ordering key is never written: {UPSERT_NATIVE_MEMORY}"
+        );
+        assert!(
+            SET_NATIVE_MEMORY_MTIMES.contains("m.source_mtime = entry.source_mtime"),
+            "unchanged memories never get the ordering key: {SET_NATIVE_MEMORY_MTIMES}"
+        );
+    }
+
+    /// The legacy-edge fulltext path is gone and must not come back.
+    ///
+    /// A Neo4j fulltext index cannot be partitioned, so it ranked across every
+    /// store and applied its limit before any slug filter — crowding out this
+    /// store's hits — and a single surviving hit short-circuited the scoped query,
+    /// returning an under-filled result. Over-fetching made it costlier, not
+    /// correct.
+    #[test]
+    fn no_unpartitionable_fulltext_index_is_queried_for_native_recall() {
+        // Assembled from parts: spelling the index name as one literal here would
+        // plant it in the very source this test scans.
+        let index = ["engram", "native", "legacy", "edges"].join("_");
+        assert!(
+            !include_str!("lib.rs").contains(&index),
+            "the unpartitionable legacy-edge index is being used again"
+        );
+        // ...and the abandoned nodes from the old import are cleaned up.
+        assert!(DROP_LEGACY_EDGE_CACHE.contains("EngramLegacyEdge"));
+    }
+
     /// Filenames are unique only within a store, so every native statement that
     /// reads or writes memory-scoped data must be slug-scoped.
+    ///
+    /// This scans the source instead of listing the statements. The previous
+    /// version enumerated its own subjects by hand and omitted the legacy-edge
+    /// query, so it passed while that statement returned other stores' memories —
+    /// a test that chooses what to check cannot catch what it forgot to add.
+    /// Anything touching an `Engram*` label is now in scope automatically, so a
+    /// new unscoped statement fails here on arrival.
     #[test]
     fn every_native_statement_is_scoped_by_slug() {
-        for (name, statement) in [
-            ("NATIVE_FACTS_FOR_TOKENS", NATIVE_FACTS_FOR_TOKENS),
-            ("NATIVE_KEYWORD_FILES", NATIVE_KEYWORD_FILES),
-            ("NATIVE_SEMANTIC_FILES", NATIVE_SEMANTIC_FILES),
-            ("UPSERT_NATIVE_MEMORY", UPSERT_NATIVE_MEMORY),
-            ("MARK_NATIVE_MEMORY_CURRENT", MARK_NATIVE_MEMORY_CURRENT),
-            ("NATIVE_MEMORY_IS_CURRENT", NATIVE_MEMORY_IS_CURRENT),
-            ("REPLACE_NATIVE_FACTS", REPLACE_NATIVE_FACTS),
-            ("RETIRE_OBSOLETE_TRIPLES", RETIRE_OBSOLETE_TRIPLES),
-            ("WRITE_NATIVE_TRIPLES", WRITE_NATIVE_TRIPLES),
-            ("APPLY_SUPERSESSION", APPLY_SUPERSESSION),
-            ("SET_NATIVE_FACT_EMBEDDINGS", SET_NATIVE_FACT_EMBEDDINGS),
-            ("PRUNE_MISSING_MEMORIES", PRUNE_MISSING_MEMORIES),
-            ("NATIVE_MEMORY_FILES", NATIVE_MEMORY_FILES),
-        ] {
-            assert!(statement.contains("$slug"), "{name} is not slug-scoped");
+        let mut checked = Vec::new();
+        for declaration in include_str!("lib.rs").split("\nconst ").skip(1) {
+            let Some((name, body)) = declaration.split_once(": &str = ") else {
+                continue;
+            };
+            let statement = body.split(";\n").next().unwrap_or_default();
+            // Schema DDL names labels but has no rows to scope.
+            if statement.contains("CREATE FULLTEXT INDEX") {
+                continue;
+            }
+            // One documented exception, kept as a named list so adding to it is a
+            // visible decision rather than a quiet carve-out: the abandoned edge
+            // cache is deleted wholesale precisely BECAUSE those nodes predate
+            // slug scoping and carry no slug to filter on.
+            if ["DROP_LEGACY_EDGE_CACHE"].contains(&name) {
+                continue;
+            }
+            if !statement.contains("Engram") {
+                continue; // a Graphiti-only statement, scoped by Graphiti itself
+            }
+            assert!(
+                statement.contains("$slug"),
+                "{name} touches Engram* data without a $slug predicate"
+            );
+            checked.push(name.to_string());
         }
+        // Guard the guard: if the parse silently matches nothing, the assertion
+        // above is vacuous and we are back to a test that proves nothing.
+        assert!(
+            checked.len() >= 14,
+            "expected to scan the native statements, only found {checked:?}"
+        );
+        // The legacy import is the statement class that slipped through a
+        // hand-written list; prove the scan reaches it.
+        assert!(
+            checked
+                .iter()
+                .any(|name| name == "IMPORT_NATIVE_LEGACY_FACTS"),
+            "the legacy import is not being scanned: {checked:?}"
+        );
     }
 
     /// Recall must only surface claims that are both active and still open.
@@ -906,10 +1199,14 @@ mod tests {
         // no supersedes triple, no targets
         assert!(supersession_targets(&[triple("a", "uses", "b", 0.9, "current")]).is_empty());
 
-        // and the query retires by object, never by relation name
-        assert!(APPLY_SUPERSESSION.contains("toLower(prior.object) IN $targets"));
+        // The query retires by object identity, and the target list — computed
+        // above, in Rust — is what selects the superseding triple.
+        assert!(APPLY_SUPERSESSION.contains("toLower(sup.object) IN $targets"));
+        assert!(APPLY_SUPERSESSION.contains("toLower(prior.object) = toLower(sup.object)"));
+        // `sup.relation` identifies the asserting triple; what must never come
+        // back is inferring the *prior* claim from a relation name.
         assert!(
-            !APPLY_SUPERSESSION.contains("relation = 'supersedes'"),
+            !APPLY_SUPERSESSION.contains("prior.relation = 'supersedes'"),
             "supersession is still inferred inside the query"
         );
     }

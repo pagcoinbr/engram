@@ -8,6 +8,14 @@ pub struct Memory {
     pub description: String,
     pub memory_type: String,
     pub body: String,
+    /// Source file mtime, seconds since the epoch.
+    ///
+    /// The operator's own ordering of events, which nothing else in the graph
+    /// records: `created_at`/`updated_at` on a node are *ingestion* times, so
+    /// anything that reasons about which claim came first from those is really
+    /// reasoning about the order we happened to sync in. Supersession needs the
+    /// difference (see `APPLY_SUPERSESSION` in engram-graph).
+    pub source_mtime: i64,
 }
 
 #[derive(Debug, Error)]
@@ -26,6 +34,13 @@ pub fn load(dir: impl AsRef<Path>) -> Result<Vec<Memory>, StoreError> {
         {
             continue;
         }
+        let source_mtime = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|age| age.as_secs() as i64)
+            .unwrap_or_default();
         let raw = fs::read_to_string(&path)?;
         let (meta, body) = parse(&raw);
         let file = path.file_name().unwrap().to_string_lossy().to_string();
@@ -42,6 +57,7 @@ pub fn load(dir: impl AsRef<Path>) -> Result<Vec<Memory>, StoreError> {
                 .cloned()
                 .unwrap_or_else(|| "reference".into()),
             body,
+            source_mtime,
         });
     }
     memories.sort_by(|left, right| left.file.cmp(&right.file));

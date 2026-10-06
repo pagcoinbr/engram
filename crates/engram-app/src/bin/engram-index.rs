@@ -108,15 +108,11 @@ async fn run(args: Args) -> Result<usize, IndexError> {
     let space = config.embedding_space_id();
     let mut indexed = 0;
     for memory in &memories {
-        // Redact BEFORE the embedding request: the endpoint may be off-box, and
-        // imported or hand-edited memories never passed the save-time guard.
-        let (body, _) = engram_secrets::redact(&memory.body);
-        let input = format!(
-            "{} {} {}",
-            memory.name,
-            memory.description,
-            truncate(&body, 1500)
-        );
+        let Redacted {
+            name,
+            description,
+            input,
+        } = redacted_input(&memory.name, &memory.description, &memory.body);
         // The space id is part of the freshness key, so switching to another model
         // of the SAME dimension invalidates every record instead of leaving two
         // models' vectors mixed in one collection.
@@ -147,8 +143,8 @@ async fn run(args: Args) -> Result<usize, IndexError> {
         vectors
             .upsert(IndexPoint {
                 file: &memory.file,
-                name: &memory.name,
-                description: &memory.description,
+                name: &name,
+                description: &description,
                 memory_type: &memory.memory_type,
                 slug: &slug,
                 sha: &sha,
@@ -194,9 +190,35 @@ fn truncate(value: &str, max_bytes: usize) -> &str {
         .unwrap_or_default()
 }
 
+/// One memory's text, scrubbed for both the embedding request and the payload.
+struct Redacted {
+    name: String,
+    description: String,
+    input: String,
+}
+
+/// Redact BEFORE the embedding request: the endpoint may be off-box, and
+/// imported or hand-edited memories never passed the save-time guard.
+///
+/// All three fields, not just the body. Redacting the body alone while
+/// interpolating `name` and `description` raw sent frontmatter secrets straight
+/// to the endpoint and then stored the raw description in the Qdrant payload —
+/// precisely the imported/hand-edited case this guard exists for.
+fn redacted_input(name: &str, description: &str, body: &str) -> Redacted {
+    let (name, _) = engram_secrets::redact(name);
+    let (description, _) = engram_secrets::redact(description);
+    let (body, _) = engram_secrets::redact(body);
+    let input = format!("{} {} {}", name, description, truncate(&body, 1500));
+    Redacted {
+        name,
+        description,
+        input,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::truncate;
+    use super::{redacted_input, truncate};
 
     #[test]
     fn truncation_preserves_utf8_boundaries() {
@@ -218,6 +240,40 @@ mod tests {
             let (masked, count) = engram_secrets::redact(sample);
             assert!(count > 0, "not redacted: {sample}");
             assert!(masked.contains(engram_secrets::REDACTION), "{masked}");
+        }
+    }
+
+    /// Frontmatter prose is as exposed as the body.
+    ///
+    /// Only `body` used to be scrubbed, while `name` and `description` were
+    /// interpolated raw into the embedding request AND stored verbatim in the
+    /// Qdrant payload — so a secret in frontmatter crossed the boundary twice.
+    ///
+    /// Scope note: the filename and type still go to Qdrant unredacted, and
+    /// deliberately so — the filename is the record's identity and redacting it
+    /// would break lookup and pruning. Secrets in *filenames* are not covered by
+    /// this guard.
+    #[test]
+    fn redaction_covers_every_prose_field_sent_off_box() {
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let out = redacted_input(
+            &format!("key {secret}"),
+            &format!("desc {secret}"),
+            &format!("body {secret}"),
+        );
+        for (field, value) in [
+            ("input", &out.input),
+            ("name", &out.name),
+            ("description", &out.description),
+        ] {
+            assert!(
+                !value.contains(secret),
+                "{field} still carries the credential: {value}"
+            );
+            assert!(
+                value.contains(engram_secrets::REDACTION),
+                "{field}: {value}"
+            );
         }
     }
 }

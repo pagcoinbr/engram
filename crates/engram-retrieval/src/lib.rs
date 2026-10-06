@@ -98,6 +98,7 @@ mod tests {
                 description: "AdGuard ULA".into(),
                 memory_type: "reference".into(),
                 body: "IPv6 DNS server".into(),
+                source_mtime: 0,
             },
             Memory {
                 file: "other.md".into(),
@@ -105,6 +106,7 @@ mod tests {
                 description: "unrelated".into(),
                 memory_type: "reference".into(),
                 body: "".into(),
+                source_mtime: 0,
             },
         ];
         assert_eq!(bm25(&memories, "IPv6 DNS", 1)[0].file, "dns.md");

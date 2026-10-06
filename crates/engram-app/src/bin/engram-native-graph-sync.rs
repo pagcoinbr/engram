@@ -39,14 +39,14 @@ struct Args {
     password: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Extraction {
     facts: Vec<String>,
     #[serde(default)]
     triples: Vec<Triple>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Triple {
     subject: String,
     relation: String,
@@ -94,16 +94,6 @@ async fn run(args: Args) -> Result<usize, SyncError> {
     if !config.local_enabled {
         return Err("local_enabled is false".into());
     }
-    // Fact embeddings go through the same OpenAI-compatible client as the indexer,
-    // so the same provider restriction applies. Refuse clearly instead of writing
-    // facts with no embeddings at all.
-    if !config.rust_embedding_supported() {
-        return Err(SyncError::UnsupportedProvider(format!(
-            "embedding provider '{}' is not implemented in Rust; use the Python graph sync",
-            config.embed_provider()
-        )));
-    }
-
     // Credentials from config + graph/.env, with the CLI able to override.
     let mut creds = config.graph.credentials();
     if let Some(uri) = args.uri {
@@ -122,12 +112,36 @@ async fn run(args: Args) -> Result<usize, SyncError> {
     }
     let client = GraphClient::from_credentials(&creds).map_err(|error| error.to_string())?;
 
+    // The legacy import is pure Cypher — no model is called — so it must run
+    // BEFORE the provider gates below. Gating it was a real obstruction: the
+    // migration this release documents was unreachable on exactly the read-only
+    // native install that needs it most.
     if args.import_legacy_embeddings {
         client
             .import_legacy_fact_embeddings(&slug)
             .await
             .map_err(|error| error.to_string())?;
         return Ok(0);
+    }
+
+    // Everything past here calls models. A native sync needs BOTH an
+    // OpenAI-compatible embedding endpoint and a generation endpoint for fact
+    // extraction; checking only the former sent the binary off to fail on a URL
+    // parse. Note the generation requirement is `llama_cpp.url`, which is what
+    // the reasoning client is built from — NOT `backend`, which selects the
+    // Python pipeline's generation backend.
+    if !config.rust_embedding_supported() {
+        return Err(SyncError::UnsupportedProvider(format!(
+            "embedding provider '{}' is not implemented in Rust; use the Python graph sync",
+            config.embed_provider()
+        )));
+    }
+    if !config.rust_reasoning_supported() {
+        return Err(SyncError::UnsupportedProvider(
+            "no generation endpoint for fact extraction: set llama_cpp.url to an \
+             OpenAI-compatible server, or use the Python graph sync"
+                .into(),
+        ));
     }
 
     let memories =
@@ -154,6 +168,28 @@ async fn run(args: Args) -> Result<usize, SyncError> {
             .await
             .map_err(|error| error.to_string())?;
     }
+
+    // Bring the supersession ordering key up to date across the WHOLE store
+    // before syncing anything.
+    //
+    // `source_mtime` is deliberately outside the freshness hash — a `touch` must
+    // not cost a re-extraction — so the upsert only writes it when content
+    // changed, leaving every node that predated the field unset. Doing the
+    // backfill per memory inside the loop below was not enough either: memories
+    // are processed in filename order, so a changed superseding memory could
+    // apply supersession against a later-sorting node whose key was still unset,
+    // read its mtime as zero, and retire claims that were actually newer. One
+    // batched write up front, no model calls, and a no-op once values match.
+    client
+        .set_native_memory_mtimes(
+            &slug,
+            &memories
+                .iter()
+                .map(|memory| (memory.file.clone(), memory.source_mtime))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
 
     let mut count = 0;
     let mut failures = Vec::new();
@@ -222,6 +258,11 @@ async fn sync_memory(
     // Redact before anything leaves the box. The reasoning endpoint may be remote
     // and Neo4j keeps whatever it is given; imported and hand-edited memories never
     // passed the save-time guard, so this is the only place that can catch them.
+    //
+    // `name` included: it is frontmatter like the description, it is written to
+    // Neo4j by the upsert below, and a remote Neo4j is now a supported
+    // configuration — so leaving it raw was a credential crossing the network.
+    let (safe_name, _) = engram_secrets::redact(&memory.name);
     let (safe_description, _) = engram_secrets::redact(&memory.description);
     let (safe_body, _) = engram_secrets::redact(&memory.body);
 
@@ -234,18 +275,25 @@ async fn sync_memory(
         safe_description,
         safe_body
     );
-    let extraction = tokio::time::timeout(
+    // Extraction failure must FAIL, not degrade.
+    //
+    // This chain used to be `.ok().and_then(Result::ok).and_then(..ok()).unwrap_or(..)`,
+    // which collapsed a timeout, an HTTP error and malformed JSON alike into a
+    // heuristic facts-only extraction with zero triples — and then the sync went
+    // on to stamp the memory current. One blip of reasoning downtime silently
+    // erased that memory's triples and marked the result final. An error here
+    // leaves the memory unstamped, so the next run retries it.
+    let raw = tokio::time::timeout(
         Duration::from_secs(90),
         reasoning.chat(&config.llama_cpp.model, &prompt),
     )
     .await
-    .ok()
-    .and_then(Result::ok)
-    .and_then(|raw| serde_json::from_str::<Extraction>(&raw).ok())
-    .unwrap_or(Extraction {
-        facts: facts(&safe_description, &safe_body),
-        triples: Vec::new(),
-    });
+    .map_err(|_| "fact extraction timed out after 90s".to_string())?
+    .map_err(|error| format!("fact extraction failed: {error}"))?;
+    let extraction = parse_extraction(&raw)?;
+    // An empty `facts` list is a legitimate answer about a thin memory, so the
+    // sentence-level heuristic still backs it. That is a judgement about content,
+    // not a mask over a failed call.
     let extracted = if extraction.facts.is_empty() {
         facts(&safe_description, &safe_body)
     } else {
@@ -261,9 +309,10 @@ async fn sync_memory(
         .upsert_native_memory(
             slug,
             &memory.file,
-            &memory.name,
+            &safe_name,
             &safe_description,
             &safe_body,
+            memory.source_mtime,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -295,6 +344,21 @@ async fn sync_memory(
         .mark_native_memory_current(slug, &memory.file, sha, space)
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Parse the model's extraction, treating malformed output as a failure.
+///
+/// Unparseable JSON used to be swallowed alongside timeouts and HTTP errors,
+/// degrading to a facts-only extraction with zero triples that was then stamped
+/// current — so a model having a bad day permanently erased a memory's triples.
+/// Returning `Err` leaves the memory unstamped and therefore retryable.
+fn parse_extraction(raw: &str) -> Result<Extraction, String> {
+    serde_json::from_str::<Extraction>(raw).map_err(|error| {
+        format!(
+            "fact extraction returned unparseable JSON ({error}): {}",
+            raw.trim().chars().take(200).collect::<String>()
+        )
+    })
 }
 
 /// Clean up one extracted triple and settle its tense.
@@ -365,6 +429,30 @@ fn facts(description: &str, body: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed extraction must FAIL. It used to collapse into a facts-only
+    /// result with no triples, which the sync then stamped as current — one blip
+    /// of reasoning downtime silently wiped that memory's triples for good.
+    #[test]
+    fn unparseable_extraction_is_an_error_not_an_empty_result() {
+        for raw in [
+            "",
+            "I'm sorry, I can't do that.",
+            "{\"facts\": [\"a\"], \"triples\": ", // truncated mid-stream
+            "<think>reasoning</think>",
+        ] {
+            let error =
+                parse_extraction(raw).expect_err(&format!("malformed output accepted: {raw:?}"));
+            assert!(error.contains("unparseable JSON"), "{error}");
+        }
+    }
+
+    /// A model that legitimately finds nothing is not a failure.
+    #[test]
+    fn a_well_formed_empty_extraction_is_accepted() {
+        let parsed = parse_extraction("{\"facts\":[],\"triples\":[]}").unwrap();
+        assert!(parsed.facts.is_empty() && parsed.triples.is_empty());
+    }
 
     fn triple(
         subject: &str,
