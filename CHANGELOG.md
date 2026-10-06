@@ -313,6 +313,29 @@ five were real, and two of them were holes left by this remediation itself.
   store that does not exist injects nothing, silently, with exit 0, looking exactly
   like "no relevant memories".
 
+### Fixed — found by deploying to a live host
+
+- **`install.sh` refreshes the `engram-app` copy a systemd unit actually runs.**
+  There are two parallel unit sets: the installer writes *user* units pointing at
+  `~/.claude/rust`, but a host may run *system* units whose `ExecStart` names a
+  path the installer has never written to. On the deployment that surfaced this,
+  the install reported success, the binary landed, `systemctl restart` returned
+  cleanly — and the API served a three-week-old build with nothing indicating it.
+  With SELinux enforcing this is not a misconfiguration to correct: systemd cannot
+  exec out of `/root/.claude` at all, so an enforcing host *must* run the API from
+  a `bin_t` path. The installer now reads `ExecStart` from every engram unit it can
+  find, refreshes any `engram-app` it names, runs `restorecon`, and reports what it
+  touched. Only existing paths are refreshed — creating one would add a
+  system-wide install to hosts that never asked for one.
+- **Binding the API port fails with an explanation rather than a panic.** A busy
+  port surfaced as `Os { code: 98 }` from `unwrap()`, which reads like a crash
+  instead of "something else is already listening".
+- **`test_daemon_stamp`'s compatibility check no longer depends on host state.** It
+  asserted that `graph_sync.py` appeared in the command, so it passed for weeks and
+  broke the moment a real install added the `engram-graph-sync` wrapper. It now
+  covers both cases and asserts the invariant: the Graphiti path is used and the
+  native writer is not.
+
 ### Known limitations
 
 Stated rather than silently carried:
