@@ -24,7 +24,11 @@ struct Args {
     limit: usize,
     #[arg(long, env = "ENGRAM_CONFIG")]
     config: Option<PathBuf>,
-    #[arg(long)]
+    // allow_hyphen_values because EVERY engram slug starts with '-' (it is a
+    // path with separators replaced), so clap read `--slug -home-alice` as a
+    // missing value followed by an unknown flag. The documented invocation was
+    // unusable as typed.
+    #[arg(long, allow_hyphen_values = true)]
     slug: Option<String>,
     /// Require exact ordered agreement rather than reporting the score.
     #[arg(long)]

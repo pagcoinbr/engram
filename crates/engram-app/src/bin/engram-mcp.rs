@@ -12,7 +12,11 @@ struct Args {
     config: Option<PathBuf>,
     /// Default store for calls that do not name one. Resolved from the environment
     /// and the session's working directory when omitted.
-    #[arg(long)]
+    // allow_hyphen_values because EVERY engram slug starts with '-' (it is a
+    // path with separators replaced), so clap read `--slug -home-alice` as a
+    // missing value followed by an unknown flag. The documented invocation was
+    // unusable as typed.
+    #[arg(long, allow_hyphen_values = true)]
     slug: Option<String>,
 }
 

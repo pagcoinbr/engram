@@ -13,7 +13,11 @@ use engram_retrieval::{bm25, rrf};
 use engram_store::{Memory, load};
 use engram_vector::QdrantClient;
 use serde::Serialize;
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Serialize)]
 pub struct ResultItem {
@@ -172,7 +176,29 @@ async fn recall_with_backend(
     // In compatibility mode the local legs are suppressed so Graphiti's ordering
     // is returned untouched. Fast mode has no Graphiti ordering to preserve, so
     // they are exactly what it has to work with.
-    let graphiti_compat = backend == "graphiti_compat" && mode == Mode::Full;
+    //
+    // ...but only when there is a Graphiti to be compatible WITH. Compat is the
+    // default (an upgraded install must not be moved off its populated index), and
+    // compat failure is fatal by design, because silently reordering is the one
+    // thing this mode exists to prevent. On an install that never had the graph —
+    // `install.sh --no-graph`, which writes no `graph:` block — those two correct
+    // decisions combined into a broken one: recall failed closed on
+    // `ModuleNotFoundError: graphiti_core` for every query, out of the box.
+    //
+    // An absent Graphiti is not a failure to preserve ordering; there is no
+    // ordering to preserve. So it degrades to the ordinary hybrid path instead,
+    // and says so in `legs`. An install that HAS Graphiti and then fails still
+    // fails closed — there the ordering is the whole point.
+    let graphiti_installed = graphiti_usable(&engram_paths::graph_dir());
+    let graphiti_compat = backend == "graphiti_compat" && mode == Mode::Full && graphiti_installed;
+    if backend == "graphiti_compat" && mode == Mode::Full && !graphiti_installed {
+        legs.insert(
+            "graph".into(),
+            "graphiti_compat requested but Graphiti is not installed; \
+             using local keyword + vector recall"
+                .into(),
+        );
+    }
     let keyword = if graphiti_compat {
         legs.insert(
             "keyword".into(),
@@ -196,8 +222,26 @@ async fn recall_with_backend(
         vector_leg(&config, query, slug, k * 2, &mut legs).await
     };
     let graph_limit = if graphiti_compat { k } else { k * 2 };
+    // Dispatch on the decision actually made, not on the configured name: with
+    // compat requested but unavailable we must not call the compat leg again just
+    // to re-discover that.
+    let effective_backend = if backend == "graphiti_compat" && !graphiti_compat {
+        "native"
+    } else {
+        backend.as_str()
+    };
     let graph = match mode {
-        Mode::Full => graph_leg(&config, &backend, slug, query, graph_limit, &mut legs).await,
+        Mode::Full => {
+            graph_leg(
+                &config,
+                effective_backend,
+                slug,
+                query,
+                graph_limit,
+                &mut legs,
+            )
+            .await
+        }
         Mode::Fast => fast_graph_leg(&config, slug, query, &mut legs).await,
     };
     if graphiti_compat
@@ -337,6 +381,24 @@ async fn graph_leg(
     native_leg(config, slug, query, k, legs).await
 }
 
+/// The installed Graphiti recall script.
+fn graphiti_script(graph_dir: &Path) -> PathBuf {
+    graph_dir.join("memory_graph_recall.py")
+}
+
+/// Whether Graphiti is actually usable here, which is what distinguishes "this
+/// install has an index whose ordering must be preserved" from "this install never
+/// had the graph".
+///
+/// The signal is the **venv**, not the script. `install.sh` copies `graph/*.py`
+/// unconditionally and only builds `graph/venv` under `--graph`, so the script's
+/// presence proves nothing — and with no venv the compat leg falls back to bare
+/// `python3`, where `import graphiti_core` is exactly the failure we are trying to
+/// classify.
+fn graphiti_usable(graph_dir: &Path) -> bool {
+    graph_dir.join("venv/bin/python").is_file() && graphiti_script(graph_dir).is_file()
+}
+
 /// How long the Graphiti child gets before it is killed.
 ///
 /// This bounds the CHILD so a stalled Neo4j cannot hang the process forever — it
@@ -363,7 +425,7 @@ async fn graphiti_compat_leg(
     } else {
         "python3".into()
     };
-    let script = graph_dir.join("memory_graph_recall.py");
+    let script = graphiti_script(graph_dir);
     // tokio::process + a deadline. This was a blocking Command::output() with NO
     // timeout, called from an async handler AND from the UserPromptSubmit hook: a
     // stalled Neo4j blocked a tokio worker and delayed the user's prompt
@@ -649,6 +711,37 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Compat mode must not fail closed when Graphiti was never installed.
+    ///
+    /// Two individually correct decisions combined into a broken one: compat is
+    /// the default so an upgraded install is not moved off its populated index,
+    /// and compat failure is fatal so ordering is never silently changed. On an
+    /// `install.sh --no-graph` install — which writes no `graph:` block — that
+    /// made recall fail closed on `ModuleNotFoundError: graphiti_core` for every
+    /// query, out of the box. Found by running install.sh as a non-root user.
+    #[test]
+    fn a_missing_graphiti_degrades_instead_of_failing_closed() {
+        let absent = std::env::temp_dir().join("engram-no-graphiti-at-all");
+        assert!(!graphiti_usable(&absent), "an empty dir is not a Graphiti");
+
+        // The SCRIPT is not the signal: install.sh copies graph/*.py
+        // unconditionally and only builds the venv under --graph, so a
+        // --no-graph install has the script and no way to run it. Keying on the
+        // script made this degradation a no-op, which is how the first attempt
+        // at this fix still failed closed on a real non-root install.
+        let fake = FakeGraphiti::new("script-without-venv", "import sys; sys.exit(1)");
+        assert!(graphiti_script(fake.dir()).is_file());
+        assert!(
+            !graphiti_usable(fake.dir()),
+            "a script with no venv must not count as an installed Graphiti"
+        );
+
+        // With a venv present it counts, and a failure there stays fatal.
+        std::fs::create_dir_all(fake.dir().join("venv/bin")).unwrap();
+        std::fs::write(fake.dir().join("venv/bin/python"), "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(graphiti_usable(fake.dir()));
     }
 
     /// A fixture `<graph dir>/memory_graph_recall.py` standing in for Graphiti.

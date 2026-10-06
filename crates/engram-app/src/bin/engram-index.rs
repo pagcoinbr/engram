@@ -18,7 +18,11 @@ const EXIT_UNSUPPORTED_PROVIDER: u8 = 3;
 struct Args {
     #[arg(long, env = "ENGRAM_CONFIG")]
     config: Option<PathBuf>,
-    #[arg(long)]
+    // allow_hyphen_values because EVERY engram slug starts with '-' (it is a
+    // path with separators replaced), so clap read `--slug -home-alice` as a
+    // missing value followed by an unknown flag. The documented invocation was
+    // unusable as typed.
+    #[arg(long, allow_hyphen_values = true)]
     slug: Option<String>,
     #[arg(long, conflicts_with_all = ["only", "delete"])]
     rebuild: bool,

@@ -7,7 +7,11 @@ struct Args {
     /// Resolved by engram-paths when omitted, so this is not pinned to one host.
     #[arg(long, env = "ENGRAM_CONFIG")]
     config: Option<PathBuf>,
-    #[arg(long)]
+    // allow_hyphen_values because EVERY engram slug starts with '-' (it is a
+    // path with separators replaced), so clap read `--slug -home-alice` as a
+    // missing value followed by an unknown flag. The documented invocation was
+    // unusable as typed.
+    #[arg(long, allow_hyphen_values = true)]
     slug: Option<String>,
     #[arg(long, default_value_t = 6)]
     k: usize,

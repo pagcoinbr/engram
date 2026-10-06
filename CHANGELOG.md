@@ -258,6 +258,28 @@ overshot the bug.
   two implementations it mirrors. `backend: Ollama` resolved to Ollama in both and
   to FastEmbed in the gate.
 
+### Fixed — found by the non-root install test
+
+The review asked for a clean install under an unprivileged user. It was worth it:
+the portability work above was all correct, and two bugs it could not have caught
+turned up immediately.
+
+- **Recall worked out of the box again on a `--no-graph` install.** Two
+  individually correct decisions combined into a broken one: `graphiti_compat` is
+  the default so an upgraded install is never moved off its populated index, and a
+  compat failure is fatal so recall can never silently reorder. On an install that
+  never had the graph, that meant every query died with
+  `ModuleNotFoundError: graphiti_core`. An absent Graphiti is not a failure to
+  preserve ordering — there is no ordering to preserve — so it now degrades to
+  local keyword + vector recall and says so in `legs`. An install that *has*
+  Graphiti and then fails still fails closed. The signal is the **venv**, not the
+  script: `install.sh` copies `graph/*.py` unconditionally and only builds
+  `graph/venv` under `--graph`.
+- **`--slug` accepts a value starting with `-`.** Every engram slug does (it is a
+  path with the separators replaced), so clap read `--slug -home-alice` as a
+  missing value followed by an unknown flag, and the documented invocation was
+  unusable as typed.
+
 ### Known limitations
 
 Stated rather than silently carried:
