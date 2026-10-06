@@ -141,6 +141,38 @@ mkdir -p "$CLAUDE/hooks"; install -m 0755 "$REPO"/bin/hooks/*.py "$CLAUDE/hooks/
 rm -rf "$CLAUDE/ui" "$CLAUDE/engram-ui.sh" 2>/dev/null || true
 say "engine installed into $CLAUDE (console: run $CLAUDE/engram-tui.py)"
 
+# Keep a copy of engram-app that a systemd unit runs, but that this installer does
+# not own, in step with the one it just built.
+#
+# On an SELinux-enforcing host, systemd cannot exec out of /root/.claude
+# (admin_home_t is not an entrypoint), so those deployments run the API from a
+# bin_t path such as /usr/local/bin and the unit's ExecStart points there. This
+# script only ever wrote $CLAUDE/rust, so every install produced a new binary that
+# the service never ran: `systemctl restart` succeeded, the API kept serving the
+# old code, and nothing said so. That is the worst shape for this failure — the
+# deploy looks clean.
+#
+# Only refresh a path that ALREADY exists. Creating one would quietly add a
+# system-wide install on hosts that never asked for it.
+sync_service_binaries(){
+  local unit path updated=0
+  for unit in /etc/systemd/system/engram-*.service "$HOME/.config/systemd/user"/engram-*.service; do
+    [[ -f "$unit" ]] || continue
+    while read -r path; do
+      [[ -n "$path" ]] || continue
+      # Already the installer-managed copy, or not ours to touch.
+      [[ "$path" == "$CLAUDE/rust/engram-app" ]] && continue
+      [[ -f "$path" ]] || continue
+      install -m 0755 "$REPO/target/release/engram-app" "$path" || continue
+      command -v restorecon >/dev/null && restorecon "$path" 2>/dev/null
+      say "refreshed $path (run by $(basename "$unit"))"
+      updated=1
+    done < <(grep -hoE '^ExecStart=[^ ]*/engram-app' "$unit" 2>/dev/null | sed 's/^ExecStart=//')
+  done
+  [[ "$updated" == 1 ]] && say "restart the API to pick it up: systemctl restart engram-api"
+  return 0
+}
+
 # Build the Rust API and command-line migration tools when Cargo is available.
 # Python services remain installed during the staged cutover, so a missing Rust
 # toolchain never turns an update into an outage.
@@ -157,6 +189,7 @@ if command -v cargo >/dev/null; then
     rm -f "$CLAUDE/rust/engram-graph-compat"
     install -m 0644 "$REPO/tests/graph_recall_eval.json" "$CLAUDE/rust/graph_recall_eval.json"
     say "Rust executables installed into $CLAUDE/rust"
+    sync_service_binaries
   else
     warn "Rust build failed — retaining the installed Python services"
   fi

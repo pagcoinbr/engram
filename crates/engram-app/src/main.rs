@@ -179,8 +179,27 @@ async fn main() {
         .route("/api/v1/config/editor/validate", post(validate_editor))
         .route("/api/v1/recall", get(recall_api))
         .with_state(Arc::new(AppState { config }));
-    let listener = tokio::net::TcpListener::bind(args.bind).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // A bind failure is an operator problem, not a bug: the usual cause is an
+    // older copy of this service still holding the port, and `unwrap()` reported
+    // it as a panic with a bare `Os { code: 98 }`, which reads like a crash.
+    let listener = match tokio::net::TcpListener::bind(args.bind).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("engram-app: could not bind {}: {error}", args.bind);
+            if error.kind() == std::io::ErrorKind::AddrInUse {
+                eprintln!(
+                    "engram-app: something is already listening there — check for an \
+                     earlier engram-app (ss -ltnp | grep {})",
+                    args.bind.port()
+                );
+            }
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = axum::serve(listener, app).await {
+        eprintln!("engram-app: server stopped: {error}");
+        std::process::exit(1);
+    }
 }
 
 async fn recommended_models() -> Json<Vec<engram_config::RecommendedEmbedder>> {
