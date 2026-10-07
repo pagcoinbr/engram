@@ -104,6 +104,12 @@ fn resolve(cli: Option<&str>, cwd: Option<&Path>) -> String {
 }
 
 /// `/home/u/proj` -> `-home-u-proj`, the naming Claude Code uses for project dirs.
+/// The operator's store pin in `<engram home>/engram.env`, if any. The legacy
+/// Graphiti graph is one unscoped group built from this store.
+pub fn pinned_slug() -> Option<String> {
+    env_file_slug(&engram_home().join("engram.env"))
+}
+
 pub fn slugify(path: &Path) -> String {
     path.to_string_lossy().replace('/', "-")
 }
@@ -210,6 +216,24 @@ mod tests {
             unsafe { std::env::remove_var(key) };
         }
         unsafe { std::env::set_var("HOME", "/home/tester") };
+    }
+
+    #[test]
+    fn the_pin_is_read_from_engram_env_only() {
+        let _g = env_lock();
+        clear();
+        let dir = std::env::temp_dir().join("engram-paths-pin-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("ENGRAM_BIN", dir.to_str().unwrap()) };
+        std::fs::remove_file(dir.join("engram.env")).ok();
+        assert_eq!(pinned_slug(), None);
+        // a session override is not the pin: the legacy graph was built from the file
+        unsafe { std::env::set_var("CLAUDE_MEMORY_SLUG", "-session-override") };
+        assert_eq!(pinned_slug(), None);
+        std::fs::write(dir.join("engram.env"), "CLAUDE_MEMORY_SLUG=\"-pinned\"\n").unwrap();
+        assert_eq!(pinned_slug().as_deref(), Some("-pinned"));
+        std::fs::remove_dir_all(&dir).ok();
+        clear();
     }
 
     #[test]

@@ -50,6 +50,18 @@ import memory_ai  # noqa: E402
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{3,}")
 
 
+def pinned_slug() -> str:
+    """The operator's store pin in engram.env, or "" when there is none."""
+    try:
+        for line in (ENGRAM_BIN / "engram.env").read_text().splitlines():
+            line = line.strip().removeprefix("export ").strip()
+            if line.startswith("CLAUDE_MEMORY_SLUG="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+
 def resolve_slug(cwd: str = "") -> str:
     """Decide WHICH store to search, and pin it in the environment for the legs.
 
@@ -59,17 +71,7 @@ def resolve_slug(cwd: str = "") -> str:
     mirrors memory_lib.sh: explicit env, then the operator pin in engram.env, then
     the cwd-derived Claude Code project store, then the $HOME default.
     """
-    s = os.environ.get("CLAUDE_MEMORY_SLUG")
-    if not s:
-        envf = ENGRAM_BIN / "engram.env"
-        try:
-            for line in envf.read_text().splitlines():
-                line = line.strip().removeprefix("export ").strip()
-                if line.startswith("CLAUDE_MEMORY_SLUG="):
-                    s = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-        except Exception:
-            pass
+    s = os.environ.get("CLAUDE_MEMORY_SLUG") or pinned_slug()
     if not s and cwd:
         s = str(cwd).replace("/", "-")
     if not s:
@@ -283,8 +285,12 @@ def graph_facts(query: str, max_facts: int = 6, max_tokens: int = 32,
         if not tokens:
             return []
         res = _post(endpoint, {"statements": [{
+            # Graphiti never deletes a superseded fact, it stamps invalid_at /
+            # expired_at; without this every version of history read as current.
             "statement": "UNWIND $names AS nm MATCH (n:Entity)-[r:RELATES_TO]-(m:Entity) "
-                         "WHERE toLower(n.name)=toLower(nm) RETURN r.fact AS fact LIMIT $lim",
+                         "WHERE toLower(n.name)=toLower(nm) "
+                         "AND r.invalid_at IS NULL AND r.expired_at IS NULL "
+                         "RETURN r.fact AS fact LIMIT $lim",
             "parameters": {"names": tokens, "lim": max_facts}}]},
             {"Authorization": auth}, timeout)
         rows = res["results"][0]["data"]
@@ -310,13 +316,16 @@ def recall(query: str, k: int = 6, mtype: str = "", fast: bool = False,
     """Hybrid recall. fast=True swaps the graphiti graph leg for 1-hop neighbour
     facts, which is the difference between ~0.3s and several seconds. `timeout`
     bounds each HTTP leg (the prompt hook lowers it)."""
-    resolve_slug(cwd)
+    slug = resolve_slug(cwd)
     cfg = memory_ai.load()
     want = max(k * 2, 10)
     vector_hits = vector_leg(query, want, mtype, cfg, timeout)
     keyword_pairs = keyword_leg(query, want, mtype)
     graph_records = [] if fast else graph_recall_leg(query, want, mtype)
-    facts = graph_facts(query, timeout=timeout) if fast else []
+    # The legacy graph is ONE unscoped group built from the pinned store, so its
+    # facts may only reach a session searching that store; any other project would
+    # get another project's facts. (The Rust native backend is scoped per slug.)
+    facts = graph_facts(query, timeout=timeout) if fast and slug == pinned_slug() else []
     results = fuse_records(graph_records, vector_hits, keyword_pairs, cfg, k)
     return {"query": query, "results": results, "facts": facts,
             "sources_used": sorted({s for r in results for s in r["sources"]})}
