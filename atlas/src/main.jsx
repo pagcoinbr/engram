@@ -26,6 +26,7 @@ const NAV = [
 
 async function api(path, options) {
   const response = await fetch(path, options);
+  if (response.status === 401) {location.assign("/login"); throw new Error("Not signed in");}
   if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
   return response.json();
 }

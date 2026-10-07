@@ -140,7 +140,9 @@ the MCP `memory_recall_hybrid` tool. It also exposes a loopback-only service:
 
 ```bash
 cargo run -p engram-app --bin engram-app -- --config ~/.claude/engram.yaml
-curl http://127.0.0.1:8787/api/v1/status
+# printf is a shell builtin, so the token never appears in a process's argv
+curl -H @<(printf 'Authorization: Bearer %s' "$(cat ~/.claude/engram-api.token)") \
+  http://127.0.0.1:8787/api/v1/status
 cargo run -p engram-app --bin engram-index -- --rebuild
 ```
 
@@ -148,6 +150,16 @@ cargo run -p engram-app --bin engram-index -- --rebuild
 `/api/v1/config/editor` provides revision-protected validation and saves for the
 Atlas configuration screen. The installer places these binaries in
 `~/.claude/rust/` and enables `engram-api.service` for systemd installations.
+
+Both local APIs (this one and the Atlas on `:8765`) require a shared token, created
+0600 at `~/.claude/engram-api.token` by whichever server starts first
+(`ENGRAM_API_TOKEN_FILE` overrides the path). Scripts send
+`Authorization: Bearer <token>` (from a file or stdin, never on the command line,
+where `ps` shows it to every user); in the browser, paste the token into the form
+at `http://127.0.0.1:8765/login` once and an HttpOnly, SameSite=Strict cookie
+takes over. The token is never accepted in a URL. A loopback bind is not a barrier on its own: a web page can
+DNS-rebind its own name to 127.0.0.1. If you expose the Atlas through a reverse
+proxy, terminate TLS there; the token travels on every request.
 
 ---
 

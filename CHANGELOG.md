@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — API authentication
+
+### Security
+- **Both local APIs require a token.** Every route on `engram-app` (:8787) except
+  `/healthz`, and every route on `engram_api`/Atlas (:8765) except the page shell
+  and `/login`, was unauthenticated, including config rewrites and memory
+  create/delete. A loopback bind did not protect them from a browser tab
+  (DNS rebinding). The token lives in `~/.claude/engram-api.token` (0600), created
+  race-free by whichever server starts first; scripts use `Authorization: Bearer`,
+  the browser gets an HttpOnly SameSite=Strict cookie from the `/login` POST form.
+  The token is never accepted in a URL (history, proxy logs, Referer).
+- **A config save that moves an endpoint drops that endpoint's `api_key`.** The
+  writers preserved unmodelled keys, so repointing `llama_cpp.url`/`embed.url`
+  sent the stored bearer token to the new host.
+- **`/api/v1/recall?slug=` is validated.** It was joined straight into
+  `projects/<slug>/memory`, so `../..` searched markdown anywhere on disk.
+- **Atlas config backups and temp files are created 0600** instead of at the
+  umask default, which left every credential world-readable.
+
 ## Unreleased — PR #34 stabilization (Rust foundation + Graphiti compatibility)
 
 Remediation of the PR #34 review. The theme: the Rust layer was written against one

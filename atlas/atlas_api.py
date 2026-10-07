@@ -330,6 +330,13 @@ def _write_config(editable: dict) -> str:
     path = _config_path()
     raw = yaml.safe_load(path.read_text()) or {}
     raw["backend"] = editable["backend"]
+    # A key is bound to its endpoint: if the edit moves `url`, drop the old key
+    # rather than send it to the new host (same rule as the Rust writer). Set the
+    # key for a new endpoint in engram.yaml by hand.
+    for section in ("llama_cpp", "embed"):
+        old, new = raw.get(section) or {}, editable[section]
+        if "url" in new and str(old.get("url") or "").rstrip("/") != str(new["url"] or "").rstrip("/"):
+            old.pop("api_key", None)
     raw.setdefault("llama_cpp", {}).update(editable["llama_cpp"])
     raw.setdefault("embed", {}).update(editable["embed"])
     raw.setdefault("graph", {}).update(editable["graph"])
@@ -342,10 +349,16 @@ def _write_config(editable: dict) -> str:
     now = time.time_ns()
     stamp = f"{now // 1_000_000_000}.{now % 1_000_000_000:09d}.{os.getpid()}"
     backup = backup_dir / f"engram.yaml.{stamp}.bak"
-    backup.write_bytes(path.read_bytes())
+    # Both files carry every credential in the config: create them 0600 instead of
+    # at the umask default (world-readable) and chmod-ing afterwards.
+    def private(target: Path, data: bytes) -> None:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    private(backup, path.read_bytes())
     temp = path.with_suffix(f".yaml.{stamp}.tmp")
-    temp.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
-    os.chmod(temp, path.stat().st_mode)
+    private(temp, yaml.safe_dump(raw, sort_keys=False, allow_unicode=True).encode())
+    os.chmod(temp, path.stat().st_mode & 0o700)
     temp.replace(path)
     return str(backup)
 
@@ -360,7 +373,8 @@ def _request_json(url: str, body: dict | None = None, timeout: float = 3.0) -> d
 def _rust_json(path: str, body: dict | None = None, method: str = "GET") -> dict:
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(f"{RUST_API}{path}", data=data, method=method,
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json",
+                                              "Authorization": f"Bearer {base.TOKEN}"})
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode())

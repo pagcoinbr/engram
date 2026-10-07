@@ -39,7 +39,7 @@ jobs:
           python-version: "3.12"
       # The suites load modules by path into a throwaway $HOME, so only PyYAML is
       # needed. Tests that want a live Neo4j/Qdrant/LLM skip themselves.
-      - run: python -m pip install --quiet pyyaml
+      - run: python -m pip install --quiet pyyaml fastapi httpx
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
       - run: bash tests/run_all.sh --python
 
