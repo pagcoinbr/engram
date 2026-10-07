@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased — migrate the legacy graph to the Rust native backend
+
+### Added
+- **`engram-native-graph-sync --bootstrap-from-legacy`** seeds the native graph from
+  the legacy Graphiti one **without calling a model**, where re-extracting a store
+  on a local 8 GB GPU would take ~16 h. Check first that the legacy
+  `fact_embedding`s are in the configured embedding space.
+  - **Scoped:** it (and `--import-legacy-embeddings`) refuses unless the target is
+    the `engram.env`-pinned store, failing closed with no pin. The legacy graph is
+    one unscoped group built from that store.
+  - **Verified:** a memory qualifies only if its file is byte-identical to one
+    legacy episode (`Episodic.source_md`), and only that episode's facts are used,
+    so an older ingested version never contributes.
+  - **Redacted before writing:** facts are read out, redacted with the shared
+    secret detector (text, entity names, relation name) and re-embedded from the
+    redacted text in Rust; raw legacy facts never touch the native graph.
+  - **History kept, never resurrected:** superseded facts (Graphiti
+    `invalid_at`/`expired_at`) are imported with `valid_until`, so recall skips
+    them; when a claim exists both live and superseded, the live copy wins.
+  - **Atomic and resumable:** each memory's facts and commit marker are one
+    transaction. An interrupted run leaves fact-less, unstamped nodes that the next
+    run resumes; nodes carrying facts from elsewhere are left alone.
+
+  Reference store (677 memories): 606 memories, 6,099 facts (106 redacted, 515
+  historical) in ~30 s; the rest are left for the normal extracting sync.
+
+### Fixed
+- **Legacy recall served superseded facts as current.** Graphiti never deletes a
+  contradicted fact, it stamps `invalid_at`/`expired_at`; no legacy read query
+  (Python fast leg, Rust fast/semantic/keyword legs) checked either, so every
+  version of history was recalled at once (632 of 6,720 edges on the reference
+  store). All now require both to be null.
+- **Both recall hooks redact graph facts before injecting them.** Facts reach the
+  model verbatim, and legacy graph facts never passed the save-time secret guard.
+  The Python hook injects nothing if its redactor cannot be imported.
+- **The Rust recall hook injected no graph facts.** It printed only facts attributed
+  to a returned memory; the fast leg's facts are unattributed (`Output::facts`).
+  Same section and per-session dedup as the Python hook now.
+- **Imported legacy facts were invisible to the fast leg,** which read triples
+  only. Imported facts keep their edge's entity names and match them exactly, as
+  the legacy query matched `Entity.name`.
+- **Legacy graph facts reached every project.** The legacy graph is one unscoped
+  group built from the `engram.env`-pinned store; both the Python and Rust fast legs
+  now serve its facts only to that store. Native facts are slug-scoped already.
+- **Extraction timeout comes from `llama_cpp.timeout_seconds`,** not a fixed 90 s
+  that a local model (~85 s per extraction) failed at random.
+
 ## Unreleased — API authentication
 
 ### Security

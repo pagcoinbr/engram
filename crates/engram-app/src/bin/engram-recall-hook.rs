@@ -121,14 +121,16 @@ async fn main() {
         return;
     };
 
+    let facts = fresh_facts(&result.facts, &seen, inject.max_facts);
     let fresh = result
         .results
         .into_iter()
         .filter(|item| seen.insert(item.file.clone()))
         .collect::<Vec<_>>();
-    if fresh.is_empty() {
+    if fresh.is_empty() && facts.is_empty() {
         return;
     }
+    seen.extend(facts.iter().map(|fact| fact_key(fact)));
     let _ = std::fs::create_dir_all(&state_dir);
     let temp = state_path.with_extension(format!("json.{}.tmp", std::process::id()));
     if std::fs::write(&temp, serde_json::to_vec(&seen).unwrap_or_default()).is_ok() {
@@ -141,19 +143,34 @@ async fn main() {
     for item in &fresh {
         println!("- {}: {}", item.name, item.description);
     }
-    // Facts stay attributed to the memory that carried them, and the total is
-    // capped by recall.inject.max_facts.
-    let mut shown = 0;
-    for item in &fresh {
-        for fact in &item.facts {
-            if shown >= inject.max_facts {
-                break;
-            }
-            println!("  · {fact}");
-            shown += 1;
+    if !facts.is_empty() {
+        println!("Graph facts (1-hop):");
+        for fact in &facts {
+            println!("- {fact}");
         }
     }
     println!("</relevant-memory>");
+}
+
+/// Graph facts not yet injected this session, capped by recall.inject.max_facts.
+///
+/// From `result.facts`, which holds every fact: the fast leg's 1-hop facts are
+/// not attributed to any memory, so printing only each item's `facts` dropped all
+/// of them, and the hook injected memory names with no facts at all. Same section
+/// and per-session dedup as hooks/memory-recall-inject.py.
+fn fresh_facts(all: &[String], seen: &BTreeSet<String>, max: usize) -> Vec<String> {
+    // Redacted before dedup and printing: facts reach the model verbatim, and
+    // legacy/imported facts never passed the save-time secret guard.
+    all.iter()
+        .map(|fact| engram_secrets::redact(fact).0)
+        .filter(|fact| !seen.contains(&fact_key(fact)))
+        .take(max)
+        .collect()
+}
+
+/// Facts share the session state with memory files; the prefix keeps them apart.
+fn fact_key(fact: &str) -> String {
+    format!("fact:{fact}")
 }
 
 fn load_seen(path: &std::path::Path) -> BTreeSet<String> {
@@ -179,5 +196,30 @@ fn sweep_stale_state(dir: &std::path::Path) {
         if stale {
             let _ = std::fs::remove_file(entry.path());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unattributed_facts_are_injected_once_per_session() {
+        let all = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut seen = BTreeSet::new();
+        assert_eq!(fresh_facts(&all, &seen, 2), ["a", "b"]);
+        seen.extend(["a", "b"].map(fact_key));
+        seen.insert("b".into()); // a memory FILE named "b" must not hide fact "b"
+        assert_eq!(fresh_facts(&all, &seen, 6), ["c"]);
+        seen.insert(fact_key("c"));
+        assert!(fresh_facts(&all, &seen, 6).is_empty());
+    }
+
+    #[test]
+    fn injected_facts_are_redacted() {
+        let all = vec!["the key is api_key=sk-proj-abcdefghijklmnopqrstuvwxyz1234".to_string()];
+        let out = fresh_facts(&all, &BTreeSet::new(), 6);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].contains("sk-proj-"), "{out:?}");
     }
 }

@@ -674,10 +674,18 @@ async fn fast_graph_leg(
         client
             .native_facts_for_tokens(slug, &tokens, config.recall.inject.max_facts.max(1))
             .await
-    } else {
+    } else if engram_paths::pinned_slug().as_deref() == Some(slug) {
         client
             .facts_for_tokens(&tokens, config.recall.inject.max_facts.max(1))
             .await
+    } else {
+        // The legacy graph is ONE unscoped group built from the pinned store; a
+        // session on any other store would be handed another project's facts.
+        legs.insert(
+            "graph".into(),
+            "fast: legacy facts serve only the pinned store (use graph.backend: native)".into(),
+        );
+        return leg;
     };
     match facts {
         Ok(mut facts) => {

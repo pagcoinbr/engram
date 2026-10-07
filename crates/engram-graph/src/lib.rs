@@ -27,6 +27,34 @@ pub struct NativeTriple {
     pub temporal: String,
 }
 
+/// A fact read out of the legacy graph for the bootstrap.
+pub struct LegacyFact {
+    pub file: String,
+    pub text: String,
+    pub subject: String,
+    pub object: String,
+    pub legacy_name: String,
+    pub embedding: Option<Vec<f32>>,
+    /// Graphiti's `invalid_at` (or `expired_at`): when a newer fact superseded
+    /// this one. Graphiti never deletes a contradicted fact, it stamps it.
+    pub valid_until: Option<String>,
+}
+
+/// A fact ready to be written by the bootstrap: redacted, with a vector of the
+/// text actually stored.
+#[derive(serde::Serialize)]
+pub struct BootstrapFact {
+    pub text: String,
+    pub subject: String,
+    pub object: String,
+    pub legacy_name: String,
+    pub embedding: Option<Vec<f32>>,
+    pub redacted: bool,
+    /// Set for a superseded legacy fact, which is imported as history: every
+    /// native recall query requires `valid_until IS NULL`.
+    pub valid_until: Option<String>,
+}
+
 pub const RELATION_TAXONOMY: &[&str] = &[
     "belongs_to",
     "conflicts_with",
@@ -170,17 +198,36 @@ const LEGACY_FACTS_FOR_TOKENS: &str = "\
 UNWIND $names AS nm \
 MATCH (n:Entity)-[r:RELATES_TO]-(m:Entity) \
 WHERE toLower(n.name) = toLower(nm) \
+  AND r.invalid_at IS NULL AND r.expired_at IS NULL \
 RETURN r.fact AS fact LIMIT $lim";
 
+/// Triples whose subject/object mention a token, plus facts whose ENTITY
+/// endpoints equal one. The second branch serves facts imported from the legacy
+/// graph: they carry no triples (753 free-form Graphiti relation names do not map
+/// onto the taxonomy without a model), only the entity names of the edge they came
+/// from, so it matches them exactly the way the legacy query matched `Entity.name`
+/// (equality, so filler words never hit). Without it a bootstrapped store recalls
+/// zero facts on the hook's fast path.
 const NATIVE_FACTS_FOR_TOKENS: &str = "\
 UNWIND $names AS name \
-MATCH (m:EngramMemory {slug: $slug})-[:HAS_TRIPLE]->(t:EngramTriple {status: 'active'}) \
-WHERE t.valid_until IS NULL \
-  AND (toLower(t.subject) CONTAINS toLower(name) OR toLower(t.object) CONTAINS toLower(name)) \
-RETURN DISTINCT t.subject + ' ' + t.relation + ' ' + t.object AS fact LIMIT $lim";
+CALL { \
+  WITH name \
+  MATCH (m:EngramMemory {slug: $slug})-[:HAS_TRIPLE]->(t:EngramTriple {status: 'active'}) \
+  WHERE t.valid_until IS NULL \
+    AND (toLower(t.subject) CONTAINS toLower(name) OR toLower(t.object) CONTAINS toLower(name)) \
+  RETURN t.subject + ' ' + t.relation + ' ' + t.object AS fact \
+  UNION \
+  WITH name \
+  MATCH (m:EngramMemory {slug: $slug})-[:HAS_FACT]->(f:EngramFact) \
+  WHERE f.valid_until IS NULL \
+    AND (toLower(f.subject) = toLower(name) OR toLower(f.object) = toLower(name)) \
+  RETURN f.text AS fact \
+} \
+RETURN DISTINCT fact LIMIT $lim";
 
 const LEGACY_SEMANTIC_FILES: &str = "\
 MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity) \
+WHERE e.invalid_at IS NULL AND e.expired_at IS NULL \
 WITH e, vector.similarity.cosine(e.fact_embedding, $vector) AS score WHERE score > 0 \
 UNWIND coalesce(e.episodes, []) AS episode \
 MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL \
@@ -190,12 +237,65 @@ ORDER BY score DESC LIMIT $limit";
 const LEGACY_KEYWORD_FILES: &str = "\
 CALL db.index.fulltext.queryRelationships('edge_name_and_fact', $query, {limit: $limit}) \
 YIELD relationship AS rel, score \
+WITH rel, score WHERE rel.invalid_at IS NULL AND rel.expired_at IS NULL \
 UNWIND coalesce(rel.episodes, []) AS episode \
 MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL \
 RETURN ep.file AS file, collect(DISTINCT rel.fact) AS facts, max(score) AS score \
 ORDER BY score DESC LIMIT $limit";
 
 // Legacy import. Schema DDL carries no slug; the data statement must.
+
+/// Every legacy episode for these files with the verbatim markdown Graphiti
+/// ingested (`Episodic.source_md`). A file can have several episodes (older
+/// ingested versions); the caller picks the one whose bytes match the file.
+const LEGACY_SOURCES: &str = "\
+MATCH (e:Episodic) WHERE e.file IN $files AND e.source_md IS NOT NULL \
+RETURN e.file, e.uuid, e.source_md";
+
+/// Files the bootstrap must not touch: already current, or carrying facts from
+/// somewhere else (a failed extracting sync leaves facts without a marker). A node
+/// an interrupted bootstrap left behind has neither, so a retry resumes it.
+const NATIVE_FILES: &str = "\
+MATCH (m:EngramMemory {slug: $slug}) \
+WHERE m.sha IS NOT NULL OR (m)-[:HAS_FACT]->() \
+RETURN m.file";
+
+/// The facts of exactly these legacy episodes, read OUT of the legacy graph so
+/// they can be redacted and re-embedded before anything native is written. An
+/// older ingested version of a file is a different episode and never matches.
+const LEGACY_VERIFIED_FACTS: &str = "\
+MATCH (source:Entity)-[r:RELATES_TO]->(target:Entity) \
+WHERE r.fact IS NOT NULL \
+UNWIND coalesce(r.episodes, []) AS episode \
+WITH source, r, target, episode WHERE episode IN $episodes \
+MATCH (ep:Episodic {uuid: episode}) \
+RETURN DISTINCT ep.file, r.fact, coalesce(source.name, ''), coalesce(target.name, ''), \
+       coalesce(r.name, ''), r.fact_embedding, \
+       toString(coalesce(r.invalid_at, r.expired_at))";
+
+/// One memory's bootstrap, as ONE statement and therefore one transaction: its
+/// already-redacted facts and its commit marker land together or not at all. An
+/// interruption leaves a node with no facts and no marker, which NATIVE_FILES
+/// lets the next run resume.
+const COMMIT_BOOTSTRAPPED_MEMORY: &str = "\
+MATCH (m:EngramMemory {slug: $slug, file: $file}) \
+CALL { \
+  WITH m \
+  UNWIND $facts AS row \
+  MERGE (f:EngramFact {slug: $slug, memory_file: m.file, text: row.text}) \
+  ON CREATE SET f.created_at = datetime(), f.valid_from = datetime() \
+  SET f.legacy_name = row.legacy_name, f.subject = row.subject, f.object = row.object, \
+      f.embedding = row.embedding, f.embedding_updated_at = datetime(), \
+      f.redacted_at = CASE WHEN row.redacted THEN datetime() ELSE null END, \
+      f.valid_until = CASE WHEN row.valid_until IS NULL THEN null \
+                           ELSE datetime(row.valid_until) END, \
+      f.updated_at = datetime() \
+  MERGE (m)-[:HAS_FACT]->(f) \
+  RETURN count(f) AS written \
+} \
+SET m.sha = $sha, m.embedding_space = $space, m.native_triple_version = 2, \
+    m.native_triples_synced_at = datetime() \
+RETURN written";
 
 const CREATE_NATIVE_FACT_INDEX: &str = "\
 CREATE FULLTEXT INDEX engram_native_fact_text IF NOT EXISTS \
@@ -219,14 +319,14 @@ MATCH (edge:EngramLegacyEdge) WITH edge LIMIT 10000 DETACH DELETE edge RETURN co
 /// have lost them for good. An unembedded fact simply sits out the semantic leg
 /// (which requires `f.embedding IS NOT NULL`) and is still found by keyword.
 const IMPORT_NATIVE_LEGACY_FACTS: &str = "\
-MATCH (:Entity)-[r:RELATES_TO]->(:Entity) \
+MATCH (source:Entity)-[r:RELATES_TO]->(target:Entity) \
 UNWIND coalesce(r.episodes, []) AS episode \
 MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL \
 MATCH (m:EngramMemory {slug: $slug, file: ep.file}) \
 WHERE r.fact IS NOT NULL \
 MERGE (f:EngramFact {slug: $slug, memory_file: m.file, text: r.fact}) \
 ON CREATE SET f.created_at = datetime(), f.valid_from = datetime() \
-SET f.legacy_name = r.name, \
+SET f.legacy_name = r.name, f.subject = source.name, f.object = target.name, \
     f.embedding = coalesce(r.fact_embedding, f.embedding), \
     f.embedding_updated_at = CASE WHEN r.fact_embedding IS NULL THEN f.embedding_updated_at \
                                   ELSE datetime() END, \
@@ -748,6 +848,89 @@ impl GraphClient {
         Ok(())
     }
 
+    /// `(file, episode uuid, source_md)` for every legacy episode of these files.
+    pub async fn legacy_sources(
+        &self,
+        files: &[String],
+    ) -> Result<Vec<(String, String, String)>, GraphError> {
+        let response = self
+            .query(LEGACY_SOURCES, serde_json::json!({"files": files}))
+            .await?;
+        Ok(response
+            .results
+            .into_iter()
+            .flat_map(|set| set.data)
+            .filter_map(|row| {
+                let text = |i: usize| Some(row.row.get(i)?.as_str()?.to_string());
+                Some((text(0)?, text(1)?, text(2)?))
+            })
+            .collect())
+    }
+
+    /// Files that already have a native node in this store.
+    pub async fn native_files(&self, slug: &str) -> Result<Vec<String>, GraphError> {
+        self.strings(NATIVE_FILES, serde_json::json!({"slug": slug}))
+            .await
+    }
+
+    /// The facts of exactly these legacy episodes (see LEGACY_VERIFIED_FACTS).
+    pub async fn legacy_verified_facts(
+        &self,
+        episodes: &[String],
+    ) -> Result<Vec<LegacyFact>, GraphError> {
+        let response = self
+            .query(
+                LEGACY_VERIFIED_FACTS,
+                serde_json::json!({"episodes": episodes}),
+            )
+            .await?;
+        Ok(response
+            .results
+            .into_iter()
+            .flat_map(|set| set.data)
+            .filter_map(|row| {
+                let text = |i: usize| Some(row.row.get(i)?.as_str()?.to_string());
+                let embedding = row.row.get(5).and_then(|value| {
+                    value
+                        .as_array()?
+                        .iter()
+                        .map(|x| x.as_f64().map(|x| x as f32))
+                        .collect::<Option<Vec<f32>>>()
+                });
+                Some(LegacyFact {
+                    file: text(0)?,
+                    text: text(1)?,
+                    subject: text(2)?,
+                    object: text(3)?,
+                    legacy_name: text(4)?,
+                    embedding,
+                    valid_until: text(6),
+                })
+            })
+            .collect())
+    }
+
+    /// Write one memory's (already redacted) facts and its commit marker in a
+    /// single transaction. See COMMIT_BOOTSTRAPPED_MEMORY.
+    pub async fn commit_bootstrapped_memory(
+        &self,
+        slug: &str,
+        file: &str,
+        facts: &[BootstrapFact],
+        sha: &str,
+        space: &str,
+    ) -> Result<(), GraphError> {
+        self.query(CREATE_NATIVE_FACT_INDEX, serde_json::json!({}))
+            .await?;
+        self.query(
+            COMMIT_BOOTSTRAPPED_MEMORY,
+            serde_json::json!({"slug": slug, "file": file, "facts": facts,
+                "sha": sha, "space": space}),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Import legacy Graphiti facts as slug-scoped native facts, and clear out
     /// the abandoned edge cache the previous version of this import created.
     pub async fn import_legacy_fact_embeddings(&self, slug: &str) -> Result<(), GraphError> {
@@ -1145,7 +1328,43 @@ mod tests {
             assert!(statement.contains("status: 'active'"), "{statement}");
             assert!(statement.contains("valid_until IS NULL"), "{statement}");
         }
+        // the imported-fact branch: still only open facts, still this slug
+        assert!(NATIVE_FACTS_FOR_TOKENS.contains("f.valid_until IS NULL"));
+        assert_eq!(NATIVE_FACTS_FOR_TOKENS.matches("{slug: $slug}").count(), 2);
         assert!(NATIVE_SEMANTIC_FILES.contains("f.valid_until IS NULL"));
+    }
+
+    /// Imported legacy facts are matched like the legacy query matched entities:
+    /// by equality, so a filler word ("that", "when") inside a fact's text or an
+    /// entity name never pulls it in.
+    /// The bootstrap import is bounded by the verified episode list and the
+    /// slug: no other episode of the same file, and no other store's node.
+    #[test]
+    fn bootstrap_import_takes_only_verified_episodes() {
+        assert!(LEGACY_VERIFIED_FACTS.contains("WHERE episode IN $episodes"));
+        assert!(LEGACY_SOURCES.contains("e.uuid"));
+        // facts and marker in ONE statement = one transaction
+        assert!(COMMIT_BOOTSTRAPPED_MEMORY.contains("MERGE (m)-[:HAS_FACT]->(f)"));
+        assert!(COMMIT_BOOTSTRAPPED_MEMORY.contains("SET m.sha = $sha"));
+        assert!(COMMIT_BOOTSTRAPPED_MEMORY.contains("EngramFact {slug: $slug"));
+        // a superseded legacy fact is imported as history, never as active
+        assert!(LEGACY_VERIFIED_FACTS.contains("coalesce(r.invalid_at, r.expired_at)"));
+        assert!(COMMIT_BOOTSTRAPPED_MEMORY.contains("datetime(row.valid_until)"));
+        // and the legacy read paths stop serving superseded facts
+        assert!(LEGACY_FACTS_FOR_TOKENS.contains("r.invalid_at IS NULL AND r.expired_at IS NULL"));
+        assert!(LEGACY_SEMANTIC_FILES.contains("e.invalid_at IS NULL AND e.expired_at IS NULL"));
+        assert!(LEGACY_KEYWORD_FILES.contains("rel.invalid_at IS NULL AND rel.expired_at IS NULL"));
+        // a retry resumes fact-less, unstamped nodes and skips everything else
+        assert!(NATIVE_FILES.contains("m.sha IS NOT NULL OR (m)-[:HAS_FACT]->()"));
+    }
+
+    #[test]
+    fn imported_facts_match_entity_names_exactly() {
+        assert!(NATIVE_FACTS_FOR_TOKENS.contains("toLower(f.subject) = toLower(name)"));
+        assert!(NATIVE_FACTS_FOR_TOKENS.contains("toLower(f.object) = toLower(name)"));
+        assert!(!NATIVE_FACTS_FOR_TOKENS.contains("f.text) CONTAINS"));
+        assert!(IMPORT_NATIVE_LEGACY_FACTS.contains("f.subject = source.name"));
+        assert!(IMPORT_NATIVE_LEGACY_FACTS.contains("f.object = target.name"));
     }
 
     #[test]

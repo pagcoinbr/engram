@@ -118,7 +118,14 @@ def main() -> None:
 
     seen_files, seen_facts = _seen(session_id)
     fresh = [r for r in out.get("results", []) if r["file"] not in seen_files]
-    facts = [f for f in out.get("facts", []) if _fact_id(f) not in seen_facts][:max_facts]
+    # Redacted before dedup and printing: facts reach the model verbatim, and
+    # legacy graph facts never passed the save-time secret guard.
+    try:
+        from engram_secrets import redact
+    except Exception as e:
+        return _quiet(f"secret redactor not importable, injecting nothing: {e}")
+    facts = [redact(f)[0] for f in out.get("facts", [])]
+    facts = [f for f in facts if _fact_id(f) not in seen_facts][:max_facts]
     if not fresh and not facts:
         return _quiet("everything relevant was already injected this session")
 
