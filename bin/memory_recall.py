@@ -264,10 +264,12 @@ def _neo4j_http() -> tuple[str, str]:
     return f"{base.rstrip('/')}/db/{db}/tx/commit", f"Basic {token}"
 
 
-def graph_facts(query: str, max_facts: int = 6, max_tokens: int = 6,
+def graph_facts(query: str, max_facts: int = 6, max_tokens: int = 32,
                 timeout: float = 5.0) -> list[str]:
     """The cheap graph leg: 1-hop RELATES_TO facts for entities named in the query.
-    One HTTP round trip for all tokens (UNWIND), so cost is flat in token count."""
+    One HTTP round trip for all tokens (UNWIND), so cost is flat in token count.
+    The cap is generous on purpose: at 6, prose prompts spent it on filler words
+    ("that", "when") and the real entity further in the sentence was never looked up."""
     try:
         endpoint, auth = _neo4j_http()
         tokens, seen = [], set()

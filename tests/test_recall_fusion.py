@@ -176,6 +176,27 @@ def test_embedding_failure_propagates(mr):
     print("ok — embed raises on failure; vector_leg degrades to empty")
 
 
+def test_graph_facts_reaches_late_entity(mr):
+    """A prose prompt leads with filler words; the entity further in must still be
+    looked up. With a 6-token cap this prompt never sent "neo4j" and got 0 facts."""
+    sent = {}
+
+    def fake_post(url, body, headers=None, timeout=5.0):
+        sent["names"] = body["statements"][0]["parameters"]["names"]
+        return {"results": [{"data": [{"row": ["a fact"]}]}]}
+
+    orig = mr._neo4j_http, mr._post
+    mr._neo4j_http, mr._post = (lambda: ("http://127.0.0.1:7474/x", "Basic x")), fake_post
+    try:
+        facts = mr.graph_facts("I'm noticing that when i start a chat qdrant recall and "
+                               "neo4j recall isn't working anymore")
+    finally:
+        mr._neo4j_http, mr._post = orig
+    assert "neo4j" in sent["names"], f"late entity dropped by token cap: {sent['names']}"
+    assert facts == ["a fact"]
+    print("ok — graph facts look up entities past the first few words")
+
+
 def test_hook_dedup(home, slug):
     """Same prompt twice in one session must inject once; a new session re-injects."""
     hook = ROOT / "bin" / "hooks" / "memory-recall-inject.py"
@@ -239,6 +260,7 @@ def main():
         test_embedding_auth_and_timeout(mr)
         test_embedding_prefixes(mr)
         test_embedding_failure_propagates(mr)
+        test_graph_facts_reaches_late_entity(mr)
         test_slug_resolution(mr, d, slug)
         os.environ["CLAUDE_MEMORY_SLUG"] = slug
         test_hook_dedup(d, slug)
