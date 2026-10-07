@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — `update.sh`
+
+### Added
+- **`update.sh`**, dry-run by default, `--apply` to act: a safe fast-forward pull, then
+  `install.sh` with the daemon mode the box already uses. It restores
+  `~/.claude/engram-local-overrides/`, rebuilds and restarts the Atlas and the Rust API
+  when they are installed, and checks that the recall hook still injects memories. On
+  failure it prints the rollback. Tested in `tests/test_update.sh`, isolated from the
+  caller's real services.
+
 ## Unreleased — migrate the legacy graph to the Rust native backend
 
 ### Added
