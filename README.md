@@ -189,11 +189,35 @@ daemon. Restart Claude Code afterward so it loads the new commands.
 in `~/.claude`, **preserves your `engram.yaml` and your `daemon.env` secrets** (the ccg
 key, the Telegram token), and re-registers the MCP servers without duplicating them.
 
+`update.sh` wraps it with the steps a bare re-run misses, **dry-run by default**:
+
+```bash
+cd engram
+./update.sh            # shows the incoming commits and the plan; changes nothing
+./update.sh --apply    # pull + reinstall + restore overrides + rebuild Atlas + verify
+# then restart Claude Code so it reloads the commands + MCP servers
+```
+
+- **Safe pull:** fast-forward only; refuses a dirty tree, a non-default branch or a
+  diverged one.
+- **Same daemon mode:** re-runs `install.sh --yes --daemon <mode>` with the mode the box
+  already uses (`systemd` when `engram.timer` is enabled, else `none`), so a manual-only
+  box is never switched back to a scheduled one. Override with `--daemon`; pass extra
+  installer flags after `--`.
+- **Local overrides:** every file under `~/.claude/engram-local-overrides/` is copied back
+  over `~/.claude` after the install (e.g. a hand-customised
+  `commands/memory-reformat.md`), which a reinstall would otherwise overwrite.
+- **Atlas and Rust API:** rebuilds the Atlas (`npm ci`, only when `atlas/` changed) and
+  restarts `engram-atlas` / `engram-api` when those user services exist.
+- **Verified:** runs the registered recall hook on a probe prompt and checks the Atlas
+  answers; exits 1 with the rollback command if either fails.
+
+By hand, without the wrapper:
+
 ```bash
 cd engram && git pull            # get the new code
 ./install.sh                     # re-run: refreshes ~/.claude, keeps your config + secrets
 systemctl --user restart engram.timer   # (systemd daemon) pick up the new code
-# then restart Claude Code so it reloads the commands + MCP servers
 ```
 
 Two things to do by hand after an update:
