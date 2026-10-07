@@ -538,6 +538,21 @@ async fn graphiti_compat_leg(
     leg
 }
 
+/// Entity-ish words for the graph lookup: 4+ chars, case-insensitively deduped.
+/// The cap is generous on purpose: at 6, prose prompts spent it on filler words
+/// ("that", "when") and the real entity further in was never looked up. Every
+/// token goes in one UNWIND query, so cost is flat in token count. Mirrors
+/// `memory_recall.graph_facts`.
+fn graph_query_tokens(query: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    query
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
+        .filter(|word| word.len() >= 4 && seen.insert(word.to_lowercase()))
+        .take(32)
+        .map(str::to_string)
+        .collect()
+}
+
 async fn native_leg(
     config: &Config,
     slug: &str,
@@ -560,12 +575,7 @@ async fn native_leg(
             return GraphLeg::empty();
         }
     };
-    let tokens = query
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
-        .filter(|word| word.len() >= 4)
-        .take(6)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let tokens = graph_query_tokens(query);
 
     // Each sub-leg's failure is recorded. These were all `unwrap_or_default()`
     // followed by an unconditional legs["graph"] = "ok", so an auth failure, a
@@ -642,12 +652,7 @@ async fn fast_graph_leg(
     legs: &mut HashMap<String, String>,
 ) -> GraphLeg {
     let mut leg = GraphLeg::empty();
-    let tokens = query
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
-        .filter(|word| word.len() >= 4)
-        .take(6)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let tokens = graph_query_tokens(query);
     if tokens.is_empty() {
         legs.insert("graph".into(), "fast: no usable query tokens".into());
         return leg;
@@ -701,6 +706,19 @@ async fn embed_query(config: &Config, query: &str) -> Result<Vec<f32>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_tokens_reach_an_entity_past_the_filler() {
+        let tokens = graph_query_tokens(
+            "I'm noticing that when i start a chat qdrant recall and neo4j recall isn't working",
+        );
+        assert!(tokens.iter().any(|t| t == "neo4j"), "{tokens:?}");
+        assert_eq!(
+            tokens.iter().filter(|t| *t == "recall").count(),
+            1,
+            "{tokens:?}"
+        );
+    }
 
     use std::sync::{Mutex, MutexGuard, OnceLock};
 

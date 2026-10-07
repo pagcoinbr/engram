@@ -171,9 +171,9 @@ mod tests {
     #[test]
     fn a_supplied_directory_beats_the_process_cwd() {
         let _guard = env_lock();
-        unsafe {
-            std::env::remove_var("CLAUDE_MEMORY_SLUG");
-        }
+        // clear(), not just CLAUDE_MEMORY_SLUG: on a host with engram installed the
+        // real ~/.claude/engram.env pin otherwise outranks the supplied directory.
+        clear();
         let supplied = Path::new("/home/alice/projects/api");
         assert_eq!(
             resolve_slug_in(None, Some(supplied)),

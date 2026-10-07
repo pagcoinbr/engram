@@ -21,7 +21,7 @@ async fn main() {
         .query
         .split_whitespace()
         .filter(|word| word.len() >= 4)
-        .take(6)
+        .take(32)
         .map(str::to_string)
         .collect::<Vec<_>>();
     let result = async {
