@@ -91,12 +91,23 @@ async def recall(query: str, k: int = 8) -> str:
 async def _main():
     args = sys.argv[1:]
     if not args:
-        print('usage: memory_graph_recall.py "<query>" [--k N] [--json]'); return
+        print('usage: memory_graph_recall.py "<query>" [--k N] [--json|--json-full]'); return
     k = int(args[args.index("--k") + 1]) if "--k" in args else 8
     as_json = "--json" in args
+    # --json prints ONLY the records, for the existing callers that expect a bare
+    # array (memory_recall.graph_recall_leg). --json-full prints the whole reply,
+    # including `neighbours` — the 1-hop related memories that --json silently drops
+    # and that therefore never reached the hybrid layer or the Rust compatibility
+    # path at all.
+    as_json_full = "--json-full" in args
     query = " ".join(a for a in args if not a.startswith("--") and a != str(k))
     data = await recall_records(query, k)
-    print(json.dumps(data["records"]) if as_json else _format(query, data))
+    if as_json_full:
+        print(json.dumps(data))
+    elif as_json:
+        print(json.dumps(data["records"]))
+    else:
+        print(_format(query, data))
 
 
 if __name__ == "__main__":

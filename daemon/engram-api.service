@@ -1,0 +1,14 @@
+[Unit]
+Description=Engram Rust API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/engram/daemon.env
+ExecStart=%h/.claude/rust/engram-app --config %h/.claude/engram.yaml --bind 127.0.0.1:8787
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

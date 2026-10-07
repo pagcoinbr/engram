@@ -1,0 +1,387 @@
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+
+const POINT_NAMESPACE: Uuid = Uuid::from_u128(0x6f9b7c2e2a4d5e1f9c3a0a1b2c3d4e5f);
+
+#[derive(Clone)]
+pub struct QdrantClient {
+    base_url: String,
+    collection: String,
+    client: Client,
+}
+
+#[derive(Debug, Error)]
+pub enum VectorError {
+    #[error("request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error(
+        "collection '{collection}' has dimension {actual:?}; expected {expected}. Rebuild the index before changing embedding spaces"
+    )]
+    Dimension {
+        collection: String,
+        expected: u32,
+        actual: Option<u64>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct Hit {
+    pub file: String,
+    pub name: String,
+    pub description: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IndexPoint<'a> {
+    pub file: &'a str,
+    pub name: &'a str,
+    pub description: &'a str,
+    pub memory_type: &'a str,
+    pub slug: &'a str,
+    pub sha: &'a str,
+    /// Which embedding space produced `vector` — see
+    /// `Config::embedding_space_id`. Stored so an operator can see at a glance
+    /// whether a collection holds vectors from more than one model; freshness is
+    /// enforced through `sha`, which the space id is folded into.
+    pub space: &'a str,
+    pub vector: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct ScrollResponse {
+    result: ScrollResult,
+}
+#[derive(Deserialize)]
+struct ScrollResult {
+    points: Vec<ScrollPoint>,
+    next_page_offset: Option<serde_json::Value>,
+}
+#[derive(Deserialize)]
+struct ScrollPoint {
+    payload: Option<Payload>,
+}
+#[derive(Deserialize)]
+struct Response {
+    result: Points,
+}
+#[derive(Deserialize)]
+struct Points {
+    points: Vec<Point>,
+}
+#[derive(Deserialize)]
+struct Point {
+    payload: Option<Payload>,
+    score: Option<f64>,
+}
+#[derive(Deserialize)]
+struct Payload {
+    file: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+}
+
+/// The payload filter for a search: slug and embedding space, either optional.
+/// Extracted so its shape can be asserted without a live Qdrant.
+fn search_filter(slug: Option<&str>, space: Option<&str>) -> serde_json::Value {
+    let mut must = Vec::new();
+    if let Some(slug) = slug {
+        must.push(serde_json::json!({"key": "slug", "match": {"value": slug}}));
+    }
+    if let Some(space) = space {
+        must.push(serde_json::json!({"key": "space", "match": {"value": space}}));
+    }
+    if must.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({"must": must})
+}
+
+impl QdrantClient {
+    pub fn new(base_url: impl Into<String>, collection: impl Into<String>) -> Self {
+        Self::with_credentials(base_url, collection, None, 0)
+    }
+
+    /// Build a client from the active config, so the Qdrant API key and timeout
+    /// are picked up at every call site instead of at none of them.
+    ///
+    /// `vector_store.api_key` is documented and shipped in `engram.yaml.example`
+    /// for Qdrant Cloud; it was not modelled in Rust, so a Cloud deployment got
+    /// unauthenticated requests and a 401 with no explanation.
+    pub fn from_config(config: &engram_config::Config) -> Self {
+        Self::with_credentials(
+            config.vector_store.url.clone(),
+            config.vector_store.collection.clone(),
+            config.vector_store.api_key.present(),
+            config.vector_store.timeout_seconds,
+        )
+    }
+
+    pub fn with_credentials(
+        base_url: impl Into<String>,
+        collection: impl Into<String>,
+        api_key: Option<&str>,
+        timeout_seconds: u64,
+    ) -> Self {
+        // The key is attached as a default header rather than per request: every
+        // method below builds its own request, and one missed call site is an
+        // unauthenticated query.
+        let mut builder = Client::builder();
+        if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(key) {
+                let mut value = value;
+                value.set_sensitive(true);
+                headers.insert("api-key", value);
+            }
+            builder = builder.default_headers(headers);
+        }
+        if timeout_seconds > 0 {
+            builder = builder.timeout(std::time::Duration::from_secs(timeout_seconds));
+        }
+        Self {
+            base_url: base_url.into().trim_end_matches('/').into(),
+            collection: collection.into(),
+            client: builder.build().unwrap_or_else(|_| Client::new()),
+        }
+    }
+    /// `space` is the active [`engram_config::Config::embedding_space_id`].
+    ///
+    /// Filtering on it is not optional hygiene. Indexing is incremental, so during
+    /// a reindex after a same-dimension model change the collection holds points
+    /// from BOTH spaces at once — and vectors from two models are not comparable,
+    /// so scoring a new query against old points produces confident nonsense with
+    /// nothing to indicate it. Writing the space onto the payload without reading
+    /// it back here left exactly that window open. A query returns fewer results
+    /// until the reindex finishes, which is the right failure: incomplete beats
+    /// wrongly ranked.
+    pub async fn search(
+        &self,
+        vector: Vec<f32>,
+        limit: usize,
+        slug: Option<&str>,
+        space: Option<&str>,
+    ) -> Result<Vec<Hit>, VectorError> {
+        let mut body = serde_json::json!({"query": vector, "limit": limit, "with_payload": true});
+        let filter = search_filter(slug, space);
+        if !filter.is_null() {
+            body["filter"] = filter;
+        }
+        let response = self
+            .client
+            .post(format!(
+                "{}/collections/{}/points/query",
+                self.base_url, self.collection
+            ))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Response>()
+            .await?;
+        Ok(response
+            .result
+            .points
+            .into_iter()
+            .filter_map(|point| {
+                let payload = point.payload?;
+                Some(Hit {
+                    file: payload.file?,
+                    name: payload.name.unwrap_or_default(),
+                    description: payload.description.unwrap_or_default(),
+                    score: point.score.unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    pub async fn ensure_collection(
+        &self,
+        dimension: u32,
+        recreate: bool,
+    ) -> Result<(), VectorError> {
+        let url = format!("{}/collections/{}", self.base_url, self.collection);
+        let response = self.client.get(&url).send().await?;
+        if response.status().is_success() && !recreate {
+            let body: serde_json::Value = response.json().await?;
+            let actual = body
+                .pointer("/result/config/params/vectors/size")
+                .and_then(serde_json::Value::as_u64);
+            if actual == Some(dimension.into()) {
+                return Ok(());
+            }
+            return Err(VectorError::Dimension {
+                collection: self.collection.clone(),
+                expected: dimension,
+                actual,
+            });
+        }
+        if response.status().is_success() && recreate {
+            self.client.delete(&url).send().await?.error_for_status()?;
+        }
+        self.client
+            .put(&url)
+            .json(&serde_json::json!({"vectors": {"size": dimension, "distance": "Cosine"}}))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn upsert(&self, point: IndexPoint<'_>) -> Result<(), VectorError> {
+        let id = Uuid::new_v5(
+            &POINT_NAMESPACE,
+            format!("{}::{}", point.slug, point.file).as_bytes(),
+        );
+        self.client
+            .put(format!(
+                "{}/collections/{}/points",
+                self.base_url, self.collection
+            ))
+            .json(&serde_json::json!({"points": [{
+                "id": id.to_string(),
+                "vector": point.vector,
+                "payload": {
+                    "file": point.file,
+                    "name": point.name,
+                    "description": point.description,
+                    "type": point.memory_type,
+                    "slug": point.slug,
+                    "sha": point.sha,
+                    "space": point.space,
+                }
+            }]}))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn delete(&self, slug: &str, file: &str) -> Result<(), VectorError> {
+        let id = Uuid::new_v5(&POINT_NAMESPACE, format!("{slug}::{file}").as_bytes());
+        self.client
+            .post(format!(
+                "{}/collections/{}/points/delete",
+                self.base_url, self.collection
+            ))
+            .json(&serde_json::json!({"points": [id.to_string()]}))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn is_current(&self, slug: &str, file: &str, sha: &str) -> Result<bool, VectorError> {
+        let id = Uuid::new_v5(&POINT_NAMESPACE, format!("{slug}::{file}").as_bytes());
+        let response = self
+            .client
+            .get(format!(
+                "{}/collections/{}/points/{}",
+                self.base_url, self.collection, id
+            ))
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let body: serde_json::Value = response.error_for_status()?.json().await?;
+        Ok(body
+            .pointer("/result/payload/sha")
+            .and_then(serde_json::Value::as_str)
+            == Some(sha))
+    }
+
+    pub async fn files(&self, slug: &str) -> Result<Vec<String>, VectorError> {
+        let mut files = Vec::new();
+        let mut offset = None;
+        loop {
+            let mut body = serde_json::json!({"limit": 256, "with_payload": true, "with_vector": false, "filter": {"must": [{"key": "slug", "match": {"value": slug}}]}});
+            if let Some(value) = offset {
+                body["offset"] = value;
+            }
+            let response = self
+                .client
+                .post(format!(
+                    "{}/collections/{}/points/scroll",
+                    self.base_url, self.collection
+                ))
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<ScrollResponse>()
+                .await?;
+            files.extend(
+                response
+                    .result
+                    .points
+                    .into_iter()
+                    .filter_map(|point| point.payload.and_then(|payload| payload.file)),
+            );
+            let next = response.result.next_page_offset;
+            if next.is_none() {
+                return Ok(files);
+            }
+            offset = next;
+        }
+    }
+
+    pub async fn count(&self, slug: Option<&str>) -> Result<u64, VectorError> {
+        let mut body = serde_json::json!({"exact": true});
+        if let Some(slug) = slug {
+            body["filter"] =
+                serde_json::json!({"must": [{"key": "slug", "match": {"value": slug}}]});
+        }
+        let response: serde_json::Value = self
+            .client
+            .post(format!(
+                "{}/collections/{}/points/count",
+                self.base_url, self.collection
+            ))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(response
+            .pointer("/result/count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The search filter must pin the embedding space, not just the slug.
+    ///
+    /// Indexing is incremental, so a same-dimension model change leaves points
+    /// from two spaces in one collection, and vectors from different models are
+    /// not comparable — scoring a new query against old points produces
+    /// confident nonsense. The `space` payload was being written and never read
+    /// back, which left exactly that window open.
+    #[test]
+    fn the_search_filter_pins_the_embedding_space() {
+        let body = search_filter(Some("-home-alice"), Some("b941b4f74fc6de19"));
+        let must = body["must"].as_array().expect("a must clause");
+        let keys = must
+            .iter()
+            .filter_map(|clause| clause["key"].as_str())
+            .collect::<Vec<_>>();
+        assert!(keys.contains(&"space"), "space is not filtered: {body}");
+        assert!(keys.contains(&"slug"), "slug is not filtered: {body}");
+
+        // Either may be absent on its own, and with neither there is no filter.
+        assert_eq!(
+            search_filter(None, Some("s"))["must"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(search_filter(None, None).is_null());
+    }
+}

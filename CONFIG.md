@@ -101,6 +101,64 @@ is the 2-way (vector+keyword) variant for no-graph installs. Each ranker degrade
 independently. The installer adds `qdrant-client` to the graph venv on `--vector` so
 the warm graph server can query Qdrant in-process.
 
+## Rust graph backend
+
+The Rust recall service has two graph backends:
+
+```yaml
+graph:
+  backend: graphiti_compat       # graphiti_compat | native
+```
+
+`graphiti_compat` is the production-safe migration choice, **and the default when
+the `graph:` block is absent** — which is the case for almost every install
+upgraded in place, since the installer never adds one. It calls the installed,
+pinned Graphiti recall path and returns its ordered results untouched.
+
+Note what that means concretely: in compatibility mode the outer **keyword and
+vector legs are disabled and there is no RRF**. The whole point is that
+compatibility mode cannot change Graphiti's ranking, so it is *compatibility*, not
+hybrid fusion — the `legs` map in a recall response says so explicitly
+(`"disabled: graphiti_compat preserves Graphiti ordering"`). It fails closed if the
+Graphiti path is unavailable, and the child process is bounded by
+`recall.timeout_ms`.
+
+`native` uses Rust's typed-triple and embedding index together with the usual
+hybrid RRF; use it for shadow evaluation until its recall evaluation reaches
+parity. Native node identity includes the memory store slug, so switching to it
+requires a graph rebuild, and the legacy-edge cache needs
+`engram-native-graph-sync --import-legacy-embeddings` to be re-run.
+
+The native writer needs **both** an OpenAI-compatible embedding endpoint
+(`embed.url`, or `llama_cpp.url` as a fallback) and an OpenAI-compatible
+generation endpoint for fact extraction (`llama_cpp.url`). Note that this is
+`llama_cpp.url` specifically, *not* `backend` — `backend` selects the Python
+pipeline's generation backend, so `backend: ollama` with an OpenAI-compatible
+`llama_cpp.url` alongside it is a perfectly serviceable native setup.
+
+With `graph.backend: native` and either endpoint missing, the daemon's graph job
+**skips and says so** each run rather than falling back to the Python Graphiti
+writer: writing the index nothing is reading looks exactly like memories that
+saved and then vanished. The config still loads, so recall against an
+already-populated native index keeps working. Choose `graphiti_compat` to use the
+Python writer.
+
+Endpoint URLs must not embed credentials — `https://user:pass@host/v1` is
+rejected. Those URLs are published by `/api/v1/status` and the model editor, which
+would route the password around the redaction that `api_key` gets.
+
+`ENGRAM_GRAPH_BACKEND` temporarily overrides this setting for a process, and is
+honoured by the **reader and the writer alike** — a daemon that wrote to one index
+while recall read the other produced a split brain that looked like missing
+memories. The daemon uses the matching writer, export, and reconciliation jobs for
+whichever backend is selected, so new memories remain visible to the recall path in
+use.
+
+The prompt hook is separate: it always runs in fast mode (local BM25 + vector + one
+graph fact query, never the Graphiti child) under the much shorter
+`recall.inject.timeout_ms` budget, because a prompt that waits is worse than a
+prompt without recall.
+
 ```yaml
 recall:
   scope_to_slug: true            # restrict vector/hybrid recall to the current store's slug

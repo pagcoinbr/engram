@@ -51,5 +51,37 @@ def test_real_tasks_defer_when_deps_down():
     print("ok — graph/vector/export/reconcile/harvest all defer explicitly")
 
 
+def test_graphiti_compat_uses_legacy_jobs():
+    """The selected reader and writer must address the same Graphiti index.
+
+    Parameterised over whether the `engram-graph-sync` wrapper is installed,
+    because it is only a wrapper: it resolves ENGRAM_CONFIG/ENGRAM_GRAPH and hands
+    them to graph_sync.py, so both routes drive the same Graphiti writer. An
+    earlier version asserted that `graph_sync.py` appeared in the command, which
+    made the result depend on which binaries happened to be installed on the host
+    running the tests — it passed until a real install added the wrapper.
+    """
+    import shutil
+    for wrapper in (None, "/opt/engram/rust/engram-graph-sync"):
+        d = tempfile.mkdtemp()
+        m = _load(Path(d) / "s.json", {})
+        m.cfg = lambda: {"graph": {"backend": "graphiti_compat"}}
+        m._neo4j_up = lambda: True
+        m._rust = lambda name, _w=wrapper: _w if name == "engram-graph-sync" else None
+        seen = []
+        m._run = lambda command, **_: seen.append(command) or 0
+        m.task_graph(); m.task_export(); m.task_reconcile()
+        assert len(seen) == 3, f"wrapper={wrapper}: expected three jobs, got {seen}"
+        for command in seen:
+            target = " ".join(str(c) for c in command)
+            assert ("graph_sync.py" in target) or ("engram-graph-sync" in target), \
+                f"wrapper={wrapper}: not the Graphiti path: {command}"
+            # The native writer must never run while Graphiti is the reader.
+            assert "native-graph-sync" not in target, \
+                f"wrapper={wrapper}: native writer under a Graphiti reader: {command}"
+        shutil.rmtree(d)
+    print("ok — graphiti compatibility keeps the legacy writer/export/reconcile path")
+
+
 if __name__ == "__main__":
-    test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down()
+    test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down(); test_graphiti_compat_uses_legacy_jobs()

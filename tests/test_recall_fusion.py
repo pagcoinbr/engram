@@ -88,6 +88,94 @@ def test_neo4j_transport(mr):
     print("ok — neo4j transport (loopback http, remote https-only, no silent downgrade)")
 
 
+def _stub_post(mr, reply):
+    """Swap mr._post for a recorder. `reply` is a value to return or an exception
+    to raise. Returns (calls, restore)."""
+    calls = []
+
+    def post(url, body, headers=None, timeout=5.0):
+        calls.append((url, body, headers, timeout))
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+    old = mr._post
+    mr._post = post
+    return calls, lambda: setattr(mr, "_post", old)
+
+
+def test_embedding_provider(mr):
+    calls, restore = _stub_post(mr, {"data": [{"embedding": [0.1, 0.2]}]})
+    try:
+        got = mr.embed("hello", {"embed": {"provider": "llama_cpp",
+                                              "url": "http://bge.example/v1",
+                                              "model": "bge-m3"}})
+    finally:
+        restore()
+    assert got == [0.1, 0.2], got
+    assert calls == [("http://bge.example/v1/embeddings",
+                      {"model": "bge-m3", "input": "hello"}, {}, 5.0)], calls
+    print("ok — fast recall honors the configured llama.cpp embedding endpoint")
+
+
+def test_embedding_auth_and_timeout(mr):
+    """An authenticated endpoint must get the bearer token, and the caller's budget
+    must reach the socket — recall runs on every prompt, so an unbounded embed call
+    is a hung prompt."""
+    calls, restore = _stub_post(mr, {"data": [{"embedding": [1.0]}]})
+    try:
+        mr.embed("q", {"embed": {"provider": "openai", "url": "https://api.example/v1",
+                                 "model": "m", "api_key": "sk-test"}}, timeout=0.25)
+    finally:
+        restore()
+    url, body, headers, timeout = calls[0]
+    assert headers == {"Authorization": "Bearer sk-test"}, headers
+    assert timeout == 0.25, timeout
+    assert url == "https://api.example/v1/embeddings", url
+    print("ok — embed sends the configured api_key and honors the caller's timeout")
+
+
+def test_embedding_prefixes(mr):
+    """Asymmetric models (bge/e5/nomic) index documents and queries in different
+    sub-spaces. Applying the wrong prefix — or none — silently degrades recall, so
+    kind= must pick the configured one."""
+    cfg = {"embed": {"provider": "llama_cpp", "url": "http://e/v1", "model": "m",
+                     "query_prefix": "query: ", "document_prefix": "passage: "}}
+    for kind, want in (("query", "query: hello"), ("document", "passage: hello")):
+        calls, restore = _stub_post(mr, {"data": [{"embedding": [1.0]}]})
+        try:
+            mr.embed("hello", cfg, kind=kind)
+        finally:
+            restore()
+        assert calls[0][1]["input"] == want, (kind, calls[0][1])
+    print("ok — embed applies the configured query/document prefixes")
+
+
+def test_embedding_failure_propagates(mr):
+    """embed() must RAISE, never substitute a vector from another model. The vector
+    leg decides what a dead endpoint means; silently returning a 768-dim fastembed
+    vector into a 1024-dim index is how an index gets poisoned with no error."""
+    _, restore = _stub_post(mr, OSError("connection refused"))
+    try:
+        try:
+            mr.embed("hello", {"embed": {"provider": "llama_cpp", "url": "http://dead/v1"}})
+        except OSError:
+            pass
+        else:
+            raise AssertionError("embed() swallowed a dead endpoint")
+    finally:
+        restore()
+    # and the leg above it degrades instead of crashing the prompt
+    _, restore = _stub_post(mr, OSError("connection refused"))
+    try:
+        assert mr.vector_leg("hello", 3, cfg={"vector_store": {"enabled": True},
+                                              "embed": {"provider": "llama_cpp",
+                                                        "url": "http://dead/v1"}}) == []
+    finally:
+        restore()
+    print("ok — embed raises on failure; vector_leg degrades to empty")
+
+
 def test_graph_facts_reaches_late_entity(mr):
     """A prose prompt leads with filler words; the entity further in must still be
     looked up. With a 6-token cap this prompt never sent "neo4j" and got 0 facts."""
@@ -168,6 +256,10 @@ def main():
 
         test_fusion(mr)
         test_neo4j_transport(mr)
+        test_embedding_provider(mr)
+        test_embedding_auth_and_timeout(mr)
+        test_embedding_prefixes(mr)
+        test_embedding_failure_propagates(mr)
         test_graph_facts_reaches_late_entity(mr)
         test_slug_resolution(mr, d, slug)
         os.environ["CLAUDE_MEMORY_SLUG"] = slug

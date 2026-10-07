@@ -33,3 +33,6 @@ logs/
 # Node (if a real Vite build is added later)
 node_modules/
 ui/dist/
+
+# Rust build output
+target/

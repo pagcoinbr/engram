@@ -141,6 +141,62 @@ mkdir -p "$CLAUDE/hooks"; install -m 0755 "$REPO"/bin/hooks/*.py "$CLAUDE/hooks/
 rm -rf "$CLAUDE/ui" "$CLAUDE/engram-ui.sh" 2>/dev/null || true
 say "engine installed into $CLAUDE (console: run $CLAUDE/engram-tui.py)"
 
+# Keep a copy of engram-app that a systemd unit runs, but that this installer does
+# not own, in step with the one it just built.
+#
+# On an SELinux-enforcing host, systemd cannot exec out of /root/.claude
+# (admin_home_t is not an entrypoint), so those deployments run the API from a
+# bin_t path such as /usr/local/bin and the unit's ExecStart points there. This
+# script only ever wrote $CLAUDE/rust, so every install produced a new binary that
+# the service never ran: `systemctl restart` succeeded, the API kept serving the
+# old code, and nothing said so. That is the worst shape for this failure — the
+# deploy looks clean.
+#
+# Only refresh a path that ALREADY exists. Creating one would quietly add a
+# system-wide install on hosts that never asked for it.
+sync_service_binaries(){
+  local unit path updated=0
+  for unit in /etc/systemd/system/engram-*.service "$HOME/.config/systemd/user"/engram-*.service; do
+    [[ -f "$unit" ]] || continue
+    while read -r path; do
+      [[ -n "$path" ]] || continue
+      # Already the installer-managed copy, or not ours to touch.
+      [[ "$path" == "$CLAUDE/rust/engram-app" ]] && continue
+      [[ -f "$path" ]] || continue
+      install -m 0755 "$REPO/target/release/engram-app" "$path" || continue
+      command -v restorecon >/dev/null && restorecon "$path" 2>/dev/null
+      say "refreshed $path (run by $(basename "$unit"))"
+      updated=1
+    done < <(grep -hoE '^ExecStart=[^ ]*/engram-app' "$unit" 2>/dev/null | sed 's/^ExecStart=//')
+  done
+  [[ "$updated" == 1 ]] && say "restart the API to pick it up: systemctl restart engram-api"
+  return 0
+}
+
+# Build the Rust API and command-line migration tools when Cargo is available.
+# Python services remain installed during the staged cutover, so a missing Rust
+# toolchain never turns an update into an outage.
+if command -v cargo >/dev/null; then
+  say "building Rust API and recall tools"
+  if (cd "$REPO" && cargo build --release -q -p engram-app --bins); then
+    mkdir -p "$CLAUDE/rust"
+    for rust_bin in engram-app engram-graph-sync engram-graph-recall-eval engram-index engram-lifecycle engram-mcp engram-native-graph-sync engram-recall engram-recall-hook; do
+      [[ -x "$REPO/target/release/$rust_bin" ]] && install -m 0755 "$REPO/target/release/$rust_bin" "$CLAUDE/rust/$rust_bin"
+    done
+    # engram-graph-compat was removed: the bounded Graphiti spawn now lives inside
+    # engram-hybrid, so there is one compatibility implementation, not two. Drop a
+    # copy left behind by an earlier install.
+    rm -f "$CLAUDE/rust/engram-graph-compat"
+    install -m 0644 "$REPO/tests/graph_recall_eval.json" "$CLAUDE/rust/graph_recall_eval.json"
+    say "Rust executables installed into $CLAUDE/rust"
+    sync_service_binaries
+  else
+    warn "Rust build failed — retaining the installed Python services"
+  fi
+else
+  warn "cargo not found — Rust API not installed; install Rust and re-run this installer"
+fi
+
 # ---- engram.yaml ----
 if [[ -f "$CLAUDE/engram.yaml" ]]; then
   say "engram.yaml exists — preserving it (edit by hand to change backend/tier)"
@@ -154,6 +210,14 @@ if [[ -f "$CLAUDE/engram.yaml" ]]; then
   if [[ -n "$NEWKEYS" ]]; then
     warn "new config keys available since your engram.yaml was written:${NEWKEYS}"
     warn "  -> compare $REPO/engram.yaml.example and add the blocks you want (e.g. auto_curate, telegram)."
+  fi
+  # A missing `graph:` block means the graph backend comes from code defaults, and
+  # that default decides which INDEX recall reads. It is graphiti_compat on both
+  # sides (Rust and the daemon) precisely so an upgrade keeps using the Graphiti
+  # index it already populated, but say so rather than leaving it implicit.
+  if ! grep -qE '^graph:' "$CLAUDE/engram.yaml"; then
+    say "no 'graph:' block in engram.yaml — staying on graphiti_compat (your existing index)"
+    say "  -> to try the native graph, add:  graph:\\n  backend: native"
   fi
 else
   sed -e "s|^backend: .*|backend: $BACKEND|" \
@@ -214,7 +278,7 @@ if [[ "$WANT_GRAPH" == yes ]]; then
   if [[ ! -x "$VENV/bin/python" ]]; then
     say "building graph venv (graphiti-core, neo4j, fastembed)... this can take a few minutes"
     if python3 -m venv "$VENV" && "$VENV/bin/pip" install -q --upgrade pip && \
-       "$VENV/bin/pip" install -q "mcp[cli]" graphiti-core neo4j fastembed pyyaml; then
+       "$VENV/bin/pip" install -q "mcp[cli]" "graphiti-core==0.29.2" neo4j fastembed pyyaml; then
       say "graph venv ready"
     else
       warn "graph venv build failed — install graphiti-core/neo4j/fastembed manually into $VENV"
@@ -229,14 +293,35 @@ if [[ "$WANT_GRAPH" == yes ]]; then
       && say "added mcp to graph venv (engram-graph could not start without it)" \
       || warn "could not install mcp into graph venv — engram-graph will not start"
   fi
+  if [[ -x "$VENV/bin/python" ]] && ! "$VENV/bin/python" -c "import importlib.metadata as m; assert m.version('graphiti-core') == '0.29.2'" 2>/dev/null; then
+    "$VENV/bin/pip" install -q "graphiti-core==0.29.2" \
+      && say "pinned graphiti-core to 0.29.2 for recall compatibility" \
+      || warn "could not pin graphiti-core — graphiti_compat recall may differ from the tested version"
+  fi
   if command -v claude >/dev/null && [[ -x "$VENV/bin/python" ]]; then
     if ! claude mcp list 2>/dev/null | grep -q engram-graph; then
-      claude mcp add --scope user engram-graph "$VENV/bin/python" "$CLAUDE/graph/mg_mcp_server.py" \
+      claude mcp add --scope user engram-graph \
+        -e "ENGRAM_BIN=$CLAUDE" -e "ENGRAM_CONFIG=$CLAUDE/engram.yaml" -e "ENGRAM_GRAPH=$CLAUDE/graph" \
+        -- "$VENV/bin/python" "$CLAUDE/graph/mg_mcp_server.py" \
         && say "registered engram-graph MCP server" || warn "claude mcp add failed (register manually later)"
     else say "engram-graph MCP already registered"; fi
   else warn "claude CLI or graph venv missing — skipping MCP registration (run 'claude mcp add' later)"; fi
   hermes_register engram-graph "$VENV/bin/python" "$CLAUDE/graph/mg_mcp_server.py"
   say "start Neo4j: cd $CLAUDE/graph && NEO4J_PASSWORD=\$(grep -oP 'NEO4J_PASSWORD=\\K.*' .env) docker compose up -d"
+fi
+
+# Register Rust hybrid recall while retaining the graph server's admin tools.
+# The INSTALLATION paths are pinned into the entry (this install's config and graph
+# dir, which the server cannot otherwise know); the memory slug deliberately is NOT,
+# because it is per-project and the server resolves it from the session's directory.
+if command -v claude >/dev/null && [[ -x "$CLAUDE/rust/engram-mcp" ]]; then
+  if ! claude mcp list 2>/dev/null | grep -q '^engram-rust'; then
+    claude mcp add --scope user engram-rust \
+      -e "ENGRAM_BIN=$CLAUDE" -e "ENGRAM_CONFIG=$CLAUDE/engram.yaml" -e "ENGRAM_GRAPH=$CLAUDE/graph" \
+      -- "$CLAUDE/rust/engram-mcp" \
+      && say "registered Rust hybrid recall MCP server" \
+      || warn "could not register engram-rust MCP server"
+  else say "engram-rust MCP already registered"; fi
 fi
 
 # ---- vector venv + MCP (optional Qdrant index) ----
@@ -287,13 +372,42 @@ if command -v jq >/dev/null; then
   merge_hook(){ jq --arg e "$1" --arg c "$2" '.hooks //= {} | .hooks[$e] //= [] |
       if ([.hooks[$e][]?|.hooks[]?|.command]|index($c))==null then .hooks[$e] += [{"hooks":[{"type":"command","command":$c}]}] else . end' \
       "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"; }
+  # replace_hook EVENT WANTED OBSOLETE...: add WANTED and remove the named
+  # alternatives in ONE atomic rewrite.
+  #
+  # merge_hook only ever appends. An install that registered the Python recall hook
+  # and later gained the Rust binary ended up running BOTH, each with its own
+  # dedup state — duplicate work and duplicate injection on every prompt.
+  replace_hook(){
+    local event="$1" wanted="$2"; shift 2
+    local drop; drop="$(printf '%s\n' "$@" | jq -R . | jq -s .)"
+    jq --arg e "$event" --arg c "$wanted" --argjson drop "$drop" '
+      .hooks //= {} | .hooks[$e] //= []
+      # drop the obsolete commands wherever they sit in the nested shape
+      | .hooks[$e] = [ .hooks[$e][]
+          | if type == "object" and has("hooks")
+            then .hooks = [ .hooks[] | select(.command as $cmd | ($drop | index($cmd)) == null) ]
+            else . end
+          | select((type == "object" and has("hooks") and (.hooks | length) == 0) | not) ]
+      | if ([.hooks[$e][]?|.hooks[]?|.command]|index($c))==null
+        then .hooks[$e] += [{"hooks":[{"type":"command","command":$c}]}] else . end' \
+      "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+  }
   merge_hook SessionStart "$CLAUDE/memory_curate_check.sh"
   merge_hook SessionStart "$CLAUDE/codex-availability-warn.sh"
   merge_hook Stop "$CLAUDE/memory_agent.sh"
   merge_hook Stop "$CLAUDE/memory_session_curate.sh"
   # auto-recall: inject the memories relevant to each prompt (deduped per session).
   # Turn off with `recall.inject.enabled: false` in engram.yaml — no need to unmerge.
-  merge_hook UserPromptSubmit "$CLAUDE/hooks/memory-recall-inject.py"
+  # Exactly ONE recall hook must be registered. Whichever implementation is
+  # chosen, the other is removed in the same rewrite.
+  if [[ -x "$CLAUDE/rust/engram-recall-hook" ]]; then
+    replace_hook UserPromptSubmit "$CLAUDE/rust/engram-recall-hook" \
+      "$CLAUDE/hooks/memory-recall-inject.py"
+  else
+    replace_hook UserPromptSubmit "$CLAUDE/hooks/memory-recall-inject.py" \
+      "$CLAUDE/rust/engram-recall-hook"
+  fi
   say "hooks merged into settings.json"
 fi
 
@@ -313,7 +427,10 @@ case "$DAEMON" in
     # PRESERVE operator secrets across re-installs (do NOT clobber them): the ccg key
     # and the Telegram approval-gate token/chat id live here and must survive.
     PRESERVED="$(grep -E '^(ENGRAM_CCG_KEY|ANTHROPIC_BASE_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)=' "$DAEMON_ENV" 2>/dev/null || true)"
-    { echo "ENGRAM_BIN=$CLAUDE"; echo "ENGRAM_GRAPH=$CLAUDE/graph"; echo "ENGRAM_CONFIG=$CLAUDE/engram.yaml"; echo "ENGRAM_LOG_DIR=$CLAUDE/logs";
+    # CLAUDE_MEMORY_SLUG must be here too: without it the daemon re-derives the
+    # slug from $HOME and ignores an operator pin, so scheduled jobs index a
+    # different store than the one interactive recall searches.
+    { echo "ENGRAM_BIN=$CLAUDE"; echo "ENGRAM_GRAPH=$CLAUDE/graph"; echo "ENGRAM_CONFIG=$CLAUDE/engram.yaml"; echo "ENGRAM_LOG_DIR=$CLAUDE/logs"; echo "CLAUDE_MEMORY_SLUG=$SLUG";
       [[ -x "$CLAUDE/graph/venv/bin/python" ]] && echo "ENGRAM_GRAPH_PYTHON=$CLAUDE/graph/venv/bin/python";
       [[ -x "$CLAUDE/vector/venv/bin/python" ]] && echo "ENGRAM_VECTOR_PYTHON=$CLAUDE/vector/venv/bin/python"; } > "$DAEMON_ENV"
     if [[ -n "$PRESERVED" ]]; then
@@ -336,6 +453,7 @@ DENV
     fi
     chmod 600 "$DAEMON_ENV"
     sed "s|^ExecStart=.*|ExecStart=$(command -v python3) $CLAUDE/engram-daemon.py --once|" "$REPO/daemon/engram.service" > "$HOME/.config/systemd/user/engram.service"
+    sed "s|%h/.claude|$CLAUDE|g" "$REPO/daemon/engram-api.service" > "$HOME/.config/systemd/user/engram-api.service"
     cp "$REPO/daemon/engram.timer" "$HOME/.config/systemd/user/engram.timer"
     # Optional nightly Codex-gated curate+fixate APPLY (headless Claude). ExecStart is
     # templated to the real $CLAUDE path (honours ENGRAM_CLAUDE_HOME). Enabled (NOT
@@ -351,6 +469,11 @@ DENV
     fi
     if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable --now engram.timer 2>/dev/null; then
       say "systemd timer enabled (engram.timer); 'sudo loginctl enable-linger $USER' to run when logged out"
+      if [[ -x "$CLAUDE/rust/engram-app" ]]; then
+        systemctl --user enable --now engram-api.service 2>/dev/null \
+          && say "Rust API enabled on 127.0.0.1:8787" \
+          || warn "could not enable engram-api.service"
+      fi
       if [[ "${MEMORY_NIGHTLY_APPLY:-0}" == "1" ]]; then
         # enable --now is safe here: the timer is Persistent=false with a future
         # OnCalendar, so --now starts it ticking toward the next 03:37 and never

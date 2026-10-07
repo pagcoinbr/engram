@@ -252,12 +252,48 @@ memory_guard_secret_content() {
 # no-ops itself if disabled/unreachable. Backgrounded with output discarded so a
 # slow or down Qdrant never delays (or fails) a save/delete. Mirrors the local-first
 # posture of the optional GitHub push above.
+# Is the configured embedding provider one the Rust indexer implements?
+#
+# engram-index speaks exactly one transport: an OpenAI-compatible /v1/embeddings
+# endpoint. Ollama, FastEmbed and the auto-selected default are all supported
+# engram configurations that only the Python indexer can serve — but the Rust
+# binary used to be preferred whenever it merely existed, so those installs had
+# their save-time indexing handed to a binary that could not do it. Mirrors
+# Config::rust_embedding_supported and the daemon's check.
+memory_rust_index_supported() {
+    local cfgf="${ENGRAM_CONFIG:-$(memory_engram_home)/engram.yaml}"
+    [[ -f "$cfgf" ]] || return 1
+    local provider url backend
+    provider="$(sed -n '/^embed:/,/^[a-z_]/{s/^[[:space:]]*provider:[[:space:]]*["'\'']\?\([a-z_]*\).*/\1/p}' "$cfgf" | head -1)"
+    url="$(sed -n '/^embed:/,/^[a-z_]/{s/^[[:space:]]*url:[[:space:]]*["'\'']\?\([^"'\''[:space:]]*\).*/\1/p}' "$cfgf" | head -1)"
+    [[ -z "$url" ]] && url="$(sed -n '/^llama_cpp:/,/^[a-z_]/{s/^[[:space:]]*url:[[:space:]]*["'\'']\?\([^"'\''[:space:]]*\).*/\1/p}' "$cfgf" | head -1)"
+    if [[ -z "$provider" ]]; then
+        backend="$(sed -n 's/^backend:[[:space:]]*["'\'']\?\([a-z_]*\).*/\1/p' "$cfgf" | head -1)"
+        [[ "$backend" == ollama ]] && provider=ollama || provider=fastembed
+    fi
+    [[ "$provider" == openai ]] && provider=llama_cpp
+    [[ "$provider" == llama_cpp && -n "$url" ]]
+}
+
+memory_engram_home() { printf '%s' "${ENGRAM_BIN:-${HOME}/.claude}"; }
+
 memory_vector_sync() {
-    local script="${HOME}/.claude/vector/vector_sync.py"
+    local home; home="$(memory_engram_home)"
+    local rust="$home/rust/engram-index"
+    if [[ -x "$rust" ]] && memory_rust_index_supported; then
+        local -a rust_args=()
+        local arg
+        for arg in "$@"; do [[ "$arg" != "--insert" ]] && rust_args+=("$arg"); done
+        ( "$rust" --config "${ENGRAM_CONFIG:-$home/engram.yaml}" --slug "$(memory_slug)" "${rust_args[@]}" >/dev/null 2>&1 & ) 2>/dev/null || true
+        return 0
+    fi
+    # Both branches now resolve through ENGRAM_BIN; the Python one hardcoded
+    # $HOME/.claude and so missed an ENGRAM_CLAUDE_HOME install entirely.
+    local script="$home/vector/vector_sync.py"
     [[ -f "$script" ]] || return 0
     # Prefer the vector venv (has qdrant-client) > env override > graph venv > python3.
     local py="${ENGRAM_VECTOR_PYTHON:-}"
-    [[ -z "$py" && -x "${HOME}/.claude/vector/venv/bin/python" ]] && py="${HOME}/.claude/vector/venv/bin/python"
+    [[ -z "$py" && -x "$home/vector/venv/bin/python" ]] && py="$home/vector/venv/bin/python"
     [[ -z "$py" ]] && py="${ENGRAM_GRAPH_PYTHON:-python3}"
     command -v "$py" >/dev/null 2>&1 || [[ -x "$py" ]] || py="python3"
     ( "$py" "$script" "$@" >/dev/null 2>&1 & ) 2>/dev/null || true

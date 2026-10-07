@@ -26,6 +26,7 @@ sys.path.insert(0, str(HERE.parent / "bin"))
 if str(Path.home() / ".claude") not in sys.path:
     sys.path.append(str(Path.home() / ".claude"))
 import engram_llm
+import engram_secrets
 import memory_ai
 import vector_config as vc
 
@@ -77,13 +78,25 @@ class EngramVectorStore:
     def upsert(self, *, filename: str, name: str, description: str,
                mtype: str = "", sha: str = "", body: str = "", vector=None) -> None:
         from qdrant_client import models as qm
+        # Redact before anything leaves the box. The embedding endpoint may be
+        # remote and imported or hand-edited memories never passed the save-time
+        # guard, so all three fields are scrubbed — a secret in frontmatter is
+        # just as exposed as one in the body, and the description is stored in
+        # the payload as well as embedded.
+        name, _ = engram_secrets.redact(name)
+        description, _ = engram_secrets.redact(description)
+        body, _ = engram_secrets.redact(body)
         if vector is None:
             # Embed name + description + a slice of the BODY. Title-only embedding
             # (the old behaviour) made "dense semantic search" effectively a title
             # match; including the body is the single biggest recall-quality lever.
-            vector = engram_llm.embed(f"{name} {description} {body[:1500]}".strip(), self.cfg)
+            # kind="document" applies embed.document_prefix, which asymmetric
+            # models need on this side and this side only.
+            vector = engram_llm.embed(f"{name} {description} {body[:1500]}".strip(),
+                                      self.cfg, kind="document")
         payload = {"file": filename, "name": name, "description": description,
-                   "type": mtype, "slug": slug(), "sha": sha}
+                   "type": mtype, "slug": slug(), "sha": sha,
+                   "space": engram_llm.embedding_space_id(self.cfg)}
         self.client.upsert(
             collection_name=self.collection,
             points=[qm.PointStruct(id=self.point_id(filename), vector=vector, payload=payload)],
@@ -101,10 +114,20 @@ class EngramVectorStore:
                filters: dict | None = None) -> list[dict]:
         """Semantic search. `filters` accepts {"type": str|list, "slug": str} and is
         translated to a Qdrant payload filter (None = unfiltered)."""
-        qv = engram_llm.embed(query, self.cfg)
+        # kind="query" applies embed.query_prefix; indexing uses the document
+        # prefix. Applying neither put documents and queries in different spaces.
+        qv = engram_llm.embed(query, self.cfg, kind="query")
+        # Scope to the ACTIVE embedding space, always. Indexing is incremental, so
+        # after a same-dimension model change the collection holds points from two
+        # spaces at once, and vectors from different models are not comparable —
+        # scoring a new query against old points yields confident nonsense with
+        # nothing to signal it. Recall returns less until the reindex finishes,
+        # which is the right trade: incomplete beats wrongly ranked.
+        scoped = dict(filters or {})
+        scoped["space"] = engram_llm.embedding_space_id(self.cfg)
         res = self.client.query_points(
             collection_name=self.collection, query=qv, limit=k,
-            query_filter=self._build_filter(filters),
+            query_filter=self._build_filter(scoped),
             score_threshold=(threshold or None), with_payload=True).points
         return [self._hit(p) for p in res]
 
@@ -114,7 +137,13 @@ class EngramVectorStore:
         For each indexed point, ask Qdrant for its nearest neighbours and keep
         pairs scoring >= threshold (deduped, sorted high->low). Scoped to the
         current slug by default so a shared collection doesn't cross stores."""
-        qfilter = self._build_filter({"slug": slug()}) if scope_slug else None
+        # Space-scoped as well as slug-scoped: a cosine between vectors from two
+        # different models is not a similarity, so a mid-reindex collection would
+        # otherwise produce duplicate "pairs" that are artefacts of the model
+        # change rather than of the memories.
+        space = engram_llm.embedding_space_id(self.cfg)
+        qfilter = self._build_filter(
+            {"slug": slug(), "space": space} if scope_slug else {"space": space})
         seen = set()
         pairs = []
         for pt in self._scroll_all(with_vectors=True):

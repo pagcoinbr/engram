@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 Environment=ENGRAM_UI_HOST=127.0.0.1
 Environment=ENGRAM_UI_PORT=8765
+Environment=ENGRAM_RUST_API=http://127.0.0.1:8787
 Environment=ENGRAM_BIN=/root/.claude
 Environment=ENGRAM_GRAPH=/root/.claude/graph
 Environment=ENGRAM_VECTOR=/root/.claude/vector

@@ -45,22 +45,23 @@ def looks_secret(line: str) -> bool:
     return bool(SECRET_RE.search(line or ""))
 
 
+def _corpus():
+    """The shared corpus, also used by the engram-secrets Rust crate. One file, two
+    implementations — that is what keeps the Python and Rust detectors in lockstep
+    instead of each growing its own idea of what a credential looks like."""
+    import json
+    from pathlib import Path
+    p = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "secret_samples.json"
+    d = json.loads(p.read_text())
+    return d["secret"], d["clean"]
+
+
 if __name__ == "__main__":  # tiny self-check
-    samples_secret = [
-        "mnemonic: abandon abandon abandon abandon abandon ability",
-        "macaroon=0201036c6e6402eb01030a10",
-        "private_key=Kx1234567890abcdef",
-        "L1aW4aubDFB7yfras2S1mN3bqg9nwySY8nkoLmJebSLD5BWv3ENZ",  # WIF-shaped
-        "api_key=sk-proj-abcdefghijklmnopqrstuvwxyz1234",
-    ]
-    samples_clean = [
-        "the LND admin.macaroon path is ~/.lnd/...; used by lncli",
-        "deploy on port 9000 at /home/x/y.py",
-        "seed the database with fixtures before the test run",
-    ]
+    samples_secret, samples_clean = _corpus()
     for s in samples_secret:
         assert looks_secret(s), f"missed secret: {s}"
     for s in samples_clean:
         assert not looks_secret(s), f"false positive: {s}"
     assert redact("api_key=sk-proj-abcdefghijklmnopqrstuvwxyz1234")[1] == 1
-    print("ok — engram_secrets self-check")
+    print(f"ok — engram_secrets self-check ({len(samples_secret)} secret, "
+          f"{len(samples_clean)} clean samples)")
