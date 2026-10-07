@@ -96,6 +96,26 @@ def main():
             assert b.stat().st_mode & 0o777 == 0o600, (b, oct(b.stat().st_mode))
         print("ok — config and backups are private (0600)")
 
+        # --- Atlas graph view ---------------------------------------------------
+        # the graph's project is the engram.env pin, not a hard-coded "-root"
+        (claude / "engram.env").write_text('CLAUDE_MEMORY_SLUG="-home-u"\n')
+        assert atlas._graph_project() == "-home-u", atlas._graph_project()
+        # a store reached through a symlink is listed once, under its real name
+        projects = claude / "projects"
+        (projects / "-home-u" / "memory").mkdir(parents=True)
+        (projects / "-home-u-alias").mkdir(parents=True)
+        (projects / "-home-u-alias" / "memory").symlink_to(projects / "-home-u" / "memory")
+        atlas.PROJECTS_ROOT = projects
+        assert [d.name for d in atlas._project_dirs()] == ["-home-u"], atlas._project_dirs()
+        # hub entities (in more than ~2% of memories) draw no shared-entity edge
+        nodes = [{"id": f"n{i}"} for i in range(60)]
+        ents = {f"n{i}": {"hub"} for i in range(60)}
+        ents["n0"] |= {"rare"}
+        ents["n1"] |= {"rare"}
+        edges = atlas._shared_entity_edges(nodes, ents)
+        assert len(edges) == 1 and edges[0]["entities"] == ["rare"], edges
+        print("ok — Atlas: pinned graph project, symlinked store listed once, hubs capped")
+
 
 if __name__ == "__main__":
     main()

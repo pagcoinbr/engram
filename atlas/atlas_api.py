@@ -46,7 +46,34 @@ _model_cache: tuple[float, dict] | None = None
 def _project_dirs() -> list[Path]:
     if not PROJECTS_ROOT.exists():
         return []
-    return sorted(p.parent for p in PROJECTS_ROOT.glob("*/memory") if p.is_dir())
+    # A store reached through a symlink (e.g. a merged project dir pointing at the
+    # main store) is the SAME memories; listing it again doubled every count.
+    # Real directories first, so the canonical name wins over the alias.
+    seen, out = set(), []
+    for store in sorted(PROJECTS_ROOT.glob("*/memory"), key=lambda p: (p.is_symlink(), p)):
+        if store.is_dir() and store.resolve() not in seen:
+            seen.add(store.resolve())
+            out.append(store.parent)
+    return sorted(out)
+
+
+def _graph_project() -> str:
+    """The store the graph belongs to: the engram.env pin (the legacy graph is one
+    unscoped group built from it; the native graph is keyed by it). "-root" was
+    hard-coded here, which is one particular host's slug: everywhere else every
+    memory showed coverage "unknown" and no shared-entity edge was ever drawn."""
+    try:
+        import memory_recall
+        return memory_recall.pinned_slug() or "-root"
+    except Exception:
+        return "-root"
+
+
+def _graph_backend() -> str:
+    try:
+        return ((base.memory_ai.load().get("graph") or {}).get("backend") or "graphiti_compat").lower()
+    except Exception:
+        return "graphiti_compat"
 
 
 def _project_label(project_id: str) -> str:
@@ -92,16 +119,19 @@ def _inventory(scope: str) -> tuple[list[dict], list[dict]]:
                 "type": meta.get("type", "reference").lower(),
                 "mtime": int(path.stat().st_mtime),
                 "links": sorted(set(x.strip() for x in LINK_RE.findall(raw) if x.strip())),
-                "indexStatus": "unknown" if project_id != "-root" else "unindexed",
+                "indexStatus": "unknown" if project_id != _graph_project() else "unindexed",
             })
     return projects, nodes
 
 
 def _graph_evidence(nodes: list[dict]) -> tuple[list[dict], list[str]]:
     warnings = []
-    root_by_file = {n["file"]: n for n in nodes if n["project"] == "-root"}
+    graph_project = _graph_project()
+    root_by_file = {n["file"]: n for n in nodes if n["project"] == graph_project}
     if not root_by_file:
         return [], warnings
+    if _graph_backend() == "native":
+        return _native_graph_evidence(nodes, root_by_file, graph_project, warnings)
     try:
         episodes = base._graph_query(
             "MATCH (e:Episodic) WHERE e.file IS NOT NULL "
@@ -129,7 +159,7 @@ def _graph_evidence(nodes: list[dict]) -> tuple[list[dict], list[str]]:
         sync_state = {}
     for fname, node in root_by_file.items():
         expected = sync_state.get(fname)
-        path = PROJECTS_ROOT / "-root" / "memory" / fname
+        path = PROJECTS_ROOT / graph_project / "memory" / fname
         if node["indexStatus"] == "indexed" and expected and path.exists():
             actual = hashlib.sha256(path.read_bytes()).hexdigest()
             if actual != expected:
@@ -141,6 +171,7 @@ def _graph_evidence(nodes: list[dict]) -> tuple[list[dict], list[str]]:
     facts = base._graph_query(
         "MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity) "
         "WHERE any(u IN coalesce(r.episodes, []) WHERE u IN $episodes) "
+        "AND r.invalid_at IS NULL AND r.expired_at IS NULL "
         "RETURN a.name AS source, labels(a) AS source_labels, r.name AS relation, "
         "r.fact AS fact, b.name AS target, labels(b) AS target_labels, r.episodes AS episodes",
         episodes=ep_ids,
@@ -158,11 +189,25 @@ def _graph_evidence(nodes: list[dict]) -> tuple[list[dict], list[str]]:
                 "source": fact.get("source"), "relation": fact.get("relation"),
                 "target": fact.get("target"), "fact": fact.get("fact", ""),
             })
+    return _shared_entity_edges(nodes, node_entities), warnings
+
+
+def _shared_entity_edges(nodes: list[dict], node_entities: dict[str, set[str]]) -> list[dict]:
     for node in nodes:
         node["entityCount"] = len(node_entities.get(node["id"], set()))
-
+    # Hub entities ("user", "gateway", "main") sit in hundreds of memories and say
+    # nothing about how two of them relate; on a 606-memory store the top few alone
+    # made 22k of the edges, a 60 s render and a single hairball. An entity shared
+    # by more than ~2% of the memories is not evidence of a relationship.
+    freq: dict[str, int] = {}
+    for ents in node_entities.values():
+        for entity in ents:
+            freq[entity] = freq.get(entity, 0) + 1
+    cap = max(8, len(node_entities) // 50)
     shared_edges = []
-    connected = [(node_id, ents) for node_id, ents in node_entities.items() if ents]
+    connected = [(node_id, {e for e in ents if freq[e] <= cap})
+                 for node_id, ents in node_entities.items()]
+    connected = [(node_id, ents) for node_id, ents in connected if ents]
     for (left, left_entities), (right, right_entities) in itertools.combinations(connected, 2):
         shared = sorted(left_entities & right_entities, key=str.casefold)
         if not shared:
@@ -172,7 +217,37 @@ def _graph_evidence(nodes: list[dict]) -> tuple[list[dict], list[str]]:
             "id": edge_id, "source": left, "target": right, "kind": "shared_entity",
             "count": len(shared), "entities": shared[:12], "truncated": len(shared) > 12,
         })
-    return shared_edges, warnings
+    return shared_edges
+
+
+def _native_graph_evidence(nodes, root_by_file, slug, warnings):
+    """Coverage and shared entities from the Rust native graph (graph.backend:
+    native). A memory with a commit marker is indexed; a node without one is
+    mid-sync or failed (stale); no node at all is unindexed. Entities are the live
+    facts' endpoints (imported legacy facts) plus active triples' subject/object."""
+    try:
+        rows = base._graph_query(
+            "MATCH (m:EngramMemory {slug: $slug}) "
+            "OPTIONAL MATCH (m)-[:HAS_FACT]->(f:EngramFact) WHERE f.valid_until IS NULL "
+            "OPTIONAL MATCH (m)-[:HAS_TRIPLE]->(t:EngramTriple {status: 'active'}) "
+            "WHERE t.valid_until IS NULL "
+            "RETURN m.file AS file, m.sha IS NOT NULL AS current, "
+            "collect(DISTINCT f.subject) + collect(DISTINCT f.object) + "
+            "collect(DISTINCT t.subject) + collect(DISTINCT t.object) AS entities",
+            slug=slug)
+    except Exception:
+        warnings.append("Entity connections are temporarily unavailable.")
+        return [], warnings
+    node_entities: dict[str, set[str]] = {}
+    for node in root_by_file.values():
+        node["indexStatus"] = "unindexed"
+    for row in rows:
+        node = root_by_file.get(row["file"])
+        if not node:
+            continue
+        node["indexStatus"] = "indexed" if row["current"] else "stale"
+        node_entities[node["id"]] = {e for e in row["entities"] if e}
+    return _shared_entity_edges(nodes, node_entities), warnings
 
 
 def _wiki_edges(nodes: list[dict]) -> list[dict]:
