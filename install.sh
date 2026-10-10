@@ -24,6 +24,9 @@ SETTINGS="$CLAUDE/settings.json"
 BACKEND=""; TIER="small"; OLLAMA_HOST="http://localhost:11434"
 STORAGE="local"; REPO_REMOTE=""; DAEMON="none"; YES=0; WANT_GRAPH="auto"; WANT_VECTOR="auto"
 WANT_HERMES="auto"   # auto = register only if the hermes CLI is on PATH
+WANT_BACKUP="no"     # off unless asked: backups need an operator-provided bucket
+WANT_SILVERBULLET="no"  # off unless asked: stands up a web editor per vault
+WANT_WEB_AUTH="no"      # off unless asked: one web credential for atlas + SilverBullet
 START_SERVICES="yes" # bring Neo4j/Qdrant UP (they were only ever printed as a hint)
 
 while [[ $# -gt 0 ]]; do case "$1" in
@@ -37,6 +40,12 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --no-graph) WANT_GRAPH="no"; shift;;
   --vector) WANT_VECTOR="yes"; shift;;
   --no-vector) WANT_VECTOR="no"; shift;;
+  --backup) WANT_BACKUP="yes"; shift;;
+  --no-backup) WANT_BACKUP="no"; shift;;
+  --silverbullet) WANT_SILVERBULLET="yes"; shift;;
+  --no-silverbullet) WANT_SILVERBULLET="no"; shift;;
+  --web-auth) WANT_WEB_AUTH="yes"; shift;;
+  --no-web-auth) WANT_WEB_AUTH="no"; shift;;
   --hermes) WANT_HERMES="yes"; shift;;
   --no-hermes) WANT_HERMES="no"; shift;;
   --start-services) START_SERVICES="yes"; shift;;
@@ -154,6 +163,337 @@ say "engine installed into $CLAUDE (console: run $CLAUDE/engram-tui.py)"
 #
 # Only refresh a path that ALREADY exists. Creating one would quietly add a
 # system-wide install on hosts that never asked for it.
+# Provision encrypted off-host backups (restic). Called only under --backup.
+# Writes the three secrets into daemon.env (mode 600, never into engram.yaml),
+# flips backup.enabled, and inits the repo. Secrets already present (preserved
+# across a re-install) are not re-prompted. Non-interactive runs (--yes, or no
+# TTY) write commented placeholders and print instructions rather than blocking.
+provision_backup(){
+  local envf="$HOME/.config/engram/daemon.env"
+  say "provisioning encrypted backups (restic)"
+  if ! command -v restic >/dev/null 2>&1; then
+    if command -v dnf >/dev/null 2>&1; then sudo dnf install -y restic >/dev/null 2>&1 || true
+    elif command -v apt-get >/dev/null 2>&1; then sudo apt-get install -y restic >/dev/null 2>&1 || true; fi
+  fi
+  command -v restic >/dev/null 2>&1 || warn "restic not installed — install it, then set backup secrets in $envf"
+  mkdir -p "$(dirname "$envf")"; touch "$envf"; chmod 600 "$envf"
+
+  local have_pw have_bucket
+  have_pw="$(grep -c '^ENGRAM_BACKUP_PASSWORD=' "$envf" 2>/dev/null || echo 0)"
+  local endpoint bucket key_id key pw
+  if [[ -t 0 && "$YES" != "1" ]]; then
+    read -r -p "  B2/S3 endpoint [s3.us-west-004.backblazeb2.com]: " endpoint
+    read -r -p "  bucket name: " bucket
+    read -r -p "  application key id: " key_id
+    read -r -s -p "  application key: " key; echo
+    if [[ "$have_pw" == "0" ]]; then
+      read -r -s -p "  restic password (blank = generate a strong one): " pw; echo
+    fi
+  fi
+  endpoint="${endpoint:-s3.us-west-004.backblazeb2.com}"
+  # Generate a password only when none exists AND none was typed. Print it ONCE.
+  if [[ "$have_pw" == "0" && -z "${pw:-}" ]]; then
+    pw="$(openssl rand -base64 33 2>/dev/null || head -c 33 /dev/urandom | base64)"
+    warn "GENERATED restic password — store it NOW, it is the ONLY key to your backups:"
+    printf '      %s\n' "$pw"
+  fi
+  {
+    [[ "$have_pw" == "0" && -n "${pw:-}" ]] && echo "ENGRAM_BACKUP_PASSWORD=$pw"
+    [[ -n "${key_id:-}" ]] && echo "ENGRAM_BACKUP_S3_KEY_ID=$key_id"
+    [[ -n "${key:-}" ]] && echo "ENGRAM_BACKUP_S3_KEY=$key"
+  } >> "$envf"
+  chmod 600 "$envf"
+
+  # Non-secret knobs into engram.yaml: enable, and the endpoint/bucket if given.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$CLAUDE/engram.yaml" "$endpoint" "${bucket:-}" <<'PYB' 2>/dev/null || warn "could not update engram.yaml backup block"
+import sys
+try:
+    import yaml
+except Exception:
+    sys.exit(0)
+path, endpoint, bucket = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    cfg = yaml.safe_load(open(path)) or {}
+except Exception:
+    cfg = {}
+b = cfg.get("backup") or {}
+b["enabled"] = True
+b.setdefault("provider", "b2")
+b["endpoint"] = endpoint
+if bucket:
+    b["bucket"] = bucket
+b.setdefault("prefix", "engram")
+b.setdefault("retention", {"daily": 7, "weekly": 4, "monthly": 6})
+b.setdefault("check_every_days", 7)
+cfg["backup"] = b
+yaml.safe_dump(cfg, open(path, "w"), default_flow_style=False, sort_keys=False)
+PYB
+  fi
+
+  # Initialise the repo when we have enough to reach it.
+  if command -v restic >/dev/null 2>&1 && grep -q '^ENGRAM_BACKUP_PASSWORD=' "$envf" && [[ -n "${bucket:-}" || -n "$(grep '^ENGRAM_BACKUP_REPO=' "$envf" 2>/dev/null)" ]]; then
+    ( set -a; . "$envf"; set +a; ENGRAM_CONFIG="$CLAUDE/engram.yaml" python3 "$CLAUDE/engram_backup.py" init ) \
+      && say "backup repository ready — the daemon will snapshot daily" \
+      || warn "backup repo init did not complete; check the bucket + keys, then run: engram_backup.py init"
+  else
+    say "backup secrets recorded in $envf; set the bucket and run: engram_backup.py init"
+  fi
+}
+
+# Stand up a SilverBullet browser editor per vault. Called only under
+# --silverbullet. One container per tenant that has a vault, each mounting ONLY
+# its own vault (isolation at the mount layer), bound to loopback and fronted by
+# the Traefik gateway over the LAN/tailnet. Secrets (per-tenant SB_USER) live in
+# ~/.config/engram/silverbullet.env (mode 600), NOT in the repo. The work tenants
+# are read-only by default (set in the compose file).
+provision_silverbullet(){
+  local compose="$REPO/silverbullet/docker-compose.yml"
+  local envf="$HOME/.config/engram/silverbullet.env"
+  local suffix="${SB_HOST_SUFFIX:-home.arpa}"
+  local dyn="${TRAEFIK_DYNAMIC_DIR:-/opt/gateway-stack/traefik/dynamic}"
+  say "provisioning SilverBullet vault editors"
+  if ! command -v docker >/dev/null 2>&1; then warn "docker not found — cannot run SilverBullet"; return; fi
+  [[ -f "$compose" ]] || { warn "missing $compose"; return; }
+  mkdir -p "$(dirname "$envf")"; touch "$envf"; chmod 600 "$envf"
+
+  # Which tenants have a vault? Ask the config, same resolver the rest uses.
+  local tenants
+  tenants="$(python3 - "$CLAUDE/engram.yaml" <<'PYT' 2>/dev/null || true
+import sys
+try:
+    import yaml; cfg = yaml.safe_load(open(sys.argv[1])) or {}
+except Exception:
+    sys.exit(0)
+for name, entry in (cfg.get("tenants") or {}).items():
+    if str((entry or {}).get("vault") or "").strip():
+        print(name)
+PYT
+)"
+  [[ -n "$tenants" ]] || { warn "no tenant has a 'vault:' configured — nothing to serve"; return; }
+
+  # One SB_USER per tenant, generated once and preserved. Service name wiki-<t>.
+  #
+  # The compose file ships a fixed set of services (the known tenants). A tenant
+  # the compose has no service for is SKIPPED with a warning rather than silently
+  # breaking `docker compose up` — and without this guard an all-unknown set would
+  # leave `services` empty, which makes `up -d` start EVERY service. To add a new
+  # tenant: add its block to silverbullet/docker-compose.yml and a port here.
+  local services=() t var pw known
+  for t in $tenants; do
+    case "$t" in homelab|mjsv|bbhost|dseclab) known=1;; *) known=0;; esac
+    if [[ "$known" == 0 ]]; then
+      warn "tenant '$t' has no service in silverbullet/docker-compose.yml — skipping (add one to serve it)"
+      continue
+    fi
+    var="SB_USER_$(printf '%s' "$t" | tr '[:lower:]-' '[:upper:]_')"
+    if ! grep -q "^${var}=" "$envf" 2>/dev/null; then
+      # Generate and STORE the password; do NOT echo it. Printing it would land
+      # the secret in terminal scrollback, CI logs and transcript capture. The
+      # operator retrieves it deliberately from the 0600 file.
+      pw="$(openssl rand -base64 18 2>/dev/null || head -c 18 /dev/urandom | base64)"
+      echo "${var}=admin:${pw}" >> "$envf"
+      say "SilverBullet '$t': generated a login (user 'admin') — read it with: grep '^${var}=' $envf"
+    fi
+    services+=("wiki-${t}")
+  done
+  chmod 600 "$envf"
+  if [[ ${#services[@]} -eq 0 ]]; then
+    warn "no servable tenant (none match a compose service) — not starting SilverBullet"
+    return 1
+  fi
+
+  # Order matters (codex #8): bring the backends UP first, then publish routes —
+  # otherwise a failed `up` leaves live Traefik routes pointing at dead backends.
+  docker compose --env-file "$envf" -f "$compose" pull "${services[@]}" >/dev/null 2>&1 || true
+  if ! docker compose --env-file "$envf" -f "$compose" up -d "${services[@]}"; then
+    warn "docker compose up did not complete for SilverBullet; routes NOT published. Check 'docker compose -f $compose logs'"
+    return 1
+  fi
+
+  # Publish the Traefik routes only now, and ATOMICALLY (write + rename) so the
+  # gateway's file-watcher never reads a half-written config.
+  if [[ -d "$dyn" && -w "$dyn" ]]; then
+    local tmp="$dyn/.silverbullet.yml.$$"
+    { echo "http:"; echo "  services:"
+      for t in $tenants; do
+        local port; case "$t" in homelab) port=3011;; mjsv) port=3012;; bbhost) port=3013;; dseclab) port=3014;; *) port=0;; esac
+        [[ "$port" == 0 ]] && continue
+        echo "    sb-${t}: {loadBalancer: {servers: [{url: \"http://127.0.0.1:${port}\"}]}}"
+      done
+      echo "  routers:"
+      for t in $tenants; do
+        case "$t" in homelab|mjsv|bbhost|dseclab) ;; *) continue;; esac
+        echo "    sb-${t}: {rule: \"Host(\`wiki-${t}.${suffix}\`)\", entryPoints: [websecure, websecure-v6], tls: {}, service: sb-${t}}"
+      done
+    } > "$tmp" && mv -f "$tmp" "$dyn/silverbullet.yml"
+    say "published Traefik routes to $dyn/silverbullet.yml (wiki-<tenant>.${suffix})"
+  else
+    warn "gateway dynamic dir $dyn not writable — wire routes by hand from silverbullet/traefik-silverbullet.example.yml"
+  fi
+
+  for t in $tenants; do
+    case "$t" in homelab|mjsv|bbhost|dseclab) say "  SilverBullet [$t] -> https://wiki-${t}.${suffix}";; esac
+  done
+  say "SilverBullet is tailnet-only (loopback + gateway). Edits are indexed on the daemon's next wiki pass."
+}
+
+# One web credential for the whole engram web surface. Called under --web-auth.
+#
+# The model (see silverbullet/engram-web-auth.example.yml): ONE user:password,
+# enforced at the gateway for engram's atlas dashboard (whose config editor is
+# otherwise open on the LAN) and as SilverBullet's own SB_USER for the editors —
+# so a single credential logs into both, with no double prompt. It lives ONLY at
+# the web layer: the loopback API, CLI, MCP and daemon never cross it.
+provision_web_auth(){
+  local dyn="${TRAEFIK_DYNAMIC_DIR:-/opt/gateway-stack/traefik/dynamic}"
+  local sbenv="$HOME/.config/engram/silverbullet.env"
+  local failed=0
+  say "provisioning shared web auth (atlas + SilverBullet)"
+
+  local user pw
+  if [[ -t 0 && "$YES" != "1" ]]; then
+    read -r -p "  web username [admin]: " user
+    read -r -s -p "  web password (blank = generate): " pw; echo
+  fi
+  user="${user:-admin}"
+  if [[ -z "${pw:-}" ]]; then
+    pw="$(openssl rand -base64 15 2>/dev/null | tr -d '/+=' || head -c 15 /dev/urandom | base64 | tr -d '/+=')"
+    say "generated the web password — read it with: grep '^ENGRAM_WEB_PASSWORD=' $sbenv"
+  fi
+
+  # Record the plaintext ONCE in the 0600 env file (not printed), so the operator
+  # can retrieve it; it is also what SilverBullet's SB_USER needs (user:pass).
+  # umask 077 so the temp never exists even briefly world-readable (it holds the
+  # plaintext password).
+  mkdir -p "$(dirname "$sbenv")"
+  local old_umask; old_umask="$(umask)"; umask 077
+  touch "$sbenv"; chmod 600 "$sbenv"
+  local tmp; tmp="$(mktemp "$(dirname "$sbenv")/.sbenv.XXXXXX")"
+  { echo "ENGRAM_WEB_USER=$user"; echo "ENGRAM_WEB_PASSWORD=$pw"
+    grep -v '^ENGRAM_WEB_USER=\|^ENGRAM_WEB_PASSWORD=\|^SB_USER_' "$sbenv" 2>/dev/null || true
+    # Sink 2: SilverBullet's SB_USER for every known tenant = the SAME credential.
+    local T; for T in HOMELAB MJSV BBHOST DSECLAB; do echo "SB_USER_${T}=${user}:${pw}"; done
+  } > "$tmp"
+  mv -f "$tmp" "$sbenv"; chmod 600 "$sbenv"; umask "$old_umask"
+  say "SilverBullet logins synced to the same credential (in $sbenv)"
+
+  # Sink 1: the gateway. The middleware carries the bcrypt hash INLINE (like the
+  # gateway's hermes.yml), NOT via usersFile — the gateway mounts individual
+  # files, so a separate htpasswd would not be visible inside the traefik
+  # container. Inline users in a file already under the mounted dynamic/ dir
+  # needs no new mount. The '$' in a bcrypt hash is literal in a file-provider
+  # config (unlike docker labels), so it is embedded verbatim.
+  local hashline
+  if command -v htpasswd >/dev/null 2>&1; then
+    hashline="$(htpasswd -nbB "$user" "$pw")"
+  else
+    hashline="${user}:$(openssl passwd -apr1 "$pw")"
+  fi
+  if [[ -d "$dyn" && -w "$dyn" ]]; then
+    # Atomic publish: write a temp in the SAME dir, then rename, so Traefik's
+    # watcher never reads a half-written middleware.
+    local mwtmp; mwtmp="$(mktemp "$dyn/.engram-web-auth.XXXXXX")"
+    cat > "$mwtmp" <<EOF
+# Generated by install.sh --web-auth. Inline bcrypt (no usersFile: the gateway
+# mounts individual files, so a separate htpasswd would be invisible here).
+http:
+  middlewares:
+    engram-auth:
+      basicAuth:
+        users:
+          - "${hashline}"
+        removeHeader: true
+EOF
+    mv -f "$mwtmp" "$dyn/engram-web-auth.yml"
+    # Attach it to the EXISTING engram router in tls.yml (idempotent, backed up,
+    # written atomically; a backup that cannot be taken aborts the patch).
+    local tls="$dyn/tls.yml"
+    if [[ -f "$tls" ]] && command -v python3 >/dev/null; then
+      if cp -a "$tls" "$tls.engram-bak.$(date +%s)"; then
+      python3 - "$tls" <<'PY' && say "attached engram-auth to the engram router" || { warn "did NOT secure the atlas router at $tls — add 'engram-auth' to its middlewares by hand (see message above)"; failed=1; }
+import sys
+p = sys.argv[1]
+raw = open(p).read()
+
+def apply(load, dump):
+    d = load(raw)
+    r = ((d.get("http") or {}).get("routers") or {}).get("engram")
+    if r is None:
+        print(f"no 'engram' router in {p}; nothing to patch", file=sys.stderr)
+        return None
+    mw = r.setdefault("middlewares", [])
+    if "engram-auth" in mw:
+        return raw  # idempotent: already attached, leave the file byte-for-byte
+    mw.append("engram-auth")
+    return dump(d)
+
+# Prefer ruamel (round-trip: preserves comments, quoting and key order). This is
+# a shared GATEWAY file that may carry operator comments, so a lossy rewrite is
+# not acceptable.
+out = None
+try:
+    from ruamel.yaml import YAML
+    import io
+    y = YAML()
+    def _load(s):
+        return y.load(s)
+    def _dump(d):
+        buf = io.StringIO(); y.dump(d, buf); return buf.getvalue()
+    out = apply(_load, _dump)
+except Exception:
+    import yaml
+    # pyyaml strips comments. Only safe when the file has none — otherwise refuse
+    # and tell the operator exactly what to add, rather than silently mangling it.
+    if any(line.lstrip().startswith("#") for line in raw.splitlines()):
+        print("tls.yml has comments and ruamel.yaml is not installed; refusing a lossy\n"
+              "rewrite. Add these two lines under the 'engram' router:\n"
+              "      middlewares:\n        - engram-auth", file=sys.stderr)
+        sys.exit(1)
+    out = apply(yaml.safe_load, lambda d: yaml.safe_dump(d, default_flow_style=False, sort_keys=False))
+
+if out is None:
+    sys.exit(1)
+# Atomic: write a sibling temp then rename, so Traefik's watcher never reads a
+# partial router config.
+import os, tempfile
+fd, t = tempfile.mkstemp(dir=os.path.dirname(p) or ".", prefix=".tls.")
+with os.fdopen(fd, "w") as f:
+    f.write(out)
+os.replace(t, p)
+PY
+      else
+        warn "could not back up $tls — NOT patching it (atlas left unsecured). Add 'engram-auth' to the engram router by hand."; failed=1
+      fi
+    else
+      warn "no $tls to patch — attach the engram-auth middleware to your engram router manually"; failed=1
+    fi
+  else
+    warn "gateway dir $dyn not writable — atlas NOT secured. See silverbullet/engram-web-auth.example.yml to wire it by hand."; failed=1
+  fi
+
+  if [[ "$failed" == 0 ]]; then
+    say "atlas dashboard now requires login at https://engram.${SB_HOST_SUFFIX:-home.arpa}"
+  else
+    warn "WEB AUTH INCOMPLETE: the atlas dashboard is NOT protected yet — act on the message(s) above."
+  fi
+
+  # If SilverBullet instances are already running, their SB_USER is baked into the
+  # live container env; rotating the file does nothing until they are recreated.
+  if command -v docker >/dev/null 2>&1 && [[ -f "$REPO/silverbullet/docker-compose.yml" ]]; then
+    local running; running="$(docker compose --env-file "$sbenv" -f "$REPO/silverbullet/docker-compose.yml" ps --services --status running 2>/dev/null || true)"
+    if [[ -n "$running" ]]; then
+      say "recreating running SilverBullet instances so the new login takes effect"
+      # shellcheck disable=SC2086
+      docker compose --env-file "$sbenv" -f "$REPO/silverbullet/docker-compose.yml" up -d --force-recreate $running >/dev/null 2>&1 \
+        || warn "could not recreate SilverBullet — restart it so the new SB_USER applies"
+    fi
+  fi
+
+  say "web auth is gateway + web-app only — the loopback API, CLI, MCP and daemon are unaffected"
+  return "$failed"
+}
+
 sync_service_binaries(){
   local unit path updated=0
   for unit in /etc/systemd/system/engram-*.service "$HOME/.config/systemd/user"/engram-*.service; do
@@ -180,7 +520,7 @@ if command -v cargo >/dev/null; then
   say "building Rust API and recall tools"
   if (cd "$REPO" && cargo build --release -q -p engram-app --bins); then
     mkdir -p "$CLAUDE/rust"
-    for rust_bin in engram-app engram-graph-sync engram-graph-recall-eval engram-index engram-lifecycle engram-mcp engram-native-graph-sync engram-recall engram-recall-hook; do
+    for rust_bin in engram-app engram-graph-sync engram-graph-recall-eval engram-index engram-lifecycle engram-mcp engram-native-graph-sync engram-recall engram-recall-hook engram-tenant-migrate engram-wiki-index; do
       [[ -x "$REPO/target/release/$rust_bin" ]] && install -m 0755 "$REPO/target/release/$rust_bin" "$CLAUDE/rust/$rust_bin"
     done
     # engram-graph-compat was removed: the bounded Graphiti spawn now lives inside
@@ -343,13 +683,9 @@ if [[ "$WANT_VECTOR" == yes ]]; then
     else say "engram-vector MCP already registered"; fi
   else warn "claude CLI or vector venv missing — skipping MCP registration (run 'claude mcp add' later)"; fi
   hermes_register engram-vector "$VVENV/bin/python" "$CLAUDE/vector/vector_mcp_server.py"
-  # Hybrid recall: the warm engram-graph server queries Qdrant in-process, so the
-  # GRAPH venv needs qdrant-client too. Idempotent; harmless if graph isn't built.
-  if [[ -x "$CLAUDE/graph/venv/bin/python" ]]; then
-    "$CLAUDE/graph/venv/bin/pip" install -q qdrant-client \
-      && say "added qdrant-client to graph venv (enables memory_recall_hybrid)" \
-      || warn "could not add qdrant-client to graph venv (hybrid will fall back to graph+keyword)"
-  fi
+  # Hybrid recall (graph+vector+keyword) now lives in the engram-rust server, which
+  # embeds the query once. The engram-graph/engram-vector servers no longer run their
+  # own recall legs, so the graph venv no longer needs qdrant-client for it.
   say "start Qdrant: cd $CLAUDE/vector && docker compose up -d"
   # Seed the index from any memories already on disk (best-effort; no-op if Qdrant
   # is down). Output is REPORTED, not swallowed: `2>/dev/null || true` hid both a
@@ -426,11 +762,39 @@ case "$DAEMON" in
     DAEMON_ENV="$HOME/.config/engram/daemon.env"
     # PRESERVE operator secrets across re-installs (do NOT clobber them): the ccg key
     # and the Telegram approval-gate token/chat id live here and must survive.
-    PRESERVED="$(grep -E '^(ENGRAM_CCG_KEY|ANTHROPIC_BASE_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)=' "$DAEMON_ENV" 2>/dev/null || true)"
+    PRESERVED="$(grep -E '^(ENGRAM_CCG_KEY|ANTHROPIC_BASE_URL|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|ENGRAM_BACKUP_PASSWORD|ENGRAM_BACKUP_S3_KEY_ID|ENGRAM_BACKUP_S3_KEY|ENGRAM_BACKUP_REPO)=' "$DAEMON_ENV" 2>/dev/null || true)"
     # CLAUDE_MEMORY_SLUG must be here too: without it the daemon re-derives the
     # slug from $HOME and ignores an operator pin, so scheduled jobs index a
     # different store than the one interactive recall searches.
+    # ENGRAM_TENANT, when the config declares tenants and one of them owns $SLUG.
+    #
+    # The API serves ONE identity per process and has no project directory to
+    # derive it from — a service's working directory, and even its $HOME, say
+    # nothing about which agent it belongs to. (The live engram-api unit sets no
+    # HOME at all, so the derived slug there was "-", the slugification of "/".)
+    # Naming it here keeps that explicit and visible to anyone reading the unit.
+    # Store-scoped callers do not need it: the identity follows the slug.
+    API_TENANT=""
+    if [[ -f "$CLAUDE/engram.yaml" ]] && command -v python3 >/dev/null; then
+      API_TENANT="$(python3 - "$CLAUDE/engram.yaml" "$SLUG" <<'PYT' 2>/dev/null || true
+import sys
+try:
+    import yaml
+except Exception:
+    sys.exit(0)
+try:
+    cfg = yaml.safe_load(open(sys.argv[1])) or {}
+except Exception:
+    sys.exit(0)
+for name, entry in (cfg.get("tenants") or {}).items():
+    if sys.argv[2] in [str(s).strip() for s in ((entry or {}).get("slugs") or [])]:
+        print(name)
+        break
+PYT
+)"
+    fi
     { echo "ENGRAM_BIN=$CLAUDE"; echo "ENGRAM_GRAPH=$CLAUDE/graph"; echo "ENGRAM_CONFIG=$CLAUDE/engram.yaml"; echo "ENGRAM_LOG_DIR=$CLAUDE/logs"; echo "CLAUDE_MEMORY_SLUG=$SLUG";
+      [[ -n "$API_TENANT" ]] && echo "ENGRAM_TENANT=$API_TENANT";
       [[ -x "$CLAUDE/graph/venv/bin/python" ]] && echo "ENGRAM_GRAPH_PYTHON=$CLAUDE/graph/venv/bin/python";
       [[ -x "$CLAUDE/vector/venv/bin/python" ]] && echo "ENGRAM_VECTOR_PYTHON=$CLAUDE/vector/venv/bin/python"; } > "$DAEMON_ENV"
     if [[ -n "$PRESERVED" ]]; then
@@ -495,6 +859,17 @@ DENV
     say "docker daemon: cd $REPO/daemon && cp .env.example .env && \$EDITOR .env && docker compose up -d";;
   none) say "no daemon (run /memory-* commands manually, or set one up later)";;
 esac
+
+# Optional add-ons, gated ONLY on their own flags — NOT on the daemon mode. They
+# were previously inside the systemd arm above, so `--backup`/`--silverbullet`
+# silently did nothing under the default `--daemon none`. Each provision function
+# creates and 0600s its own env file, so neither depends on daemon.env existing.
+[[ "$WANT_BACKUP" == "yes" ]] && provision_backup
+# Web auth BEFORE SilverBullet: it writes the shared SB_USER_* into
+# silverbullet.env, which provision_silverbullet then honours (it only generates
+# a password when one is absent), so a single credential logs into both.
+[[ "$WANT_WEB_AUTH" == "yes" ]] && provision_web_auth
+[[ "$WANT_SILVERBULLET" == "yes" ]] && provision_silverbullet
 
 say "done. Restart Claude Code so it loads the new commands + MCP server."
 say "To run engram AUTONOMOUSLY (unattended harvest/graduate/curate + Telegram approvals),"

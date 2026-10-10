@@ -1,5 +1,586 @@
 # Changelog
 
+## Unreleased — fix the 24/7 graph re-harvest loop (per-tenant ingest state)
+
+The local model was being called around the clock. Root cause: the graph ingest's
+on-disk state — the extraction cache, `insert_state.json` (the per-file "done" set)
+and `sync_state.json` — was a single **flat** copy shared by every store, and
+`graph_sync.py` invoked `memory_graph_insert.py` **without telling it which slug**
+it had just extracted for. The inserter fell back to the `$HOME`-derived default
+slug, looked for another store's `.md` under the wrong `MEM_DIR`, hit
+`skip (no .md)`, never stamped "done", and the extractor re-harvested those memories
+on the next cycle — forever. Only the one store that happened to match the default
+(`-root`) ever completed; every tenant's memories churned the model endlessly
+(measured: 2324 generation attempts for 113 distinct prompts, same ones re-sent
+~24×, `insert_state.json` frozen for days).
+
+### Fixed
+
+- **Per-slug ingest state** — new `graph/mg_state.py` scopes the extraction cache,
+  `insert_state.json` and `sync_state.json` under `state/<slug>/`. `graph_sync.py`,
+  `memory_graph_insert.py` and `graph_maint.py` all resolve them from the active
+  slug, so each store tracks its own "done" set and a memory is extracted once.
+- **Slug propagation** — `graph_sync.py` now passes `--slug` (and `CLAUDE_MEMORY_SLUG`)
+  to the insert child, so the inserter's `MEM_DIR` and state match the store that
+  was extracted. This was the actual root cause; the scoping made it correct and
+  collision-free (two tenants with a same-named file no longer share one "done").
+- **One-time migration** — `graph_sync.py --migrate-state` (also run lazily, flock-
+  guarded + idempotent) splits any legacy flat state into per-slug dirs, assigning
+  each done file to the store it was inserted from (sha-disambiguated) so files
+  already in the graph are not re-inserted (which would duplicate episodes).
+- `tests/test_graph_ingest_scope.py` — pins per-slug path scoping, slug resolution,
+  and the migration split/disambiguation/idempotency (no graphiti/Neo4j needed).
+
+Side note unchanged here: the `:8090` generation server flaps up/down; while it is
+down, extraction cannot make progress (clean "nothing extracted"), and when it is
+up each store now ingests once and goes quiet.
+
+## Unreleased — atlas tenant awareness + per-tenant Wiki link
+
+atlas knew nothing about tenants: the Scope selector listed raw project slugs with no
+hint of which tenant owned them, there was no view of a tenant's collections/group/
+vault, and the per-tenant SilverBullet vaults were unreachable from the dashboard.
+
+### Added
+
+- **`GET /api/atlas/tenants`** (`atlas_api.py`) — the configured tenants and, for each,
+  the stores (slugs) it owns, its Qdrant collections, Graphiti group, vault, memory
+  count, and its SilverBullet URL (`wiki-<name>.<suffix>`). Non-fatal import of
+  `engram_tenant.py` (mirroring the audit loader); degrades to an untenanted payload so
+  atlas stays usable with no `tenants:` block. The Rust API is single-tenant per process
+  and lists no tenants, so this is Python-only.
+- **Atlas "Tenants" tab** — one card per tenant (collections, graph group, vault, slugs,
+  count) with an "Open wiki" link.
+- **Scope selector grouped by tenant** — projects nest under their owning tenant
+  (`<optgroup>`), with a trailing "Unassigned" group; untenanted installs keep the flat
+  list. Each project in `/api/atlas/projects` and every snapshot now carries a `tenant`
+  field.
+- **Per-tenant "Wiki" nav link** — opens the selected tenant's SilverBullet vault in a
+  new tab (a separate origin with its own login — a link, not an embed); falls back to
+  the Tenants view when no tenant is resolvable from the current scope.
+- **`ui.wiki_host_suffix`** config key (default `home.arpa`, matches install's
+  `SB_HOST_SUFFIX`) — documented in `engram.yaml.example` and `CONFIG.md`.
+- `tests/test_atlas_tenants.py` — pins the tenant-model contract the tab reads and the
+  wiki-URL shape.
+
+## Unreleased — LLM call audit + atlas "LLM Calls" tab
+
+There was no record of what engram sent to the generation model, so a loop (the same
+prompt re-sent over and over) was invisible. This adds a content-free audit of every
+generation call and a UI tab that streams them and flags exact repeats.
+
+### Added
+
+- **`bin/engram_llm_audit.py`** — append-only JSONL at `~/.claude/logs/llm_events.jsonl`,
+  one line per generation *attempt*: `proc`, `backend`, `model`, `role`, `kind`
+  (generation|health), `call_id`/`attempt`, `chars`, `ms`, `outcome`, and a **keyed
+  HMAC digest** of the prompt (`~/.config/engram/llm_audit.key`, mode 600) — a repeat is
+  detectable without storing any prompt text (the log is global across tenants). Writes
+  are best-effort (never raise into a generation), multi-process-safe (lock-before-open
+  rotation at 16 MB → `.1`, backward `tail`). `detect_loops()` flags identical
+  `(digest,model,role,proc)` groups, excluding health probes.
+- **Instrumentation (generation only, Python):** the `engram_llm.py` backends
+  (`_llamacpp_generate`, `_ollama_generate`, `_claude_generate` per retry, `_ccg_generate`
+  preflight), the native `ollama_stream` path in `memory_distill_verified.py`, and the
+  Graphiti `chat.completions.create` wrapper in `mg_config.py` (now installed always, for
+  logging; reasoning-injection stays conditional).
+- **`GET /api/atlas/llm`** (`atlas_api.py`) — recent events + flagged loops; non-fatal
+  import, schema-versioned, `limit` capped, degrades to "unavailable".
+- **Atlas "LLM Calls" tab** — header metrics (gen calls / 5 min, distinct prompts, repeat
+  ratio), a Possible-loops panel (exact-repeat detector; health excluded), and a recent-
+  calls table polling every 5 s.
+- `tests/test_llm_audit.py`; `tests/run_all.sh` points `ENGRAM_LOG_DIR` at a throwaway dir
+  so the suite never pollutes the real audit log.
+
+Reviewed by codex (APPROVE-WITH-CHANGES; all points folded in).
+
+## Unreleased — one recall path (stop the duplicate embedding calls)
+
+Recall was exposed by three MCP servers at once — `engram-graph` (Graphiti+vector+
+keyword), `engram-vector` (vector/fused) and `engram-rust` (the Rust hybrid). The
+two Python servers each ran their OWN legs, and `engram-graph`'s recall embedded the
+query **twice per call** (its graph leg and its in-process Qdrant leg each called the
+embedding model on the same text). On a local llama/bge-m3 endpoint that showed up as
+every recall hitting the model in duplicate.
+
+### Changed
+
+- **`engram-rust` is now the single recall path.** `memory_recall` /
+  `memory_recall_hybrid` are served only by the Rust `engram-mcp` server, which embeds
+  the query once and degrades to keyword+vector when no graph is installed.
+- **`engram-graph` no longer exposes recall.** Removed `memory_recall` /
+  `memory_recall_hybrid` (and the now-dead `_recall_hybrid` / `_graph_ranked`). Keeps
+  its graph-native tools: `memory_search_facts`, `memory_neighbors`, `memory_stats`.
+- **`engram-vector` no longer exposes recall.** Removed `memory_vector_recall` and
+  `memory_recall_fused`. Keeps raw inspection: `memory_vector_search`,
+  `memory_vector_stats`.
+- **`bin/memory_recall.py` (TUI/CLI) embeds once.** When the graphiti graph leg runs,
+  the redundant Qdrant vector leg is skipped — mirroring the Rust compat path. Fast
+  mode (no graph leg) still runs the vector leg. Verified: non-fast recall went from 2
+  embedding calls to 1; fast stays at 1.
+- `install.sh` no longer adds `qdrant-client` to the graph venv (graph recall is gone),
+  and docs (README/CONFIG/ARCHITECTURE/engram.yaml.example/vector docs) point recall at
+  `engram-rust`.
+
+## Unreleased — shared web authentication (atlas + SilverBullet)
+
+engram's own binaries have no auth and need none — the API (127.0.0.1:8787), CLI,
+MCP and daemon are loopback/local. But the atlas dashboard is published through
+the Traefik gateway at `engram.home.arpa` with NO auth, and its config editor can
+rewrite engram.yaml — so over the LAN it was open. This adds one web credential,
+shared with the SilverBullet editors, enforced only at the web layer.
+
+### Added — `install.sh --web-auth`
+
+- One `user:password`, provided once or generated, written to
+  `~/.config/engram/silverbullet.env` (mode 600) and applied to two sinks:
+  a Traefik `engram-auth` basicAuth middleware on the atlas router (the auth
+  engram lacked), and every `SB_USER_*` (SilverBullet's own login), so a single
+  credential logs into both with no double prompt.
+- **Web only**: all at the gateway and the web apps; the loopback API, CLI, MCP
+  and daemon are untouched by design, and a test asserts no request-auth gate is
+  ever added to engram-app.
+- `silverbullet/engram-web-auth.example.yml`, a CONFIG.md section, and
+  `tests/test_web_auth.sh`.
+
+### Reviewed by codex; blockers fixed
+
+- **Missing gateway mount** — the gateway mounts individual files, not the parent
+  dir, so a separate htpasswd would be invisible in the traefik container. The
+  middleware now carries the bcrypt hash INLINE (`users:`), like the gateway's
+  hermes router — no new mount.
+- **Fail-open reporting** — if the gateway can't be secured (dir unwritable, no
+  engram router, a commented tls.yml with no ruamel), it now says
+  "WEB AUTH INCOMPLETE: atlas is NOT protected" and returns non-zero, instead of
+  implying success.
+- **Rotation not applied** — re-running `--web-auth` now force-recreates any
+  running SilverBullet instances so the new SB_USER takes effect.
+- **Secret handling** — the plaintext env is written via `mktemp` under
+  `umask 077` and renamed, so it is never briefly world-readable.
+- **Atomic gateway updates** — the middleware file and the tls.yml patch are
+  written to a sibling temp and renamed; the router patch requires a successful
+  backup first and refuses a lossy rewrite of a commented file (prefers ruamel,
+  else prints the exact lines to add).
+
+### Honest limitations (documented, not papered over)
+
+Shared credentials, not SSO — no shared session, and Traefik basicAuth has no
+lockout (SilverBullet's own login does). `SB_USER` is visible via `docker
+inspect` to anyone with Docker/root access, inherent to basicAuth. No engram-app
+code change — web auth lives entirely at the gateway and the web apps.
+
+## Unreleased — SilverBullet: browser editor over the vaults
+
+The vaults are plain markdown on a headless server, which is why "edit remotely"
+kept needing a sync bridge (Obsidian is local-first; Obsidian Sync can't reach a
+headless box). SilverBullet inverts that — a server-first editor that serves the
+directory over the browser — so it edits the SAME files engram indexes, no sync
+layer. engram stays the indexer and the agents' writer; SilverBullet is the
+human's editor, and the loop closes: write a runbook in the browser, an agent
+recalls it and files a finding into `_agent/`, you review that in the browser.
+
+### Added
+
+- **`silverbullet/`** — a compose file (one service per tenant, each mounting
+  ONLY its own vault; loopback-bound; work tenants `SB_READ_ONLY`), a Traefik
+  dynamic-config reference, and a README.
+- **`install.sh --silverbullet`** — pulls the image, generates per-tenant
+  `SB_USER` credentials into `~/.config/engram/silverbullet.env` (mode 600) and
+  the Traefik routes (`wiki-<tenant>.home.arpa`, TLS, tailnet-only), and brings
+  up the selected instances.
+- `ARCHITECTURE.md` §4d-bis and a `CONFIG.md` section.
+
+### Verified empirically against a live SilverBullet container
+
+- SilverBullet edits plain `.md` in place — files seeded on disk by engram/agents
+  are served unchanged, and pages created in the editor land as plain `.md`.
+- The ONLY file it writes into a space is `.silverbullet.auth.json`, a **dotfile**
+  the wiki walker already skips — confirmed in the real indexer (it indexed the
+  human page and the agent's `_agent/` note, not the auth file). No `SKIP_DIRS`
+  change was needed; a test pins the property, and the backup now excludes it.
+- Mount-layer isolation: a tenant's container sees only `/data` (its vault);
+  `/vaults` does not exist inside it, so another identity is structurally
+  unreachable — the per-tenant boundary holding one level lower than the DB
+  filters.
+
+### Posture
+
+Tailnet-only (loopback + Traefik over Tailscale, no public entrypoint, no
+funnel); work vaults read-only by default (an editor-layer control, not a
+filesystem lock); auth via SilverBullet's own `SB_USER`. Off unless
+`--silverbullet` is passed. The Rust/engram pipeline is untouched beyond the
+one-line walker test and the backup exclude.
+
+## Unreleased — encrypted off-host backups (Backblaze B2 / any S3)
+
+The source-of-truth data — the `.md` memory stores (~4 MB) and the Obsidian
+vaults — had no off-host copy. This adds a daily, encrypted, retained backup of
+exactly that authoritative set; the Qdrant/Neo4j indexes are left out because
+they rebuild from it.
+
+### Added
+
+- **`bin/engram_backup.py`** — a restic wrapper, operator-runnable and
+  daemon-called (the graph_sync.py shape). Subcommands `init` / `backup` /
+  `snapshots` / `restore` / `check` / `status`. restic was chosen for one
+  property above all: **client-side AES-256, always on** — the restore set
+  includes `graph/.env`, so the store must never see plaintext — plus
+  content-addressed dedup (a daily snapshot of an unchanged 4 MB set is nearly
+  free), retention, and integrity checking.
+- **A `backup` daemon task**, daily (86400s), beside `maintenance`. No-ops with
+  one log line when disabled or when the password is absent; returns `False`
+  (deferred, not stamped) on a transient failure so it retries next tick rather
+  than waiting a full day. Its periodic `check` timer lives in the script's own
+  state file, NOT the daemon state, because `tick()` rewrites the daemon state
+  wholesale and would clobber a key written from inside a task.
+- **`backup:` block** in `engram.yaml` (non-secret knobs only) and
+  `./install.sh --backup` provisioning: ensures restic, prompts for
+  bucket/endpoint/keys, generates and prints the restic password once if none is
+  given, and inits the repo.
+
+### Security properties, asserted by the round-trip test
+
+`tests/test_backup_roundtrip.sh` (skips when restic is absent) seeds two memory
+stores and a vault, backs up, deletes the source, restores to a staging dir, and
+checks: the `.md`, vault and `graph/.env` files come back byte-for-byte;
+`.obsidian/` and `.trash/` are excluded; the plaintext is **not findable in the
+repo** (encryption is really in effect); and the restic password appears in
+neither the log nor `engram.yaml`.
+
+- **Secrets never touch `engram.yaml`.** The restic password and S3 keys live in
+  `~/.config/engram/daemon.env` (mode 600), added to the installer's PRESERVED
+  grep so a re-install keeps them. The restic env is built for the child process
+  only — the daemon's own environment never carries it.
+- **Restore never clobbers live data** — it stages into a directory for the
+  operator to review and move deliberately.
+
+### Scope
+
+Memories + vaults + `engram.yaml` + `graph/.env`. Transcripts (`*.jsonl`) and
+the rebuildable indexes are excluded. One whole-system repo. Daemon-only — the
+Rust workspace is untouched. Off by default; dormant until an operator provides a
+bucket.
+
+## Unreleased — the Obsidian wiki corpus (stages 3-6)
+
+A second corpus over a different shape of document, and the half of the feature
+the tenancy work existed to make safe.
+
+### Added
+
+- **`engram-wiki` crate** — walk, parse, chunk. All pure: `walk` reads a
+  directory, everything else transforms strings, so the chunker is unit-tested
+  without a vault, a Qdrant or an embedding endpoint.
+  - Recursive walk skipping `.obsidian` (the app's own state), `.trash`
+    (indexing it would resurrect deleted pages in recall), `.git` and dotfiles.
+  - Frontmatter (`title`, `aliases`, `tags`, inline and block lists), inline
+    `#tags`, and all four wikilink forms: `[[Page]]`, `[[Page|alias]]`,
+    `[[Page#Heading]]`, `![[Embed]]`.
+  - Link resolution by Obsidian's rule — filename anywhere in the vault,
+    shortest path winning — which needs a vault-wide index, not a path join.
+  - **Code-fence awareness.** A technical wiki is full of `# comment` inside
+    shell blocks; treating those as headings splits a page at every comment in
+    every snippet and moves the boundaries whenever a sample is edited.
+  - Heading-aware chunking, ~400 tokens with ~60 of overlap, splitting long
+    sections on paragraph boundaries and never mid-character.
+  - **Every chunk carries its breadcrumb into the embedding.** A chunk is
+    retrieved alone, so "restart the broker and clear the queue" is
+    indistinguishable between four runbooks without `Runbooks > RabbitMQ >
+    Failover` in front of it. This matters more than the chunk size does.
+  - An H1 repeating the page name is collapsed, since Obsidian pages routinely
+    do that and `RabbitMQ > RabbitMQ > Queues` spends tokens saying nothing.
+  - `CHUNKER_VERSION`, folded into the freshness hash, so a boundary change
+    invalidates stored chunks instead of leaving documents looking current.
+- **`engram-wiki-index`** — per-tenant, per-document freshness
+  (`space · chunker version · content`), redaction before the embedding call,
+  and a prune pass for documents that left the vault.
+  - **Writes new chunks before trimming old ones.** An edit that shortens a page
+    leaves orphan tail chunks — text no longer in the document but still
+    answering queries — and deleting first would blank the page from recall for
+    the duration of the re-embed. Write-then-trim is monotonic.
+- **`wiki_search` / `wiki_fetch` / `wiki_write` MCP tools.** Search locates a
+  section; fetch returns the surrounding document within a budget, which is the
+  half that makes the feature useful — a truncated fragment is what the memory
+  path already gives for a long document.
+- **`engram_retrieval::rank`** over a new `Indexable` trait, so wiki chunks reuse
+  BM25 rather than getting a second, subtly different implementation. `Memory`
+  implements it; the memory path is unchanged.
+- **A `wiki` daemon task**, per tenant rather than per store: a vault belongs to
+  an identity, and several of a tenant's stores would each trigger a full
+  re-walk of the same vault.
+
+### Isolation
+
+Wiki recall is a SEPARATE entry point from `recall`, not a leg inside it. Fusing
+them would let a 40-chunk page outvote every memory in the store, and the prompt
+hook injects from `recall` on every prompt. Wiki is retrieved when asked for.
+
+Agent writes carry four independent guards: containment (the path must resolve
+inside the vault, symlinks and `..` included), subtree confinement (and inside
+`agent_subtree`, so curated pages cannot be touched), `.md`-only (a sync client
+propagates whatever is in the vault), and redaction before the bytes hit disk —
+not merely before indexing, because a credential in a synced vault has left the
+box whatever the index holds. Writes are temp-file + fsync + rename, so Obsidian
+never renders a half-written page.
+
+### Fixed — found by running it
+
+- **The MCP server refused to start for a tenant owning several stores.** It
+  resolved the identity AND a default store up front, so a tenant whose stores
+  did not match the launch directory got no server at all — making `wiki_search`
+  unavailable because `memory_recall` could not have picked a default. The store
+  is now resolved by the tools that need one; a slug failure surfaces only there.
+- **A missing collection read as a transport failure.** A first-ever `--dry-run`
+  died on Qdrant's 404, and the leg status reported "this vault has not been
+  indexed yet" as `HTTP status client error`. A collection that does not exist
+  holds no chunks.
+- **An unconfigured vault returned empty results with puzzling leg statuses**
+  rather than saying so; a setup step and a search that found nothing looked
+  identical to a caller.
+
+### Deployed
+
+Four vaults at `/vaults/<tenant>` (`homelab`, `mjsv`, `bbhost`, `dseclab`), each
+with `Notes/`, `Runbooks/`, an agent-writable `_agent/`, and a README describing
+the layout and the isolation guarantee. Verified end to end: an agent filed a
+finding, the incremental pass indexed only that document, search returned it as
+the top hit, a canary planted in one vault was unreachable from another, and a
+credential written by an agent reached disk redacted.
+
+## Unreleased — multi-tenant agent identities (stage 3: deployment)
+
+Applied to the live install: four identities (`bbhost`, `dseclab`, `mjsv`,
+`homelab`), 13 stores, migrated and verified.
+
+### Changed — the identity follows the store
+
+The stage 1 rule, "declaring a tenant makes `--tenant` required on every binary",
+was right about safety and wrong about where the boundary is. Deploying it
+revealed three call sites it cannot work at:
+
+- the prompt hook and the MCP server are registered ONCE in `settings.json`, so a
+  fixed `--tenant` serves one of four identities;
+- `memory_lib.sh` fires `engram-index --slug <slug>` backgrounded with its output
+  discarded, so the refusal surfaced as memories silently no longer being indexed.
+
+So the rule is now: **where a store can be named, the identity is determined.** The
+slug→tenant mapping is operator-declared and total, so naming a store has exactly
+one right answer and no way to pick wrongly. `--tenant` is needed only where no
+store can be determined, and cross-checks when both are given. A store no tenant
+claims is still refused rather than adopted, and there is still no default *tenant*
+when none can be derived.
+
+### Fixed — found by deploying it
+
+- **`--group` to an old recall script corrupted the query**, rather than being
+  ignored: its parser folded the flag's value into the search text, so "qdrant
+  embedding space" became "qdrant embedding space canonical". Results still came
+  back, for a polluted query, with visibly different ranking. The legacy path now
+  sends no `--group` at all; a named tenant does, and the reply must echo the group
+  it filtered on or the leg is refused. The regression test asserts the child's
+  argv, because every fixture implements the new parser and none could see it.
+- **`memory_graph_recall.py` imported `engram_tenant` before `mg_config` had set
+  `sys.path`**, so the Graphiti child died with `ModuleNotFoundError` under a named
+  tenant. The script now resolves its own module path instead of depending on
+  import order.
+- **`/api/v1/index/status` and `/api/v1/recall` disagreed** about which identity the
+  server served: one resolved the tenant directly and refused on a tenanted
+  install while the other derived it and worked. One process, two answers.
+- **The engram-api unit sets no `HOME`**, so the environment-derived store was `-`
+  (the slugification of `/`). A service has no project directory to derive an
+  identity from; `install.sh` now writes `ENGRAM_TENANT` into `daemon.env` when a
+  tenant owns the install's slug, and the live unit carries a drop-in.
+- **`graph_sync.py` read one store from the environment and `graph_sync`/the
+  wrapper dropped the scope**, so insert, export and reconcile all operated on
+  whichever store `$HOME` named and reported success for the rest. All three are
+  now per-tenant, with `--slug`/`--tenant` forwarded through
+  `engram-graph-sync`.
+
+- **The per-prompt budget starved the leg that was already finished.** The hook
+  wraps the whole recall in `recall.inject.timeout_ms`, so a queued embedding
+  request consumed the entire 2.5s and the prompt got NOTHING — discarding a BM25
+  result computed in ~66ms from markdown on disk. This went from rare to routine
+  with tenancy: the daemon now indexes one store per tenant, so the embedding
+  endpoint sees far more load than when it owned a single store. Every prompt
+  timed out at exactly 2.515s with zero results while a direct embedding call
+  took 0.6s. The vector leg now gets its own deadline — a fraction of the prompt
+  budget — so recall degrades to keyword + graph instead of to silence, and says
+  so in the leg status.
+
+### Migration result
+
+- 71 Qdrant points copied to `engram_memory__homelab`, verified; source collection
+  left intact, plus a Qdrant snapshot taken beforehand.
+- 955 Graphiti nodes and 899 relationships relabelled `canonical` → `homelab`. A
+  relabel rather than a re-insert because all of it derived from one store — the
+  re-insert path remains as the refusal branch, verified by planting a colliding
+  filename in two tenants' stores against the live graph.
+- 5,239 pre-tenancy native nodes (no `slug`, no `tenant`) left in place, behind
+  `--purge-native`. They are unreachable by every current query.
+- All 12 cross-tenant store pairings refused; the hook injects each identity's own
+  memories, derived from the session's project directory.
+
+### Note
+
+With `graph.backend: graphiti_compat` the keyword and vector legs are disabled by
+design, so a tenant whose Graphiti group is not yet populated returns NO results
+from `engram-recall` until its graph is synced. Before tenancy those queries hit
+the shared group and returned another project's data, so this is the leak closing
+rather than a regression — but the three new tenants need an index build (the
+daemon now does this per tenant). The prompt hook is unaffected: it uses fast mode,
+which runs BM25 over the markdown store.
+
+## Unreleased — multi-tenant agent identities (stage 2: migration)
+
+`engram-tenant-migrate` moves a pre-tenancy install onto tenants. Dry run by
+default; refuses rather than guesses.
+
+### What it does, and why each step differs
+
+- **Qdrant** points are COPIED into the tenant's collection with their vectors
+  carried across verbatim, not re-embedded. Re-embedding 71 points is cheap, but
+  it is also how an index quietly changes meaning: the vectors came from whatever
+  model was configured when they were written, and the job is to move them, not
+  reinterpret them. Point ids are a uuid5 of `slug::file`, so a re-run upserts
+  rather than duplicating, and the source collection is left intact for the
+  operator to drop once recall is verified.
+- **Graphiti** data is RELABELLED to the tenant's group — but only once exactly
+  one tenant is shown to own the group's episodes. `Episodic` records a bare
+  filename and no slug, so attribution is "which owned store holds a file by
+  this name": one holder is normal, zero is a deleted memory, and two is
+  undecidable. Entity nodes are shared across episodes, so an entity named by two
+  identities is ONE node with ONE group that no update can divide — the tool
+  refuses and points at a per-tenant re-insert from `graph/extractions/`.
+- **Pre-tenancy native nodes** are DELETED, behind `--purge-native`. They carry
+  neither `slug` nor `tenant`, and every native statement now requires both, so
+  no query can reach them. The markdown store is authoritative; `--rebuild`
+  regenerates the index.
+
+### Corrected from the stage 1 notes
+
+The earlier changelog said the Graphiti migration had to be a re-insert because
+entity nodes are shared. That reasoning holds in general and does not apply to
+this install: all 884 entities, 71 episodes and 899 relationships sit in
+`canonical` and all derive from a single store, so there is nothing to split and
+a relabel is exact and free. The re-insert path is still implemented as the
+refusal branch, for the case where a group genuinely spans identities.
+
+### Guards
+
+- Refuses while any store on disk belongs to no tenant, and names them. A store
+  no tenant owns has no collection to be written to, and adopting it into
+  whichever tenant happens to be running would put one identity's memories inside
+  another's boundary.
+- Reports slugs declared in the config with no store on disk, which otherwise
+  look like a tenant that simply has no memories yet.
+- Verifies the destination point count against the source before reporting
+  success, while the source is still intact.
+- Migration Cypher is exempt from the per-statement tenant check — crossing
+  groups is its purpose — so it carries a POSITIVE requirement instead: a test
+  asserts no migration statement selects its rows by nothing, and that anything
+  writing a group binds the group it writes. An exemption that only subtracts a
+  check is how the earlier carve-out hid a live leak.
+
+## Unreleased — multi-tenant agent identities (stage 1)
+
+Groundwork for a multi-tenant Obsidian wiki corpus. This stage adds the tenant
+model and its enforcement, and in doing so closes a cross-tenant leak that was
+already live.
+
+### Fixed — the graph leg crossed projects
+
+- **Graphiti had no partition at all.** Every memory in every store was inserted
+  with the single literal `group_id = "canonical"` (`graph/mg_config.py`), and
+  `graph/memory_graph_recall.py` filtered by neither group nor slug. With 11
+  populated stores sharing that group, a recall run from one project could return
+  another project's facts. The group is now resolved per identity on both the
+  read and write paths, and the 1-hop `LINKS_TO` neighbour query scopes BOTH ends
+  of the hop — scoping only one would leak a neighbour's name through an edge.
+- **The test that should have caught it had a carve-out that exempted it.** The
+  Cypher scope guard in `crates/engram-graph` skipped any statement not
+  containing `Engram`, commented "scoped by Graphiti itself" — which was false.
+  Removed, and the guard is now per-PATTERN rather than per-statement.
+- **`EngramEntity` nodes were global.** `MERGE (e:EngramEntity {name: name})`
+  carried no slug, so entity nodes were shared across every store and identity.
+  The old guard passed it because the surrounding statement mentioned `$slug`
+  somewhere. Nothing read those nodes, so it never surfaced — it would have the
+  moment anything traversed `MENTIONS` or `SUBJECT`. Found by the new guard.
+- **`--only` swallowed the next flag's value** in `memory_graph_insert.py`: it
+  collected every non-`--` argument after `--only`, so `--only a.md --tenant work`
+  asked for a memory named "work" and reported nothing to insert.
+- **`memory_graph_recall.py` folded flag values into the search query.** Its
+  parser rebuilt the query from every argument not starting with `--`, excluding
+  only `--k`'s value by a string comparison. Any other flag's value joined the
+  query text. Now parsed properly, with value-taking flags declared.
+
+### Added — tenants
+
+- **`engram-tenant` crate and `bin/engram_tenant.py`**, the two halves of one
+  model, pinned against each other by `tests/test_tenant_parity.py` — the same
+  treatment the embedding fingerprint gets, for the same reason: Python writes
+  the indexes and Rust reads them, and a disagreement is not an error but an
+  index that looks empty.
+- **A `tenants:` block** in `engram.yaml` mapping an identity to the memory
+  stores it owns and the vault it reads. An absent block means tenancy is off and
+  behaviour is unchanged — the upgrade path. Declaring even one tenant makes
+  `--tenant` required on every binary, including when only one exists.
+- **Isolation in the type system.** The configuration is a single shared file, so
+  every process holds every vault path; discipline is not enough. A `Tenant` is
+  the only thing that can name a collection, a graph group or a vault path, and
+  a `GraphScope` — obtainable only from a `Tenant`, and refused for a slug it
+  does not own — is required by every graph call. Omitting the scope is a compile
+  error rather than a silent cross-tenant read.
+- **A collection per tenant** (`engram_memory__<name>`, `engram_wiki__<name>`)
+  rather than one collection plus a mandatory filter, so a cross-tenant read
+  requires naming the other collection. `QdrantClient::from_config` is gone;
+  there is no constructor that picks a collection by itself.
+- **Vault containment**, canonicalized before the check so a symlink pointing at
+  another tenant's vault is refused — a leak below the level any database filter
+  can see. Agent writes are confined again, to `agent_subtree`.
+- **`--tenant` on every binary**, and a per-tenant daemon loop with per-tenant
+  error isolation, so one identity's unreachable backend does not stop the others.
+
+### Changed — breaking
+
+- **`graph.backend: native` indexes need a rebuild**: node identity now includes
+  the tenant.
+- **Moving existing stores into tenants requires a migration.** Qdrant points
+  must be reindexed into the per-tenant collection and Graphiti episodes
+  re-inserted under the new group — re-inserted, not relabelled, because Graphiti
+  `Entity` nodes are shared across episodes and no `SET` can split one. Cached
+  extractions in `graph/extractions/` mean this costs no LLM calls.
+- **`engram-vector-search --space` is now required.** It was optional, which made
+  searching without pinning an embedding space the shorter command — and that
+  returns confident nonsense rather than an error.
+- **`QdrantClient::search` takes a `Scope`** instead of two `Option`s. The space
+  is no longer expressible as absent; it was an `Option` that one call site
+  happened to fill in, which is a guarantee resting on a call site.
+
+### Known limitations
+
+- The legacy keyword leg rides Graphiti's `edge_name_and_fact` fulltext index,
+  which cannot be partitioned — it ranks across every group and applies its limit
+  before any group filter. The leg over-fetches 20× and filters, bounding the
+  problem without solving it: a tenant holding under ~1/20th of the indexed edges
+  can still be crowded out. The other legs do not share the defect, so recall
+  degrades rather than leaking.
+- `engram-app` serves one identity per process, from `--tenant` at startup. An
+  operator wanting to inspect two tenants runs two instances or uses the CLI; a
+  per-request tenant parameter would turn a loopback dashboard into a way to read
+  any identity's memories over HTTP.
+
+### Found by running it, not by testing it
+
+Passing `--group` to the *installed* (older) `memory_graph_recall.py` did not get
+ignored as assumed — its parser folded the value into the query, so a search for
+"qdrant embedding space" became a search for "qdrant embedding space canonical".
+Recall still returned results, for a polluted query, on every install that had not
+refreshed its scripts. The legacy path now sends no `--group` at all (a new script
+defaults to that group anyway); a named tenant does send it, and there the reply
+must echo the group it filtered on or the leg is refused. No unit test could have
+caught this — every fixture implements the new parser — so the regression test
+asserts the child's argv rather than its records.
+
 ## Unreleased — PR #34 stabilization (Rust foundation + Graphiti compatibility)
 
 Remediation of the PR #34 review. The theme: the Rust layer was written against one

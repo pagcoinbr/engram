@@ -16,8 +16,8 @@ so the vector space matches the graph's exactly — no second embedding stack.
   list/stats. One point per `.md` (deterministic uuid5 id → upsert, not duplicate).
 - `vector_sync.py` — sha-synced orchestrator: `--insert [--only F]` / `--rebuild` /
   `--delete F` / `--status`. No-op when disabled.
-- `vector_mcp_server.py` — `engram-vector` MCP: `memory_vector_recall` /
-  `memory_vector_search` / `memory_vector_stats`.
+- `vector_mcp_server.py` — `engram-vector` MCP: `memory_vector_search` /
+  `memory_vector_stats` (raw inspection; recall is served by `engram-rust`).
 - `docker-compose.yml` — `qdrant/qdrant`, bound to `127.0.0.1:6333` only.
 - `smoke_test.py` — end-to-end round-trip against a throwaway collection.
 
