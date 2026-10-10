@@ -66,14 +66,20 @@ def _store_slugs() -> list:
 
 
 def _owner_slug(fname: str, want_sha, slugs: list):
-    """Which store a done/extracted file belongs to. Prefer the store whose copy
-    hashes to the sha recorded when the file was inserted (so a same-named file in
-    two stores is assigned to the one it actually came from); fall back to the
-    sole/first store that has a file by that name. ``None`` if no store has it."""
+    """Which store a done/extracted file belongs to, or ``None`` to leave it
+    unassigned (orphan). A single store holding the file is unambiguous. When
+    SEVERAL stores hold a same-named file, assign it to the one whose copy hashes
+    to the sha recorded at insert time; if a sha was recorded but matches NONE of
+    them (the file was edited in every store since), orphan it rather than guess
+    ``candidates[0]`` — a wrong guess files "done" under the wrong store and the
+    real owner later re-inserts it as a duplicate episode. With no recorded sha to
+    disambiguate, fall back to the first candidate (best effort)."""
     projects = _projects()
     candidates = [s for s in slugs if (projects / s / "memory" / fname).is_file()]
     if not candidates:
         return None
+    if len(candidates) == 1:
+        return candidates[0]            # only one store has it: unambiguous
     if want_sha:
         for s in candidates:
             try:
@@ -81,7 +87,8 @@ def _owner_slug(fname: str, want_sha, slugs: list):
                     return s
             except OSError:
                 pass
-    return candidates[0]
+        return None                     # several candidates, sha matched none: don't guess
+    return candidates[0]                # no sha to disambiguate: best effort
 
 
 def migrate_legacy(here: Path) -> list:
@@ -183,6 +190,16 @@ def migrate_legacy(here: Path) -> list:
             except OSError:
                 pass
         notes.append(f"orphans dropped: {orphans}; extractions moved: {moved}")
+        # This splits the on-disk INGEST STATE only. The Qdrant points and Graphiti
+        # nodes still carry their pre-tenancy collection/group until `engram-tenant-
+        # migrate` regroups them. Until that runs, historical episodes stay marked
+        # "done" here (so `--insert` won't re-add them under the tenant group) yet
+        # live in the old `canonical` group — invisible to the tenant's recall. On a
+        # multi-tenant upgrade, run `engram-tenant-migrate` alongside/after this.
+        if per:
+            notes.append("NOTE: run `engram-tenant-migrate` to regroup Qdrant/Graphiti "
+                         "data, or historical facts stay in the legacy group and recall "
+                         "won't see them.")
         return notes
     finally:
         try:

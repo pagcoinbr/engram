@@ -84,10 +84,13 @@ async def memory_neighbors(entity: str) -> str:
 async def memory_stats() -> str:
     """Counts of memories (episodes), entities, and facts in the memory graph."""
     g = await _graph()
+    # OPTIONAL MATCH so a fresh/empty tenant returns zeros rather than no rows at
+    # all: a plain MATCH on a group with no entities yields an empty result set,
+    # and recs[0] would then IndexError out of the tool for every new tenant.
     recs, _, _ = await g.driver.execute_query(
-        "MATCH (e:Episodic {group_id:$grp}) WITH count(e) AS eps "
-        "MATCH (n:Entity {group_id:$grp}) WITH eps, count(n) AS ents "
-        "MATCH ()-[r:RELATES_TO {group_id:$grp}]->() "
+        "OPTIONAL MATCH (e:Episodic {group_id:$grp}) WITH count(e) AS eps "
+        "OPTIONAL MATCH (n:Entity {group_id:$grp}) WITH eps, count(n) AS ents "
+        "OPTIONAL MATCH ()-[r:RELATES_TO {group_id:$grp}]->() "
         "RETURN eps AS episodes, ents AS entities, count(r) AS facts", grp=_active_group())
     r = recs[0]
     return f"episodes={r['episodes']} entities={r['entities']} facts={r['facts']}"

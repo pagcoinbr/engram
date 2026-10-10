@@ -2042,10 +2042,14 @@ pub fn wiki_write(
     if mode == WriteMode::Append && target.exists() {
         // Append must NOT read-modify-rename the whole file: two concurrent appends
         // would each read the old content and the last rename would silently discard
-        // the other's addition. Open with O_APPEND so every write lands atomically at
-        // the current end of file and no append can be lost. The separator is decided
-        // from a cheap last-byte read — a stale read only adds or omits one blank
-        // line, it can never lose data the way the whole-file replace did.
+        // the other's addition. Open with O_APPEND, under which each write() syscall
+        // seeks to EOF atomically, so no append is ever lost. Separator and body are
+        // concatenated into ONE write_all so they are not split by a concurrent
+        // append; a note large enough for the kernel to split one write_all into
+        // several syscalls could still interleave with another concurrent large
+        // append (no data loss, only ordering) — fine for hand-sized notes. The
+        // separator is decided from a cheap last-byte read — a stale read only adds or
+        // omits one blank line, it can never lose data the way the whole-file replace did.
         let ends_with_newline = {
             use std::io::{Read, Seek, SeekFrom};
             std::fs::File::open(&target)
@@ -2065,8 +2069,8 @@ pub fn wiki_write(
             .append(true)
             .open(&target)
             .map_err(|error| format!("{relative}: {error}"))?;
-        file.write_all(separator.as_bytes())
-            .and_then(|_| file.write_all(safe.as_bytes()))
+        let payload = format!("{separator}{safe}");
+        file.write_all(payload.as_bytes())
             .and_then(|_| file.sync_all())
             .map_err(|error| format!("{relative}: {error}"))?;
         if let Ok(dir) = std::fs::File::open(parent) {

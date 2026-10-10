@@ -233,17 +233,26 @@ def keyword_leg(query: str, k: int, mtype: str = "") -> list[tuple]:
         return []
 
 
-def graph_group(tenant: str = None) -> str:
+def graph_group(tenant: str = None, cfg: dict = None) -> str:
     """The Graphiti group_id for the active identity.
 
     Every memory was inserted under one literal group, so an unscoped graph query
     returns another project's facts. Resolved through engram_tenant so the Python
-    and Rust recall paths partition identically; on an install with no `tenants:`
-    block this is the historical group and nothing changes.
+    and Rust recall paths partition identically.
+
+    On an install with NO `tenants:` block this is the historical `canonical`
+    group — returned directly, so a stray `ENGRAM_TENANT` in the hook's environment
+    cannot make `resolve()` raise (and silently empty the graph leg). When tenancy
+    IS configured the tenant must resolve: there is no safe fallback, because the
+    shared `canonical` group spans every project. `cfg` is threaded through to avoid
+    a redundant config reload and to resolve against the caller's exact config.
     """
     import engram_tenant
 
-    return engram_tenant.resolve(requested=tenant).graph_group
+    cfg = cfg if cfg is not None else memory_ai.load()
+    if not engram_tenant.tenancy_enabled(cfg):
+        return engram_tenant.LEGACY_GRAPH_GROUP
+    return engram_tenant.resolve(cfg, tenant).graph_group
 
 
 def _recall_tenant(slug: str, cfg: dict) -> tuple[bool, str | None]:
@@ -263,7 +272,7 @@ def _recall_tenant(slug: str, cfg: dict) -> tuple[bool, str | None]:
 
 
 def graph_recall_leg(query: str, k: int, mtype: str = "", timeout: int = 120,
-                     tenant: str = None) -> list[dict]:
+                     tenant: str = None, cfg: dict = None) -> list[dict]:
     """Full graphiti hybrid search, out-of-process in the graph venv. Seconds, not
     milliseconds — for interactive recall, never for the prompt hook."""
     script = ENGRAM_GRAPH / "memory_graph_recall.py"
@@ -272,7 +281,7 @@ def graph_recall_leg(query: str, k: int, mtype: str = "", timeout: int = 120,
     py = GRAPH_PY if Path(GRAPH_PY).exists() else sys.executable
     try:
         r = subprocess.run([py, str(script), query, "--k", str(k),
-                            "--group", graph_group(tenant), "--json"],
+                            "--group", graph_group(tenant, cfg), "--json"],
                            capture_output=True, text=True, timeout=timeout)
         if r.returncode or not r.stdout.strip():
             return []
@@ -327,7 +336,7 @@ def _neo4j_http() -> tuple[str, str]:
 
 
 def graph_facts(query: str, max_facts: int = 6, max_tokens: int = 32,
-                timeout: float = 5.0, tenant: str = None) -> list[str]:
+                timeout: float = 5.0, tenant: str = None, cfg: dict = None) -> list[str]:
     """The cheap graph leg: 1-hop RELATES_TO facts for entities named in the query.
     One HTTP round trip for all tokens (UNWIND), so cost is flat in token count.
     The cap is generous on purpose: at 6, prose prompts spent it on filler words
@@ -356,7 +365,7 @@ def graph_facts(query: str, max_facts: int = 6, max_tokens: int = 32,
                          "AND r.invalid_at IS NULL AND r.expired_at IS NULL "
                          "RETURN r.fact AS fact LIMIT $lim",
             "parameters": {"names": tokens, "lim": max_facts,
-                           "grp": graph_group(tenant)}}]},
+                           "grp": graph_group(tenant, cfg)}}]},
             {"Authorization": auth}, timeout)
         rows = res["results"][0]["data"]
         return [r["row"][0] for r in rows if r["row"] and r["row"][0]][:max_facts]
@@ -391,12 +400,12 @@ def recall(query: str, k: int = 6, mtype: str = "", fast: bool = False,
                 "sources_used": [], "warning": f"slug {slug!r} is claimed by no tenant"}
     want = max(k * 2, 10)
     keyword_pairs = keyword_leg(query, want, mtype)
-    graph_records = [] if fast else graph_recall_leg(query, want, mtype, tenant=tenant)
+    graph_records = [] if fast else graph_recall_leg(query, want, mtype, tenant=tenant, cfg=cfg)
     # Facts are group-scoped by tenant (see graph_facts). On a tenanted install that
     # is the isolation boundary; on a legacy/untenanted install the single canonical
     # group spans every project, so only read it when on the pinned store (main's
     # guard). Pass the resolved tenant either way.
-    facts = (graph_facts(query, timeout=timeout, tenant=tenant)
+    facts = (graph_facts(query, timeout=timeout, tenant=tenant, cfg=cfg)
              if fast and (enabled or slug == pinned_slug()) else [])
     # Embed the query ONCE. The graphiti graph leg (graph_recall_leg) runs its own
     # dense semantic search, so an independent Qdrant vector_leg here re-embeds the
