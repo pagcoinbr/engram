@@ -41,15 +41,44 @@ if str(Path.home() / ".claude") not in sys.path:
     sys.path.append(str(Path.home() / ".claude"))
 import engram_llm  # generation routed by backend (ollama | claude)
 import memory_ai   # config loader, for the per-attempt temperature override
+import mg_state     # per-slug scoping of the extraction cache + insert/sync state
 
 
 def _slug() -> str:
+    """Which store to sync. --slug wins, then the environment, then $HOME.
+
+    A flag is needed because a tenanted host has several stores and this script
+    is invoked once per store by the daemon; deriving from the environment alone
+    meant every tenant's pass read the same directory.
+    """
+    a = sys.argv[1:]
+    if "--slug" in a:
+        i = a.index("--slug")
+        if i + 1 < len(a) and not a[i + 1].startswith("--"):
+            return a[i + 1]
     return os.environ.get("CLAUDE_MEMORY_SLUG") or str(Path.home()).replace("/", "-")
 
-MEM_DIR = Path.home() / ".claude" / "projects" / _slug() / "memory"
-EXTRACT_DIR = HERE / "extractions"
-INSERT_STATE = HERE / "insert_state.json"
-SYNC_STATE = HERE / "sync_state.json"          # file -> sha256(.md) last INSERTED (written by memory_graph_insert.py)
+
+def _tenant():
+    """The identity to insert as, or None on a pre-tenancy install.
+
+    Passed through to memory_graph_insert.py, which refuses to write without it
+    once tenants are configured — writing into the shared group is what made the
+    graph leg cross projects.
+    """
+    a = sys.argv[1:]
+    if "--tenant" in a:
+        i = a.index("--tenant")
+        if i + 1 < len(a) and not a[i + 1].startswith("--"):
+            return a[i + 1]
+    return os.environ.get("ENGRAM_TENANT") or None
+
+_SLUG = _slug()
+MEM_DIR = Path.home() / ".claude" / "projects" / _SLUG / "memory"
+# Per-slug (state/<slug>/…): the daemon runs this once per store, so a shared
+# cache/state made an insert for one store skip another store's files and
+# re-extract them every cycle — a 24/7 local-LLM loop. See mg_state.
+EXTRACT_DIR, INSERT_STATE, SYNC_STATE = mg_state.paths(HERE, _SLUG)
 SPEC = HERE / "extract_spec.md"
 
 # graphiti lives in an isolated venv; run the insert/export/reconcile subprocesses
@@ -126,7 +155,7 @@ def extract(md_path: Path) -> dict:
 
 
 def cmd_insert(limit=None):
-    EXTRACT_DIR.mkdir(exist_ok=True)
+    EXTRACT_DIR.mkdir(parents=True, exist_ok=True)   # state/<slug>/extractions
     done, sync, files = _done_files(), _load_sync(), _store_files()
     new = [p for p in files if p.name not in done]
     changed = [p for p in files if p.name in done and sync.get(p.name) != _sha(p)]
@@ -155,7 +184,16 @@ def cmd_insert(limit=None):
         print("[sync] nothing extracted; skipping insert")
         return
     print(f"[sync] inserting {len(extracted)} memory(ies) into the graph...")
-    r = subprocess.run([GRAPH_PY, str(HERE / "memory_graph_insert.py"), "--only", *extracted])
+    _t = _tenant()
+    # Tell the insert child WHICH store these extractions came from. Without this it
+    # fell back to the $HOME-derived default slug, read the wrong MEM_DIR, and
+    # `skip (no .md)`-ed every file of every non-default store — never stamping
+    # "done", so the extractor above re-ran forever. Pass --slug AND the env so the
+    # child's MEM_DIR and per-slug state match this run exactly.
+    env = {**os.environ, "CLAUDE_MEMORY_SLUG": _SLUG}
+    r = subprocess.run([GRAPH_PY, str(HERE / "memory_graph_insert.py"), "--slug", _SLUG]
+                       + (["--tenant", _t] if _t else [])
+                       + ["--only", *extracted], env=env)
     if r.returncode:
         print(f"[sync] insert exited {r.returncode}", file=sys.stderr)
         sys.exit(r.returncode)
@@ -187,6 +225,13 @@ def cmd_status():
 
 def main():
     a = sys.argv[1:]
+    if "--migrate-state" in a:
+        notes = mg_state.migrate_legacy(HERE)
+        print("\n".join(notes) if notes else "[migrate] nothing to migrate (already per-slug)")
+        return
+    # Fold any pre-tenancy flat state into per-slug dirs before reading it. Idempotent
+    # and flock-guarded, so it is a no-op once done and safe across concurrent runs.
+    mg_state.migrate_legacy(HERE)
     if "--status" in a:
         return cmd_status()
     if "--insert" in a:

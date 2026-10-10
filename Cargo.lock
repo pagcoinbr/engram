@@ -294,7 +294,9 @@ dependencies = [
  "engram-retrieval",
  "engram-secrets",
  "engram-store",
+ "engram-tenant",
  "engram-vector",
+ "engram-wiki",
  "libc",
  "regex",
  "serde",
@@ -324,6 +326,7 @@ dependencies = [
  "clap",
  "engram-config",
  "engram-paths",
+ "engram-tenant",
  "reqwest",
  "serde",
  "serde_json",
@@ -340,8 +343,11 @@ dependencies = [
  "engram-models",
  "engram-paths",
  "engram-retrieval",
+ "engram-secrets",
  "engram-store",
+ "engram-tenant",
  "engram-vector",
+ "engram-wiki",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -387,18 +393,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-tenant"
+version = "0.1.0"
+dependencies = [
+ "engram-config",
+ "engram-paths",
+ "serde_yaml",
+ "thiserror",
+]
+
+[[package]]
 name = "engram-vector"
 version = "0.1.0"
 dependencies = [
  "clap",
  "engram-config",
  "engram-models",
+ "engram-tenant",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "engram-wiki"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

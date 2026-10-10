@@ -13,6 +13,12 @@ struct Args {
     password: String,
     #[arg(long)]
     query: String,
+    /// Graphiti `group_id` to search. Required: engram wrote every memory into
+    /// one literal group before tenancy, so an unpartitioned query here reads
+    /// every identity's facts. Pass `canonical` for a pre-tenancy graph, or the
+    /// tenant name otherwise.
+    #[arg(long)]
+    group: String,
 }
 #[tokio::main]
 async fn main() {
@@ -21,12 +27,16 @@ async fn main() {
         .query
         .split_whitespace()
         .filter(|word| word.len() >= 4)
-        .take(32)
+        .take(6)
         .map(str::to_string)
         .collect::<Vec<_>>();
+    // `unchecked` because this binary has no engram.yaml to resolve a tenant
+    // from — see GraphScope::unchecked. The operator owns the correctness of
+    // --group here; the scope still partitions the query.
+    let scope = engram_tenant::GraphScope::unchecked(&args.group, "");
     let result = async {
         GraphClient::new(&args.uri, &args.database, args.user, args.password)?
-            .facts_for_tokens(&tokens, 6)
+            .facts_for_tokens(&scope, &tokens, 6)
             .await
     }
     .await;

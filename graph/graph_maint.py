@@ -31,13 +31,20 @@ from pathlib import Path
 logging.getLogger("neo4j").setLevel(logging.ERROR)
 logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 
-from mg_config import build_graphiti, CANONICAL_GROUP
+from mg_config import build_graphiti, group_from_argv
+import mg_state     # per-slug scoping; must agree with graph_sync.py / memory_graph_insert.py
+
+# The Graphiti group_id for the identity this run belongs to, resolved once.
+# Was the shared literal CANONICAL_GROUP, which is why one project's
+# maintenance pass could touch another's data.
+CANONICAL_GROUP = group_from_argv()
 
 HERE = Path(__file__).resolve().parent
-SLUG = os.environ.get("CLAUDE_MEMORY_SLUG") or str(Path.home()).replace("/", "-")
+SLUG = mg_state.slug_from_argv_env()
 MEM_DIR = Path.home() / ".claude" / "projects" / SLUG / "memory"
-INSERT_STATE = HERE / "insert_state.json"
-SYNC_STATE = HERE / "sync_state.json"
+# Per-slug, matching graph_sync.py / memory_graph_insert.py — maintenance must act
+# on the SAME store's state the ingest wrote, not a shared flat copy.
+EXTRACT_DIR, INSERT_STATE, SYNC_STATE = mg_state.paths(HERE, SLUG)
 AUDIT = HERE / "graph_maint_audit.jsonl"
 
 
@@ -234,7 +241,7 @@ async def backfill_mentions(g, apply):
         RETURN f AS file, u AS uuid""", grp=CANONICAL_GROUP)
     todo, linked, missing_json = list(r), 0, 0
     for row in todo:
-        jf = HERE / "extractions" / (row["file"][:-3] + ".json")
+        jf = EXTRACT_DIR / (row["file"][:-3] + ".json")
         if not jf.exists():
             missing_json += 1
             continue
@@ -304,6 +311,9 @@ async def prune_isolated_entities(g, apply):
 
 async def main():
     a = sys.argv[1:]
+    # Safety net: fold legacy flat state into per-slug dirs before touching it
+    # (idempotent, flock-guarded; normally already done by the ingest).
+    mg_state.migrate_legacy(HERE)
     apply = "--apply" in a
     allj = "--all" in a
     if not apply:

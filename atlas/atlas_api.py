@@ -39,6 +39,40 @@ app = base.app
 if (DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="atlas-assets")
 
+# LLM-call audit module, loaded from ENGRAM_BIN so the UI reads exactly the engine's
+# schema. NON-FATAL: a missing or older installed copy must degrade to "unavailable",
+# never break atlas startup. A unique module name avoids clashing with the engine's.
+_audit = None
+try:
+    _audit_spec = importlib.util.spec_from_file_location(
+        "engram_llm_audit_atlas", ENGRAM_BIN / "engram_llm_audit.py")
+    if _audit_spec and _audit_spec.loader:
+        _audit_mod = importlib.util.module_from_spec(_audit_spec)
+        sys.modules[_audit_spec.name] = _audit_mod
+        _audit_spec.loader.exec_module(_audit_mod)
+        if all(hasattr(_audit_mod, fn) for fn in ("tail", "detect_loops")):
+            _audit = _audit_mod
+except Exception:
+    _audit = None
+
+# Tenant model, loaded from ENGRAM_BIN the same NON-FATAL way: atlas groups projects
+# and links to SilverBullet by tenant, but a missing/older engram_tenant.py must leave
+# atlas running untenanted rather than failing startup. The Rust API is single-tenant
+# per process and lists no tenants, so this is the only source of the tenant set.
+_tenant = None
+try:
+    _tenant_spec = importlib.util.spec_from_file_location(
+        "engram_tenant_atlas", ENGRAM_BIN / "engram_tenant.py")
+    if _tenant_spec and _tenant_spec.loader:
+        _tenant_mod = importlib.util.module_from_spec(_tenant_spec)
+        sys.modules[_tenant_spec.name] = _tenant_mod
+        _tenant_spec.loader.exec_module(_tenant_mod)
+        if all(hasattr(_tenant_mod, fn) for fn in
+               ("names", "resolve", "tenant_of_slug", "tenancy_enabled")):
+            _tenant = _tenant_mod
+except Exception:
+    _tenant = None
+
 _snapshot_cache: dict[str, tuple[float, dict]] = {}
 _model_cache: tuple[float, dict] | None = None
 
@@ -46,34 +80,7 @@ _model_cache: tuple[float, dict] | None = None
 def _project_dirs() -> list[Path]:
     if not PROJECTS_ROOT.exists():
         return []
-    # A store reached through a symlink (e.g. a merged project dir pointing at the
-    # main store) is the SAME memories; listing it again doubled every count.
-    # Real directories first, so the canonical name wins over the alias.
-    seen, out = set(), []
-    for store in sorted(PROJECTS_ROOT.glob("*/memory"), key=lambda p: (p.is_symlink(), p)):
-        if store.is_dir() and store.resolve() not in seen:
-            seen.add(store.resolve())
-            out.append(store.parent)
-    return sorted(out)
-
-
-def _graph_project() -> str:
-    """The store the graph belongs to: the engram.env pin (the legacy graph is one
-    unscoped group built from it; the native graph is keyed by it). "-root" was
-    hard-coded here, which is one particular host's slug: everywhere else every
-    memory showed coverage "unknown" and no shared-entity edge was ever drawn."""
-    try:
-        import memory_recall
-        return memory_recall.pinned_slug() or "-root"
-    except Exception:
-        return "-root"
-
-
-def _graph_backend() -> str:
-    try:
-        return ((base.memory_ai.load().get("graph") or {}).get("backend") or "graphiti_compat").lower()
-    except Exception:
-        return "graphiti_compat"
+    return sorted(p.parent for p in PROJECTS_ROOT.glob("*/memory") if p.is_dir())
 
 
 def _project_label(project_id: str) -> str:
@@ -96,13 +103,41 @@ def _safe_project(project_id: str) -> Path:
     return target
 
 
+def _wiki_suffix(cfg: dict) -> str:
+    """Host suffix for per-tenant SilverBullet (wiki-<tenant>.<suffix>), matching
+    install.sh's SB_HOST_SUFFIX. Configurable via `ui.wiki_host_suffix`."""
+    ui = cfg.get("ui", {}) or {}
+    return str(ui.get("wiki_host_suffix") or "home.arpa").strip().strip(".")
+
+
+def _slug_owner():
+    """Return a slug -> tenant-name lookup, resolved once (config read a single
+    time) so _inventory doesn't reload config per project. Untenanted / module
+    absent -> every slug maps to None."""
+    if _tenant is None:
+        return lambda _slug: None
+    try:
+        cfg = base.memory_ai.load()
+        if not _tenant.tenancy_enabled(cfg):
+            return lambda _slug: None
+        mapping: dict[str, str] = {}
+        for name in _tenant.names(cfg):
+            for slug in _tenant.resolve(cfg, name).slugs:
+                mapping[str(slug)] = name
+        return lambda slug: mapping.get(slug)
+    except Exception:
+        return lambda _slug: None
+
+
 def _inventory(scope: str) -> tuple[list[dict], list[dict]]:
     projects = []
     nodes = []
+    owner = _slug_owner()
     for project_dir in _project_dirs():
         project_id = project_dir.name
         files = _memory_files(project_dir)
-        projects.append({"id": project_id, "label": _project_label(project_id), "count": len(files)})
+        projects.append({"id": project_id, "label": _project_label(project_id),
+                         "count": len(files), "tenant": owner(project_id)})
         if scope != "all" and scope != project_id:
             continue
         for path in files:
@@ -119,19 +154,16 @@ def _inventory(scope: str) -> tuple[list[dict], list[dict]]:
                 "type": meta.get("type", "reference").lower(),
                 "mtime": int(path.stat().st_mtime),
                 "links": sorted(set(x.strip() for x in LINK_RE.findall(raw) if x.strip())),
-                "indexStatus": "unknown" if project_id != _graph_project() else "unindexed",
+                "indexStatus": "unknown" if project_id != "-root" else "unindexed",
             })
     return projects, nodes
 
 
 def _graph_evidence(nodes: list[dict]) -> tuple[list[dict], list[str]]:
     warnings = []
-    graph_project = _graph_project()
-    root_by_file = {n["file"]: n for n in nodes if n["project"] == graph_project}
+    root_by_file = {n["file"]: n for n in nodes if n["project"] == "-root"}
     if not root_by_file:
         return [], warnings
-    if _graph_backend() == "native":
-        return _native_graph_evidence(nodes, root_by_file, graph_project, warnings)
     try:
         episodes = base._graph_query(
             "MATCH (e:Episodic) WHERE e.file IS NOT NULL "
@@ -159,7 +191,7 @@ def _graph_evidence(nodes: list[dict]) -> tuple[list[dict], list[str]]:
         sync_state = {}
     for fname, node in root_by_file.items():
         expected = sync_state.get(fname)
-        path = PROJECTS_ROOT / graph_project / "memory" / fname
+        path = PROJECTS_ROOT / "-root" / "memory" / fname
         if node["indexStatus"] == "indexed" and expected and path.exists():
             actual = hashlib.sha256(path.read_bytes()).hexdigest()
             if actual != expected:
@@ -171,7 +203,6 @@ def _graph_evidence(nodes: list[dict]) -> tuple[list[dict], list[str]]:
     facts = base._graph_query(
         "MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity) "
         "WHERE any(u IN coalesce(r.episodes, []) WHERE u IN $episodes) "
-        "AND r.invalid_at IS NULL AND r.expired_at IS NULL "
         "RETURN a.name AS source, labels(a) AS source_labels, r.name AS relation, "
         "r.fact AS fact, b.name AS target, labels(b) AS target_labels, r.episodes AS episodes",
         episodes=ep_ids,
@@ -189,25 +220,11 @@ def _graph_evidence(nodes: list[dict]) -> tuple[list[dict], list[str]]:
                 "source": fact.get("source"), "relation": fact.get("relation"),
                 "target": fact.get("target"), "fact": fact.get("fact", ""),
             })
-    return _shared_entity_edges(nodes, node_entities), warnings
-
-
-def _shared_entity_edges(nodes: list[dict], node_entities: dict[str, set[str]]) -> list[dict]:
     for node in nodes:
         node["entityCount"] = len(node_entities.get(node["id"], set()))
-    # Hub entities ("user", "gateway", "main") sit in hundreds of memories and say
-    # nothing about how two of them relate; on a 606-memory store the top few alone
-    # made 22k of the edges, a 60 s render and a single hairball. An entity shared
-    # by more than ~2% of the memories is not evidence of a relationship.
-    freq: dict[str, int] = {}
-    for ents in node_entities.values():
-        for entity in ents:
-            freq[entity] = freq.get(entity, 0) + 1
-    cap = max(8, len(node_entities) // 50)
+
     shared_edges = []
-    connected = [(node_id, {e for e in ents if freq[e] <= cap})
-                 for node_id, ents in node_entities.items()]
-    connected = [(node_id, ents) for node_id, ents in connected if ents]
+    connected = [(node_id, ents) for node_id, ents in node_entities.items() if ents]
     for (left, left_entities), (right, right_entities) in itertools.combinations(connected, 2):
         shared = sorted(left_entities & right_entities, key=str.casefold)
         if not shared:
@@ -217,37 +234,7 @@ def _shared_entity_edges(nodes: list[dict], node_entities: dict[str, set[str]]) 
             "id": edge_id, "source": left, "target": right, "kind": "shared_entity",
             "count": len(shared), "entities": shared[:12], "truncated": len(shared) > 12,
         })
-    return shared_edges
-
-
-def _native_graph_evidence(nodes, root_by_file, slug, warnings):
-    """Coverage and shared entities from the Rust native graph (graph.backend:
-    native). A memory with a commit marker is indexed; a node without one is
-    mid-sync or failed (stale); no node at all is unindexed. Entities are the live
-    facts' endpoints (imported legacy facts) plus active triples' subject/object."""
-    try:
-        rows = base._graph_query(
-            "MATCH (m:EngramMemory {slug: $slug}) "
-            "OPTIONAL MATCH (m)-[:HAS_FACT]->(f:EngramFact) WHERE f.valid_until IS NULL "
-            "OPTIONAL MATCH (m)-[:HAS_TRIPLE]->(t:EngramTriple {status: 'active'}) "
-            "WHERE t.valid_until IS NULL "
-            "RETURN m.file AS file, m.sha IS NOT NULL AS current, "
-            "collect(DISTINCT f.subject) + collect(DISTINCT f.object) + "
-            "collect(DISTINCT t.subject) + collect(DISTINCT t.object) AS entities",
-            slug=slug)
-    except Exception:
-        warnings.append("Entity connections are temporarily unavailable.")
-        return [], warnings
-    node_entities: dict[str, set[str]] = {}
-    for node in root_by_file.values():
-        node["indexStatus"] = "unindexed"
-    for row in rows:
-        node = root_by_file.get(row["file"])
-        if not node:
-            continue
-        node["indexStatus"] = "indexed" if row["current"] else "stale"
-        node_entities[node["id"]] = {e for e in row["entities"] if e}
-    return _shared_entity_edges(nodes, node_entities), warnings
+    return shared_edges, warnings
 
 
 def _wiki_edges(nodes: list[dict]) -> list[dict]:
@@ -405,13 +392,6 @@ def _write_config(editable: dict) -> str:
     path = _config_path()
     raw = yaml.safe_load(path.read_text()) or {}
     raw["backend"] = editable["backend"]
-    # A key is bound to its endpoint: if the edit moves `url`, drop the old key
-    # rather than send it to the new host (same rule as the Rust writer). Set the
-    # key for a new endpoint in engram.yaml by hand.
-    for section in ("llama_cpp", "embed"):
-        old, new = raw.get(section) or {}, editable[section]
-        if "url" in new and str(old.get("url") or "").rstrip("/") != str(new["url"] or "").rstrip("/"):
-            old.pop("api_key", None)
     raw.setdefault("llama_cpp", {}).update(editable["llama_cpp"])
     raw.setdefault("embed", {}).update(editable["embed"])
     raw.setdefault("graph", {}).update(editable["graph"])
@@ -424,16 +404,10 @@ def _write_config(editable: dict) -> str:
     now = time.time_ns()
     stamp = f"{now // 1_000_000_000}.{now % 1_000_000_000:09d}.{os.getpid()}"
     backup = backup_dir / f"engram.yaml.{stamp}.bak"
-    # Both files carry every credential in the config: create them 0600 instead of
-    # at the umask default (world-readable) and chmod-ing afterwards.
-    def private(target: Path, data: bytes) -> None:
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-    private(backup, path.read_bytes())
+    backup.write_bytes(path.read_bytes())
     temp = path.with_suffix(f".yaml.{stamp}.tmp")
-    private(temp, yaml.safe_dump(raw, sort_keys=False, allow_unicode=True).encode())
-    os.chmod(temp, path.stat().st_mode & 0o700)
+    temp.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    os.chmod(temp, path.stat().st_mode)
     temp.replace(path)
     return str(backup)
 
@@ -448,8 +422,7 @@ def _request_json(url: str, body: dict | None = None, timeout: float = 3.0) -> d
 def _rust_json(path: str, body: dict | None = None, method: str = "GET") -> dict:
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(f"{RUST_API}{path}", data=data, method=method,
-                                     headers={"Content-Type": "application/json",
-                                              "Authorization": f"Bearer {base.TOKEN}"})
+                                     headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode())
@@ -536,6 +509,62 @@ def atlas_snapshot(project: str = Query("all")):
     snapshot = _build_snapshot(project)
     _snapshot_cache[project] = (time.monotonic(), snapshot)
     return snapshot
+
+
+@app.get("/api/atlas/llm")
+def atlas_llm(limit: int = Query(300, ge=1, le=2000),
+              window: int = Query(300, ge=1, le=86400),
+              repeats: int = Query(3, ge=2, le=100)):
+    """The recent stream of generation calls engram sent to the model, plus groups
+    of identical prompts repeated >= `repeats` times within `window` seconds (an
+    exact-repeat / loop detector). Content-free: digests + metadata only. Degrades
+    to an empty 'unavailable' payload if the audit module or its log is absent."""
+    if _audit is None:
+        return {"events": [], "loops": [], "captured": "unavailable"}
+    events = _audit.tail(limit)
+    return {"events": events,
+            "loops": _audit.detect_loops(events, window, repeats),
+            "captured": "generation calls (python: engram_llm + graphiti)"}
+
+
+@app.get("/api/atlas/tenants")
+def atlas_tenants():
+    """The configured tenants and, for each, the memory stores (slugs) it owns,
+    its Qdrant collections, Graphiti group, vault, memory count, and the URL of
+    its SilverBullet vault (wiki-<name>.<suffix>). Read-only. Degrades to an
+    untenanted payload if the tenant module is absent or no tenants are defined —
+    atlas is fully usable untenanted."""
+    try:
+        cfg = base.memory_ai.load()
+    except Exception:
+        cfg = {}
+    suffix = _wiki_suffix(cfg)
+    if _tenant is None or not _tenant.tenancy_enabled(cfg):
+        return {"enabled": False, "legacy": True, "suffix": suffix, "tenants": []}
+    counts = {project_dir.name: len(_memory_files(project_dir))
+              for project_dir in _project_dirs()}
+    out = []
+    try:
+        for name in _tenant.names(cfg):
+            t = _tenant.resolve(cfg, name)
+            slugs = [str(s) for s in t.slugs]
+            out.append({
+                "name": name,
+                "label": t.label,
+                "slugs": slugs,
+                "vault": str(t.vault) if t.vault else None,
+                "agent_subtree": t.agent_subtree,
+                "extract_facts": bool(t.extract_facts),
+                "memory_collection": t.memory_collection,
+                "wiki_collection": t.wiki_collection,
+                "graph_group": t.graph_group,
+                "count": sum(counts.get(s, 0) for s in slugs),
+                "wiki_url": f"https://wiki-{name}.{suffix}",
+            })
+    except Exception as exc:
+        return {"enabled": True, "legacy": False, "suffix": suffix,
+                "tenants": out, "warning": str(exc)[:180]}
+    return {"enabled": True, "legacy": False, "suffix": suffix, "tenants": out}
 
 
 @app.get("/api/atlas/memory")

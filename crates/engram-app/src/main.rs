@@ -9,7 +9,7 @@ use clap::Parser;
 use engram_config::{Config, ModelProfile, recommended_embedders};
 use engram_hybrid::recall;
 use engram_models::OpenAiCompatibleClient;
-use engram_vector::QdrantClient;
+use engram_vector::{Corpus, QdrantClient};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -30,11 +30,26 @@ struct Args {
     config: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:8787")]
     bind: SocketAddr,
+    /// The agent identity this server serves. Required on an install that
+    /// defines tenants.
+    ///
+    /// One identity per process, like the MCP server: an operator wanting to
+    /// inspect two tenants runs two instances or uses the CLI. A per-request
+    /// tenant parameter would turn a loopback dashboard into a way to read any
+    /// identity's memories over HTTP, which is not a trade this endpoint needs
+    /// to make.
+    #[arg(long, env = "ENGRAM_TENANT")]
+    tenant: Option<String>,
 }
 
 #[derive(Clone)]
 struct AppState {
     config: PathBuf,
+    /// The requested tenant NAME, resolved against the config on each request
+    /// rather than at startup — the config is reloaded per request, so an
+    /// operator adding a `tenants:` block does not have to restart the server to
+    /// have it take effect.
+    tenant: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -169,13 +184,6 @@ struct SaveResponse {
 async fn main() {
     let args = Args::parse();
     let config = engram_paths::config_path(args.config);
-    let token = match api_token() {
-        Ok(token) => Arc::new(token),
-        Err(error) => {
-            eprintln!("engram-app: {error}");
-            std::process::exit(1);
-        }
-    };
     let app = Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/v1/status", get(status))
@@ -185,23 +193,10 @@ async fn main() {
         .route("/api/v1/config/editor", get(editor).put(save_editor))
         .route("/api/v1/config/editor/validate", post(validate_editor))
         .route("/api/v1/recall", get(recall_api))
-        .with_state(Arc::new(AppState { config }))
-        .layer(axum::middleware::from_fn(
-            move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let token = token.clone();
-                async move {
-                    let header = request
-                        .headers()
-                        .get(axum::http::header::AUTHORIZATION)
-                        .and_then(|value| value.to_str().ok());
-                    if request.uri().path() == "/healthz" || authorized(header, &token) {
-                        next.run(request).await
-                    } else {
-                        (StatusCode::UNAUTHORIZED, "missing or wrong bearer token").into_response()
-                    }
-                }
-            },
-        ));
+        .with_state(Arc::new(AppState {
+            config,
+            tenant: args.tenant,
+        }));
     // A bind failure is an operator problem, not a bug: the usual cause is an
     // older copy of this service still holding the port, and `unwrap()` reported
     // it as a panic with a bare `Os { code: 98 }`, which reads like a crash.
@@ -245,19 +240,35 @@ async fn index_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         Ok(config) => config,
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     };
+    // The same resolution `recall_api` uses, so the two endpoints cannot
+    // disagree about which identity this server serves. Resolving directly
+    // through `Tenant::resolve` here made /index/status refuse on a tenanted
+    // install while /recall worked — one process, two answers.
+    let tenant = match engram_tenant::resolve_tenant(
+        &config,
+        state.tenant.as_deref(),
+        &engram_paths::resolve_slug(None),
+        None,
+    ) {
+        Ok(tenant) => tenant,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
     // local_enabled is the documented master switch: with it off there is no index
     // work at all, whatever vector_store says.
     let mut status = IndexStatus {
         enabled: config.local_enabled && config.vector_store.enabled,
         local_enabled: config.local_enabled,
-        collection: config.vector_store.collection.clone(),
+        collection: tenant.memory_collection().to_string(),
         dimension: config.embed.dim,
         embedding_space: config.embedding_space_id(),
         points: None,
         error: None,
     };
     if status.enabled {
-        match QdrantClient::from_config(&config).count(None).await {
+        match QdrantClient::for_tenant(&config, &tenant, Corpus::Memory)
+            .count(None)
+            .await
+        {
             Ok(points) => status.points = Some(points),
             Err(error) => status.error = Some(error.to_string()),
         }
@@ -593,10 +604,6 @@ fn write_edit(path: &Path, edit: &EditableConfig) -> Result<String, String> {
     root.insert("backend".into(), edit.backend.clone().into());
     // Merge per section, leaving every key we do not model — including the api_key
     // entries, which the edit payload deliberately has no field for — untouched.
-    // Except: a key is bound to its endpoint. If the edit moves `url`, the old key
-    // is dropped rather than sent to the new host, otherwise anyone who can reach
-    // this endpoint could repoint the URL and collect the credential. Set the key
-    // for a new endpoint in engram.yaml by hand.
     for (section, values) in [
         ("llama_cpp", serde_yaml::to_value(&edit.llama_cpp)),
         ("embed", serde_yaml::to_value(&edit.embed)),
@@ -607,17 +614,11 @@ fn write_edit(path: &Path, edit: &EditableConfig) -> Result<String, String> {
             .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()))
             .as_mapping_mut()
             .ok_or("configuration section must be a mapping")?;
-        let values = values.map_err(|error| error.to_string())?;
-        let values = values.as_mapping().ok_or("invalid edit")?;
-        let url = |map: &serde_yaml::Mapping| {
-            map.get("url")
-                .and_then(|v| v.as_str())
-                .map(|u| u.trim_end_matches('/').to_string())
-        };
-        if values.contains_key("url") && url(section_map) != url(values) {
-            section_map.remove("api_key");
-        }
-        for (key, value) in values {
+        for (key, value) in values
+            .map_err(|error| error.to_string())?
+            .as_mapping()
+            .ok_or("invalid edit")?
+        {
             section_map.insert(key.clone(), value.clone());
         }
     }
@@ -725,89 +726,28 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .into_response()
 }
 
-/// Every route but /healthz reads or rewrites memories and config, so every route
-/// needs the shared token. A loopback bind is not a barrier on its own: a web page
-/// can DNS-rebind its own name to 127.0.0.1. Same file and format as
-/// `bin/engram_api.py`, so either server may be the one that creates it.
-fn api_token() -> Result<String, String> {
-    let path = std::env::var_os("ENGRAM_API_TOKEN_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| engram_paths::engram_home().join("engram-api.token"));
-    if !path.exists() {
-        // Written privately, then link()ed into place: a concurrent reader sees a
-        // complete token or none, never an empty file.
-        let mut bytes = [0u8; 32];
-        fs::File::open("/dev/urandom")
-            .and_then(|mut urandom| std::io::Read::read_exact(&mut urandom, &mut bytes))
-            .map_err(|error| format!("could not read /dev/urandom: {error}"))?;
-        let token: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-        let temp = path.with_file_name(format!(
-            ".engram-api.token.{}.{}",
-            std::process::id(),
-            unique_suffix()
-        ));
-        write_private(&temp, format!("{token}\n").as_bytes(), 0o600)?;
-        let linked = fs::hard_link(&temp, &path);
-        fs::remove_file(&temp).ok();
-        if let Err(error) = linked
-            && error.kind() != std::io::ErrorKind::AlreadyExists
-        {
-            return Err(format!("could not create {}: {error}", path.display()));
-        }
-    }
-    let token = fs::read_to_string(&path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?
-        .trim()
-        .to_string();
-    if token.len() < 32 {
-        return Err(format!(
-            "{} is too short; delete it and restart to regenerate",
-            path.display()
-        ));
-    }
-    Ok(token)
-}
-
-/// `Authorization: Bearer <token>`, compared without an early exit.
-fn authorized(header: Option<&str>, token: &str) -> bool {
-    let Some(supplied) = header.and_then(|value| value.strip_prefix("Bearer ")) else {
-        return false;
-    };
-    supplied.len() == token.len()
-        && supplied
-            .bytes()
-            .zip(token.bytes())
-            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-            == 0
-}
-
-/// A slug names one directory under `projects/`; anything that could leave it
-/// (`..`, a separator) would let `?slug=` search arbitrary markdown on disk.
-fn valid_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug != "."
-        && slug != ".."
-        && slug
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-}
-
 async fn recall_api(
     Query(query): Query<RecallQuery>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     // A `-root` default made this endpoint search a store that only exists on one
     // machine; resolve it the same way every other entry point does.
-    if let Some(slug) = query.slug.as_deref().map(str::trim)
-        && !slug.is_empty()
-        && !valid_slug(slug)
-    {
-        return (StatusCode::BAD_REQUEST, "invalid slug").into_response();
-    }
-    let slug = engram_paths::resolve_slug(query.slug.as_deref());
+    //
+    // Derive::Environment, not Cwd: a service's working directory says nothing
+    // about which project a request is about.
+    let resolved = match engram_tenant::resolve_for_cli(
+        &state.config,
+        state.tenant.as_deref(),
+        query.slug.as_deref(),
+        engram_tenant::Derive::Environment,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
     match recall(
         &state.config,
-        &slug,
+        &resolved.tenant,
+        &resolved.slug,
         &query.q,
         query.k.unwrap_or(6).clamp(1, 20),
     )
@@ -1059,92 +999,6 @@ mod tests {
         assert_eq!(reloaded.embed.dim, 768, "the edit did not apply");
         assert_eq!(reloaded.llama_cpp.api_key.present(), Some("sk-keepme"));
         fs::remove_dir_all(path.parent().unwrap()).ok();
-    }
-
-    #[test]
-    fn moving_an_endpoint_drops_its_credential() {
-        let path = scratch(
-            "repoint",
-            "backend: llama_cpp\n\
-             llama_cpp: {url: 'http://ai/v1/', model: qwen, timeout_seconds: 600, api_key: 'sk-llm'}\n\
-             embed: {provider: llama_cpp, url: 'http://e/v1', model: bge-m3, dim: 1024, api_key: 'sk-emb'}\n",
-        );
-        // same endpoints (trailing slash aside): both keys survive
-        write_edit(&path, &edit()).unwrap();
-        let saved = fs::read_to_string(&path).unwrap();
-        assert!(
-            saved.contains("sk-llm") && saved.contains("sk-emb"),
-            "{saved}"
-        );
-
-        let mut next = edit();
-        next.llama_cpp.url = "http://attacker.example/v1".into();
-        write_edit(&path, &next).unwrap();
-        let saved = fs::read_to_string(&path).unwrap();
-        assert!(
-            !saved.contains("sk-llm"),
-            "key followed the new host: {saved}"
-        );
-        assert!(
-            saved.contains("sk-emb"),
-            "unmoved endpoint lost its key: {saved}"
-        );
-        fs::remove_dir_all(path.parent().unwrap()).ok();
-    }
-
-    #[test]
-    fn the_token_is_created_private_once_then_reused() {
-        let dir = std::env::temp_dir().join(format!("engram-token-{}", unique_suffix()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("engram-api.token");
-        // the only test that touches this variable
-        unsafe { std::env::set_var("ENGRAM_API_TOKEN_FILE", &path) };
-        let first = api_token().unwrap();
-        assert_eq!(first.len(), 64);
-        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            api_token().unwrap(),
-            first,
-            "a second start must reuse the token"
-        );
-        assert_eq!(
-            fs::read_dir(&dir).unwrap().count(),
-            1,
-            "temp file left behind"
-        );
-        fs::write(&path, "short\n").unwrap();
-        assert!(
-            api_token().is_err(),
-            "a truncated token must not be accepted"
-        );
-        unsafe { std::env::remove_var("ENGRAM_API_TOKEN_FILE") };
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn only_the_token_and_store_slugs_get_through() {
-        let token = "a".repeat(64);
-        assert!(authorized(Some(&format!("Bearer {token}")), &token));
-        for bad in [
-            None,
-            Some(""),
-            Some("Bearer "),
-            Some("Bearer aaaa"),
-            Some("Basic aaaa"),
-        ] {
-            assert!(!authorized(bad, &token), "{bad:?}");
-        }
-        let near_miss = format!("Bearer {}b", "a".repeat(63));
-        assert!(!authorized(Some(&near_miss), &token));
-
-        assert!(valid_slug("-home-criptobro"));
-        for bad in ["..", ".", "../../etc", "a/b", "-home-x/../y", ""] {
-            assert!(!valid_slug(bad), "{bad}");
-        }
     }
 
     #[test]

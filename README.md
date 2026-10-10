@@ -140,9 +140,7 @@ the MCP `memory_recall_hybrid` tool. It also exposes a loopback-only service:
 
 ```bash
 cargo run -p engram-app --bin engram-app -- --config ~/.claude/engram.yaml
-# printf is a shell builtin, so the token never appears in a process's argv
-curl -H @<(printf 'Authorization: Bearer %s' "$(cat ~/.claude/engram-api.token)") \
-  http://127.0.0.1:8787/api/v1/status
+curl http://127.0.0.1:8787/api/v1/status
 cargo run -p engram-app --bin engram-index -- --rebuild
 ```
 
@@ -150,16 +148,6 @@ cargo run -p engram-app --bin engram-index -- --rebuild
 `/api/v1/config/editor` provides revision-protected validation and saves for the
 Atlas configuration screen. The installer places these binaries in
 `~/.claude/rust/` and enables `engram-api.service` for systemd installations.
-
-Both local APIs (this one and the Atlas on `:8765`) require a shared token, created
-0600 at `~/.claude/engram-api.token` by whichever server starts first
-(`ENGRAM_API_TOKEN_FILE` overrides the path). Scripts send
-`Authorization: Bearer <token>` (from a file or stdin, never on the command line,
-where `ps` shows it to every user); in the browser, paste the token into the form
-at `http://127.0.0.1:8765/login` once and an HttpOnly, SameSite=Strict cookie
-takes over. The token is never accepted in a URL. A loopback bind is not a barrier on its own: a web page can
-DNS-rebind its own name to 127.0.0.1. If you expose the Atlas through a reverse
-proxy, terminate TLS there; the token travels on every request.
 
 ---
 
@@ -189,35 +177,11 @@ daemon. Restart Claude Code afterward so it loads the new commands.
 in `~/.claude`, **preserves your `engram.yaml` and your `daemon.env` secrets** (the ccg
 key, the Telegram token), and re-registers the MCP servers without duplicating them.
 
-`update.sh` wraps it with the steps a bare re-run misses, **dry-run by default**:
-
-```bash
-cd engram
-./update.sh            # shows the incoming commits and the plan; changes nothing
-./update.sh --apply    # pull + reinstall + restore overrides + rebuild Atlas + verify
-# then restart Claude Code so it reloads the commands + MCP servers
-```
-
-- **Safe pull:** fast-forward only; refuses a dirty tree, a non-default branch or a
-  diverged one.
-- **Same daemon mode:** re-runs `install.sh --yes --daemon <mode>` with the mode the box
-  already uses (`systemd` when `engram.timer` is enabled, else `none`), so a manual-only
-  box is never switched back to a scheduled one. Override with `--daemon`; pass extra
-  installer flags after `--`.
-- **Local overrides:** every file under `~/.claude/engram-local-overrides/` is copied back
-  over `~/.claude` after the install (e.g. a hand-customised
-  `commands/memory-reformat.md`), which a reinstall would otherwise overwrite.
-- **Atlas and Rust API:** rebuilds the Atlas (`npm ci`, only when `atlas/` changed) and
-  restarts `engram-atlas` / `engram-api` when those user services exist.
-- **Verified:** runs the registered recall hook on a probe prompt and checks the Atlas
-  answers; exits 1 with the rollback command if either fails.
-
-By hand, without the wrapper:
-
 ```bash
 cd engram && git pull            # get the new code
 ./install.sh                     # re-run: refreshes ~/.claude, keeps your config + secrets
 systemctl --user restart engram.timer   # (systemd daemon) pick up the new code
+# then restart Claude Code so it reloads the commands + MCP servers
 ```
 
 Two things to do by hand after an update:
@@ -253,9 +217,9 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 ### Recall — how the right memories reach Claude
 - **Auto-recall** (the `UserPromptSubmit` hook): every prompt gets the memories that match it injected automatically — no waiting for Claude to think of calling a recall tool. Names + one-line descriptions only, **at most once per memory per session**, ~0.3s, fail-open. The installer uses the Rust hook when available. Off with `recall.inject.enabled: false`.
 - **Rust hybrid recall** (`engram-rust` MCP): `memory_recall_hybrid` fuses Markdown, Qdrant, and Neo4j rankings via Reciprocal Rank Fusion. Native triples use a controlled relation taxonomy, temporal state, and confidence quarantine; the legacy Graphiti MCP remains available only while parity evaluation is in progress.
-- **Graph recall** (`engram-graph` MCP): `memory_recall`, `memory_search_facts`, `memory_neighbors`, `memory_stats` — Claude loads only the relevant memories on demand, instead of dumping the whole store into context.
-- **Hybrid recall** (`memory_recall_hybrid`, on `engram-graph`): the best single recall — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename. Each ranker degrades independently; optional `type` filter.
-- **Vector recall** (the optional `engram-vector` MCP): `memory_vector_recall`, `memory_vector_search`, `memory_vector_stats` — dense semantic search via Qdrant. Plus `memory_recall_fused` (vector+keyword) for no-graph installs. Off by default; enable with `./install.sh --vector`.
+- **Hybrid recall** (`memory_recall` / `memory_recall_hybrid`, on the `engram-rust` MCP): the single recall path — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename, embedding the query once. Degrades to keyword+vector when no graph is installed. Each ranker degrades independently; optional `type` filter.
+- **Graph admin** (`engram-graph` MCP): `memory_search_facts`, `memory_neighbors`, `memory_stats` — graph-native lookups. (Recall moved to `engram-rust`; it used to live here too and re-embedded the query.)
+- **Vector inspection** (the optional `engram-vector` MCP): `memory_vector_search`, `memory_vector_stats` — raw dense-search debugging ("is there a memory about X") and index stats via Qdrant. Off by default; enable with `./install.sh --vector`.
 
 - **Local-LLM recall** (`hermes`): if the `hermes` CLI is on `PATH`, the installer also registers the same MCP servers with it, so a **local Ollama model** can recall your memories from the terminal — `hermes -z "recall what you know about X"`. Auto-detected; skip it with `./install.sh --no-hermes`. (Plain `ollama run`/`ollama agent` can't do this — ollama has no MCP client.)
 

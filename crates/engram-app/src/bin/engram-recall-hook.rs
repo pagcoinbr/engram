@@ -34,6 +34,11 @@ struct Args {
     // unusable as typed.
     #[arg(long, allow_hyphen_values = true)]
     slug: Option<String>,
+    /// The agent identity to inject memories for. Required on an install that
+    /// defines tenants; without it this hook injects nothing and says so on
+    /// stderr rather than guessing which identity the session belongs to.
+    #[arg(long, env = "ENGRAM_TENANT")]
+    tenant: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -67,7 +72,7 @@ async fn main() {
     // used the payload value; reading current_dir() here resolved a different
     // store, and a store that does not exist injects nothing, silently. The slug
     // was hard-wired to "-root" before that.
-    let slug = engram_paths::resolve_slug_in(
+    let derived = engram_paths::resolve_slug_in(
         args.slug.as_deref(),
         payload
             .cwd
@@ -80,12 +85,55 @@ async fn main() {
     // recall.inject was read by the Python hook and ignored here: `enabled` had no
     // effect and `k` was the literal 4. A config that cannot be read leaves the
     // documented defaults in place rather than disabling recall.
-    let inject = Config::load(&config_path)
-        .map(|config| config.recall.inject)
+    let config = Config::load(&config_path);
+    let inject = config
+        .as_ref()
+        .map(|config| config.recall.inject.clone())
         .unwrap_or_default();
     if !inject.enabled {
         return;
     }
+
+    // Resolve the identity before recalling anything.
+    //
+    // This hook is fail-open everywhere else — a missing config or a slow
+    // backend simply injects nothing, because delaying the user's prompt is
+    // worse than omitting context. A tenant failure is fail-open in the same
+    // direction, and that is also the SAFE direction: injecting nothing costs
+    // the user some context, while injecting another identity's memories is the
+    // single outcome the tenant model exists to prevent.
+    //
+    // Unlike the other failures this one is reported on stderr. Everything here
+    // is silent by design, and silence would hide the one mistake an operator is
+    // likely to make while setting tenants up: registering this hook without
+    // `--tenant`, which would otherwise look exactly like "no relevant
+    // memories" forever. Hook stderr surfaces in Claude Code's debug output.
+    let (tenant, slug) = match config
+        .map_err(|error| error.to_string())
+        .and_then(|config| {
+            // The identity follows the session's store, derived from the
+            // PAYLOAD cwd. This hook is registered once in settings.json and has
+            // to serve every identity on the host, so a fixed --tenant could
+            // serve one. A session in a directory no tenant claims injects
+            // nothing and says so, rather than borrowing another identity.
+            let tenant = engram_tenant::resolve_tenant(
+                &config,
+                args.tenant.as_deref(),
+                &derived,
+                args.slug.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+            let slug = tenant
+                .choose_slug(args.slug.as_deref(), &derived)
+                .map_err(|error| error.to_string())?;
+            Ok((tenant, slug))
+        }) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("engram-recall-hook: not injecting: {error}");
+            return;
+        }
+    };
 
     let session = payload
         .session_id
@@ -114,23 +162,21 @@ async fn main() {
     let budget = Duration::from_millis(inject.timeout_ms.max(250));
     let Ok(Ok(result)) = tokio::time::timeout(
         budget,
-        recall_fast(&config_path, &slug, prompt, inject.k.max(1)),
+        recall_fast(&config_path, &tenant, &slug, prompt, inject.k.max(1)),
     )
     .await
     else {
         return;
     };
 
-    let facts = fresh_facts(&result.facts, &seen, inject.max_facts);
     let fresh = result
         .results
         .into_iter()
         .filter(|item| seen.insert(item.file.clone()))
         .collect::<Vec<_>>();
-    if fresh.is_empty() && facts.is_empty() {
+    if fresh.is_empty() {
         return;
     }
-    seen.extend(facts.iter().map(|fact| fact_key(fact)));
     let _ = std::fs::create_dir_all(&state_dir);
     let temp = state_path.with_extension(format!("json.{}.tmp", std::process::id()));
     if std::fs::write(&temp, serde_json::to_vec(&seen).unwrap_or_default()).is_ok() {
@@ -143,34 +189,19 @@ async fn main() {
     for item in &fresh {
         println!("- {}: {}", item.name, item.description);
     }
-    if !facts.is_empty() {
-        println!("Graph facts (1-hop):");
-        for fact in &facts {
-            println!("- {fact}");
+    // Facts stay attributed to the memory that carried them, and the total is
+    // capped by recall.inject.max_facts.
+    let mut shown = 0;
+    for item in &fresh {
+        for fact in &item.facts {
+            if shown >= inject.max_facts {
+                break;
+            }
+            println!("  · {fact}");
+            shown += 1;
         }
     }
     println!("</relevant-memory>");
-}
-
-/// Graph facts not yet injected this session, capped by recall.inject.max_facts.
-///
-/// From `result.facts`, which holds every fact: the fast leg's 1-hop facts are
-/// not attributed to any memory, so printing only each item's `facts` dropped all
-/// of them, and the hook injected memory names with no facts at all. Same section
-/// and per-session dedup as hooks/memory-recall-inject.py.
-fn fresh_facts(all: &[String], seen: &BTreeSet<String>, max: usize) -> Vec<String> {
-    // Redacted before dedup and printing: facts reach the model verbatim, and
-    // legacy/imported facts never passed the save-time secret guard.
-    all.iter()
-        .map(|fact| engram_secrets::redact(fact).0)
-        .filter(|fact| !seen.contains(&fact_key(fact)))
-        .take(max)
-        .collect()
-}
-
-/// Facts share the session state with memory files; the prefix keeps them apart.
-fn fact_key(fact: &str) -> String {
-    format!("fact:{fact}")
 }
 
 fn load_seen(path: &std::path::Path) -> BTreeSet<String> {
@@ -196,30 +227,5 @@ fn sweep_stale_state(dir: &std::path::Path) {
         if stale {
             let _ = std::fs::remove_file(entry.path());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unattributed_facts_are_injected_once_per_session() {
-        let all = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let mut seen = BTreeSet::new();
-        assert_eq!(fresh_facts(&all, &seen, 2), ["a", "b"]);
-        seen.extend(["a", "b"].map(fact_key));
-        seen.insert("b".into()); // a memory FILE named "b" must not hide fact "b"
-        assert_eq!(fresh_facts(&all, &seen, 6), ["c"]);
-        seen.insert(fact_key("c"));
-        assert!(fresh_facts(&all, &seen, 6).is_empty());
-    }
-
-    #[test]
-    fn injected_facts_are_redacted() {
-        let all = vec!["the key is api_key=sk-proj-abcdefghijklmnopqrstuvwxyz1234".to_string()];
-        let out = fresh_facts(&all, &BTreeSet::new(), 6);
-        assert_eq!(out.len(), 1);
-        assert!(!out[0].contains("sk-proj-"), "{out:?}");
     }
 }

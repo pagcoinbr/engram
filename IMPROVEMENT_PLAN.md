@@ -88,7 +88,7 @@ Deferred (tracked in TODO, need graph venv / bigger change):
 - Graph ranking is popularity (fact COUNT), not relevance — rank by Σ 1/(60+edge_rank) using the edge order already returned.
 - Per-file graph refresh in `graph_sync.py` (delete+reinsert changed files) — removes the all-or-nothing `--rebuild` barrier (root cause of staleness); add a graph delete to `delete_memory.sh`.
 - `recall.hybrid.enabled` and `scope_to_slug` (graph leg) are only partly wired; equal RRF weights overweight the stale graph — drop graph weight to ~0.75 until ranking is fixed.
-- Consolidate the vector server's overlapping tools (`memory_vector_recall` → alias of `memory_recall_fused`).
+- ~~Consolidate the vector server's overlapping tools (`memory_vector_recall` → alias of `memory_recall_fused`).~~ DONE: recall consolidated onto `engram-rust`; `engram-graph`/`engram-vector` no longer expose recall tools (they re-embedded the query — one recall made two identical embedding calls). `engram-vector` keeps `memory_vector_search`/`memory_vector_stats`; `engram-graph` keeps facts/neighbours/stats. Python `memory_recall.py` embeds once too.
 - **Ops:** `vector_sync --rebuild` required for the R1 body-embedding to take effect on existing points (done at deploy).
 
 ### Advisor verdict (Codex, 2026-07-11)

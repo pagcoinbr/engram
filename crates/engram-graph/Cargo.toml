@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 engram-config = { path = "../engram-config" }
+engram-tenant = { path = "../engram-tenant" }
 engram-paths = { path = "../engram-paths" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

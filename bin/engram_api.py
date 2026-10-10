@@ -101,85 +101,42 @@ def _vector_store():
     s.ensure_collection()
     return s
 
-app = FastAPI(title="engram", docs_url=None, redoc_url=None)
-# Every route reads or writes memories/config, so every route needs the shared
-# token (ENGRAM_API_TOKEN_FILE, default <engram home>/engram-api.token, 0600). A
-# loopback bind alone is not a barrier: a web page can DNS-rebind its own name to
-# 127.0.0.1. Scripts send `Authorization: Bearer <token>`; the browser signs in
-# once at /login (a POST form) and gets an HttpOnly, SameSite=Strict cookie. Only the
-# page shell (/ and /assets) and /login are public, so the login can load.
-import hmac  # noqa: E402
-import secrets  # noqa: E402
-from fastapi import Request  # noqa: E402
-from fastapi.responses import HTMLResponse, RedirectResponse  # noqa: E402
+def _vector_summary(cfg) -> dict:
+    """Vector-store status for the dashboard, tenant-tolerant.
 
-TOKEN_FILE = Path(os.environ.get("ENGRAM_API_TOKEN_FILE", ENGRAM_BIN / "engram-api.token"))
-SESSION_COOKIE = "engram_session"
-
-
-def api_token() -> str:
-    """Read the token, creating it if this is the first server up. Written to a
-    private temp file and link()ed into place, so a concurrent reader (the Rust
-    API does the same) sees a complete token or none, never an empty file."""
-    if not TOKEN_FILE.exists():
-        temp = TOKEN_FILE.with_name(f".{TOKEN_FILE.name}.{os.getpid()}.{secrets.token_hex(16)}")
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(secrets.token_hex(32) + "\n")
+    EngramVectorStore resolves a single tenant in its constructor, so on a
+    tenanted install the tenant-LESS dashboard process (engram-ui sets no
+    ENGRAM_TENANT) could not get stats and reported Qdrant as *down* — a false
+    negative, since "is Qdrant up and how many vectors does it hold" needs no
+    identity. When a single tenant IS resolvable (no `tenants:` block, or
+    ENGRAM_TENANT set) the exact per-collection stats are returned unchanged;
+    otherwise we sum every tenant's memory collection through a tenant-free
+    client. A genuinely unreachable Qdrant still raises VectorUnavailable."""
+    import vector_config as vc
+    import engram_tenant
+    try:
+        return {"reachable": True, **_vector_store().stats()}
+    except vc.VectorUnavailable:
+        raise                      # Qdrant down / vector disabled: a real outage
+    except Exception:
+        # Most likely: tenancy is on but no tenant is selected. If that is NOT
+        # the reason, re-raise so the caller reports the true error.
+        if not engram_tenant.tenancy_enabled(cfg):
+            raise
+    client = vc.build_client(cfg)  # raises VectorUnavailable if Qdrant is truly down
+    per, total = [], 0
+    for name in engram_tenant.names(cfg):
+        collection = vc.collection_name(cfg, name)
         try:
-            os.link(temp, TOKEN_FILE)
-        except FileExistsError:
-            pass
-        finally:
-            temp.unlink()
-    token = TOKEN_FILE.read_text().strip()
-    if len(token) < 32:
-        sys.exit(f"{TOKEN_FILE} is too short; delete it and restart to regenerate")
-    return token
+            count = client.count(collection_name=collection, exact=True).count
+        except Exception:
+            count = 0
+        per.append({"tenant": name, "collection": collection, "points": count})
+        total += count
+    return {"reachable": True, "points": total, "dim": vc.dim(cfg),
+            "scope": "all tenants", "tenants": per}
 
-
-TOKEN = api_token()
-
-
-def _authorized(request: Request) -> bool:
-    header = request.headers.get("authorization", "")
-    supplied = header[7:] if header.lower().startswith("bearer ") else request.cookies.get(SESSION_COOKIE, "")
-    return hmac.compare_digest(supplied.encode(), TOKEN.encode())
-
-
-@app.middleware("http")
-async def require_token(request: Request, call_next):
-    path = request.url.path
-    if path in ("/", "/login") or path.startswith("/assets/") or _authorized(request):
-        return await call_next(request)
-    return JSONResponse({"detail": "unauthorized: sign in at /login"}, status_code=401)
-
-
-# The token is never accepted in a URL: query strings land in browser history,
-# reverse-proxy access logs and Referer headers. The form POSTs it in the body.
-_NO_STORE = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
-_LOGIN_FORM = """<!doctype html><meta charset="utf-8"><title>engram sign in</title>
-<form method="post" action="/login" style="font:16px system-ui;margin:4em auto;max-width:28em">
-<p>Paste the token from <code>~/.claude/engram-api.token</code>.</p>
-<input name="token" type="password" autocomplete="off" autofocus required style="width:100%">
-<p><button type="submit">Sign in</button></p></form>"""
-
-
-@app.get("/login")
-def login_form():
-    return HTMLResponse(_LOGIN_FORM, headers=_NO_STORE)
-
-
-@app.post("/login")
-async def login(request: Request):
-    import urllib.parse
-    token = urllib.parse.parse_qs((await request.body()).decode(errors="replace")).get("token", [""])[0]
-    if not hmac.compare_digest(token.strip().encode(), TOKEN.encode()):
-        return JSONResponse({"detail": "invalid token"}, status_code=401, headers=_NO_STORE)
-    response = RedirectResponse("/", status_code=303, headers=_NO_STORE)
-    response.set_cookie(SESSION_COOKIE, TOKEN, httponly=True, samesite="strict",
-                        secure=request.url.scheme == "https", path="/")
-    return response
+app = FastAPI(title="engram", docs_url=None, redoc_url=None)
 
 
 @app.get("/api/health")
@@ -208,7 +165,7 @@ def health():
         out["vector"] = {"enabled": False}
     else:
         try:
-            out["vector"] = {"enabled": True, "reachable": True, "points": _vector_store().stats()["points"]}
+            out["vector"] = {"enabled": True, "reachable": True, "points": _vector_summary(cfg)["points"]}
         except Exception as e:
             out["vector"] = {"enabled": True, "reachable": False, "error": str(e)[:200]}
     return out
@@ -323,7 +280,7 @@ def vector_stats():
     if not memory_ai.vector_enabled(cfg):
         return {"enabled": False}
     try:
-        return {"enabled": True, "reachable": True, **_vector_store().stats()}
+        return {"enabled": True, **_vector_summary(cfg)}
     except Exception as e:
         return {"enabled": True, "reachable": False, "error": str(e)[:200]}
 

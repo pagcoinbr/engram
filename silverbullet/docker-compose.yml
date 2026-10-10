@@ -1,0 +1,99 @@
+# SilverBullet — the browser editor over engram's per-tenant vaults.
+#
+# One service per tenant, each bind-mounting ONLY that tenant's vault, so the
+# tenant isolation holds even here: a compromised editor instance cannot read
+# another identity's notes, because it is never given the directory. This
+# mirrors engram's own isolation — a collection per tenant, a graph group per
+# tenant — now at the container-mount layer.
+#
+# POSTURE (do not weaken without thinking):
+#   - Bound to 127.0.0.1 ONLY. Remote access is via the Traefik gateway over
+#     Tailscale (see silverbullet/README.md + the dynamic config the installer
+#     writes). Never bind 0.0.0.0, never a Tailscale funnel, never a public port.
+#   - The work tenants are SB_READ_ONLY by default — browse client-infra notes
+#     remotely, but editing them from a browser is a wider surface than it's
+#     worth. Flip one to read-write by removing its SB_READ_ONLY line.
+#   - PUID/PGID 0: the vaults are root-owned 0700 and engram writes _agent/ as
+#     root, so the editor matches, and files are interchangeable between the two.
+#   - Secrets (SB_USER per tenant) come from silverbullet/sb.env, mode 600,
+#     written by `install.sh --silverbullet` and never committed.
+#
+# The internal `.silverbullet.auth.json` SilverBullet writes into each space is a
+# dotfile, so engram's wiki walker already ignores it and the backup excludes it.
+#
+# Brought up by `install.sh --silverbullet` (which can start a subset), or by
+# hand: `docker compose --env-file sb.env up -d wiki-homelab`.
+
+services:
+  wiki-homelab:
+    image: ghcr.io/silverbulletmd/silverbullet:v2@sha256:1b97ce0f7b5085c76e0e9363c88ed97673db62a3b0f78c7bb12868827fff8b37  # pinned to the tested digest; re-verify footprint on bump
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    environment:
+      SB_USER: "${SB_USER_HOMELAB:?set SB_USER_HOMELAB in silverbullet/sb.env — refusing to start an unauthenticated editor}"
+      PUID: "0"
+      PGID: "0"
+    volumes:
+      - "${VAULTS_ROOT:-/vaults}/homelab:/data:z"
+    ports:
+      - "127.0.0.1:3011:3000"
+    networks: [sb-homelab]
+
+  wiki-mjsv:
+    image: ghcr.io/silverbulletmd/silverbullet:v2@sha256:1b97ce0f7b5085c76e0e9363c88ed97673db62a3b0f78c7bb12868827fff8b37  # pinned to the tested digest; re-verify footprint on bump
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    environment:
+      SB_USER: "${SB_USER_MJSV:?set SB_USER_MJSV in silverbullet/sb.env — refusing to start an unauthenticated editor}"
+      SB_READ_ONLY: "true"          # client vault — browse, don't edit from a browser
+      PUID: "0"
+      PGID: "0"
+    volumes:
+      - "${VAULTS_ROOT:-/vaults}/mjsv:/data:z"
+    ports:
+      - "127.0.0.1:3012:3000"
+    networks: [sb-mjsv]
+
+  wiki-bbhost:
+    image: ghcr.io/silverbulletmd/silverbullet:v2@sha256:1b97ce0f7b5085c76e0e9363c88ed97673db62a3b0f78c7bb12868827fff8b37  # pinned to the tested digest; re-verify footprint on bump
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    environment:
+      SB_USER: "${SB_USER_BBHOST:?set SB_USER_BBHOST in silverbullet/sb.env — refusing to start an unauthenticated editor}"
+      SB_READ_ONLY: "true"
+      PUID: "0"
+      PGID: "0"
+    volumes:
+      - "${VAULTS_ROOT:-/vaults}/bbhost:/data:z"
+    ports:
+      - "127.0.0.1:3013:3000"
+    networks: [sb-bbhost]
+
+  wiki-dseclab:
+    image: ghcr.io/silverbulletmd/silverbullet:v2@sha256:1b97ce0f7b5085c76e0e9363c88ed97673db62a3b0f78c7bb12868827fff8b37  # pinned to the tested digest; re-verify footprint on bump
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    environment:
+      SB_USER: "${SB_USER_DSECLAB:?set SB_USER_DSECLAB in silverbullet/sb.env — refusing to start an unauthenticated editor}"
+      SB_READ_ONLY: "true"
+      PUID: "0"
+      PGID: "0"
+    volumes:
+      - "${VAULTS_ROOT:-/vaults}/dseclab:/data:z"
+    ports:
+      - "127.0.0.1:3014:3000"
+    networks: [sb-dseclab]
+
+# A network per instance, so a compromised editor cannot reach its siblings over
+# the Docker network (the per-vault mount already stops it reading their FILES;
+# this closes the network path codex flagged). Egress stays up — SilverBullet's
+# Library sync fetches over the internet.
+networks:
+  sb-homelab: {}
+  sb-mjsv: {}
+  sb-bbhost: {}
+  sb-dseclab: {}
