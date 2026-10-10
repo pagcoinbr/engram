@@ -176,6 +176,51 @@ def test_embedding_failure_propagates(mr):
     print("ok — embed raises on failure; vector_leg degrades to empty")
 
 
+def test_graph_facts_reaches_late_entity(mr):
+    """A prose prompt leads with filler words; the entity further in must still be
+    looked up. With a 6-token cap this prompt never sent "neo4j" and got 0 facts."""
+    sent = {}
+
+    def fake_post(url, body, headers=None, timeout=5.0):
+        sent["names"] = body["statements"][0]["parameters"]["names"]
+        sent["statement"] = body["statements"][0]["statement"]
+        return {"results": [{"data": [{"row": ["a fact"]}]}]}
+
+    orig = mr._neo4j_http, mr._post
+    mr._neo4j_http, mr._post = (lambda: ("http://127.0.0.1:7474/x", "Basic x")), fake_post
+    try:
+        facts = mr.graph_facts("I'm noticing that when i start a chat qdrant recall and "
+                               "neo4j recall isn't working anymore")
+    finally:
+        mr._neo4j_http, mr._post = orig
+    assert "neo4j" in sent["names"], f"late entity dropped by token cap: {sent['names']}"
+    assert facts == ["a fact"]
+    assert "r.invalid_at IS NULL AND r.expired_at IS NULL" in sent["statement"], \
+        "superseded (invalid_at/expired_at) legacy facts must not be served"
+    print("ok — graph facts look up entities past the first few words, active only")
+
+
+def test_legacy_facts_only_for_pinned_store(mr, home, slug):
+    """The legacy graph is one unscoped group built from the pinned store. A
+    session on another store must not be handed its facts."""
+    calls = []
+    orig = mr.graph_facts
+    mr.graph_facts = lambda query, **kw: calls.append(query) or ["a fact"]
+    envf = Path(home) / ".claude" / "engram.env"
+    try:
+        envf.write_text(f'CLAUDE_MEMORY_SLUG="{slug}"\n')
+        os.environ.pop("CLAUDE_MEMORY_SLUG", None)
+        assert mr.recall("neo4j", fast=True)["facts"] == ["a fact"], "pinned store lost its facts"
+        os.environ["CLAUDE_MEMORY_SLUG"] = "-some-other-project"
+        out = mr.recall("neo4j", fast=True)
+        assert out["facts"] == [] and len(calls) == 1, f"another store got legacy facts: {out['facts']}"
+    finally:
+        mr.graph_facts = orig
+        envf.unlink(missing_ok=True)
+        os.environ["CLAUDE_MEMORY_SLUG"] = slug
+    print("ok — legacy graph facts reach only the pinned store")
+
+
 def test_hook_dedup(home, slug):
     """Same prompt twice in one session must inject once; a new session re-injects."""
     hook = ROOT / "bin" / "hooks" / "memory-recall-inject.py"
@@ -199,6 +244,27 @@ def test_hook_dedup(home, slug):
     state = json.loads((Path(home) / ".claude" / "logs" / "recall-inject" / "sess-a.json").read_text())
     assert "reference_thing1.md" in state["files"], state
     print("ok — hook dedup (once per session, per-session state, descriptions only)")
+
+
+def test_hook_redacts_facts(home, slug):
+    """Graph facts reach the model verbatim and legacy ones never passed the
+    save-time guard, so the hook must redact them before printing."""
+    hook = ROOT / "bin" / "hooks" / "memory-recall-inject.py"
+    claude = Path(home) / ".claude"
+    secret = "api_key=sk-proj-abcdefghijklmnopqrstuvwxyz1234"
+    driver = (
+        "import sys, runpy\n"
+        f"sys.path.insert(0, {str(claude)!r})\n"
+        "import memory_recall\n"
+        "memory_recall.recall = lambda *a, **k: {'results': [], 'facts': [%r]}\n"
+        f"runpy.run_path({str(hook)!r}, run_name='__main__')\n" % f"the gateway uses {secret}")
+    env = dict(os.environ, HOME=home, ENGRAM_BIN=str(claude), CLAUDE_MEMORY_SLUG=slug)
+    out = subprocess.run([sys.executable, "-c", driver], text=True, capture_output=True, env=env,
+                         input=json.dumps({"prompt": "what does the gateway use for its api key",
+                                           "session_id": "sess-redact"}), timeout=60).stdout
+    assert "Graph facts" in out and "the gateway uses" in out, f"fact not injected at all: {out!r}"
+    assert "sk-proj-" not in out, f"secret injected verbatim: {out!r}"
+    print("ok — hook redacts graph facts before injecting them")
 
 
 def test_hook_gates(home, slug):
@@ -239,10 +305,13 @@ def main():
         test_embedding_auth_and_timeout(mr)
         test_embedding_prefixes(mr)
         test_embedding_failure_propagates(mr)
+        test_graph_facts_reaches_late_entity(mr)
         test_slug_resolution(mr, d, slug)
+        test_legacy_facts_only_for_pinned_store(mr, d, slug)
         os.environ["CLAUDE_MEMORY_SLUG"] = slug
         test_hook_dedup(d, slug)
         test_hook_gates(d, slug)
+        test_hook_redacts_facts(d, slug)
 
 
 if __name__ == "__main__":

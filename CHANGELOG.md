@@ -581,6 +581,82 @@ must echo the group it filtered on or the leg is refused. No unit test could hav
 caught this — every fixture implements the new parser — so the regression test
 asserts the child's argv rather than its records.
 
+## Unreleased — `update.sh`
+
+### Added
+- **`update.sh`**, dry-run by default, `--apply` to act: a safe fast-forward pull, then
+  `install.sh` with the daemon mode the box already uses. It restores
+  `~/.claude/engram-local-overrides/`, rebuilds and restarts the Atlas and the Rust API
+  when they are installed, and checks that the recall hook still injects memories. On
+  failure it prints the rollback. Tested in `tests/test_update.sh`, isolated from the
+  caller's real services.
+
+## Unreleased — migrate the legacy graph to the Rust native backend
+
+### Added
+- **`engram-native-graph-sync --bootstrap-from-legacy`** seeds the native graph from
+  the legacy Graphiti one **without calling a model**, where re-extracting a store
+  on a local 8 GB GPU would take ~16 h. Check first that the legacy
+  `fact_embedding`s are in the configured embedding space.
+  - **Scoped:** it (and `--import-legacy-embeddings`) refuses unless the target is
+    the `engram.env`-pinned store, failing closed with no pin. The legacy graph is
+    one unscoped group built from that store.
+  - **Verified:** a memory qualifies only if its file is byte-identical to one
+    legacy episode (`Episodic.source_md`), and only that episode's facts are used,
+    so an older ingested version never contributes.
+  - **Redacted before writing:** facts are read out, redacted with the shared
+    secret detector (text, entity names, relation name) and re-embedded from the
+    redacted text in Rust; raw legacy facts never touch the native graph.
+  - **History kept, never resurrected:** superseded facts (Graphiti
+    `invalid_at`/`expired_at`) are imported with `valid_until`, so recall skips
+    them; when a claim exists both live and superseded, the live copy wins.
+  - **Atomic and resumable:** each memory's facts and commit marker are one
+    transaction. An interrupted run leaves fact-less, unstamped nodes that the next
+    run resumes; nodes carrying facts from elsewhere are left alone.
+
+  Reference store (677 memories): 606 memories, 6,099 facts (106 redacted, 515
+  historical) in ~30 s; the rest are left for the normal extracting sync.
+
+### Fixed
+- **Legacy recall served superseded facts as current.** Graphiti never deletes a
+  contradicted fact, it stamps `invalid_at`/`expired_at`; no legacy read query
+  (Python fast leg, Rust fast/semantic/keyword legs) checked either, so every
+  version of history was recalled at once (632 of 6,720 edges on the reference
+  store). All now require both to be null.
+- **Both recall hooks redact graph facts before injecting them.** Facts reach the
+  model verbatim, and legacy graph facts never passed the save-time secret guard.
+  The Python hook injects nothing if its redactor cannot be imported.
+- **The Rust recall hook injected no graph facts.** It printed only facts attributed
+  to a returned memory; the fast leg's facts are unattributed (`Output::facts`).
+  Same section and per-session dedup as the Python hook now.
+- **Imported legacy facts were invisible to the fast leg,** which read triples
+  only. Imported facts keep their edge's entity names and match them exactly, as
+  the legacy query matched `Entity.name`.
+- **Legacy graph facts reached every project.** The legacy graph is one unscoped
+  group built from the `engram.env`-pinned store; both the Python and Rust fast legs
+  now serve its facts only to that store. Native facts are slug-scoped already.
+- **Extraction timeout comes from `llama_cpp.timeout_seconds`,** not a fixed 90 s
+  that a local model (~85 s per extraction) failed at random.
+
+## Unreleased — API authentication
+
+### Security
+- **Both local APIs require a token.** Every route on `engram-app` (:8787) except
+  `/healthz`, and every route on `engram_api`/Atlas (:8765) except the page shell
+  and `/login`, was unauthenticated, including config rewrites and memory
+  create/delete. A loopback bind did not protect them from a browser tab
+  (DNS rebinding). The token lives in `~/.claude/engram-api.token` (0600), created
+  race-free by whichever server starts first; scripts use `Authorization: Bearer`,
+  the browser gets an HttpOnly SameSite=Strict cookie from the `/login` POST form.
+  The token is never accepted in a URL (history, proxy logs, Referer).
+- **A config save that moves an endpoint drops that endpoint's `api_key`.** The
+  writers preserved unmodelled keys, so repointing `llama_cpp.url`/`embed.url`
+  sent the stored bearer token to the new host.
+- **`/api/v1/recall?slug=` is validated.** It was joined straight into
+  `projects/<slug>/memory`, so `../..` searched markdown anywhere on disk.
+- **Atlas config backups and temp files are created 0600** instead of at the
+  umask default, which left every credential world-readable.
+
 ## Unreleased — PR #34 stabilization (Rust foundation + Graphiti compatibility)
 
 Remediation of the PR #34 review. The theme: the Rust layer was written against one

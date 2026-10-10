@@ -50,6 +50,18 @@ import memory_ai  # noqa: E402
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{3,}")
 
 
+def pinned_slug() -> str:
+    """The operator's store pin in engram.env, or "" when there is none."""
+    try:
+        for line in (ENGRAM_BIN / "engram.env").read_text().splitlines():
+            line = line.strip().removeprefix("export ").strip()
+            if line.startswith("CLAUDE_MEMORY_SLUG="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+
 def resolve_slug(cwd: str = "") -> str:
     """Decide WHICH store to search, and pin it in the environment for the legs.
 
@@ -59,17 +71,7 @@ def resolve_slug(cwd: str = "") -> str:
     mirrors memory_lib.sh: explicit env, then the operator pin in engram.env, then
     the cwd-derived Claude Code project store, then the $HOME default.
     """
-    s = os.environ.get("CLAUDE_MEMORY_SLUG")
-    if not s:
-        envf = ENGRAM_BIN / "engram.env"
-        try:
-            for line in envf.read_text().splitlines():
-                line = line.strip().removeprefix("export ").strip()
-                if line.startswith("CLAUDE_MEMORY_SLUG="):
-                    s = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-        except Exception:
-            pass
+    s = os.environ.get("CLAUDE_MEMORY_SLUG") or pinned_slug()
     if not s and cwd:
         s = str(cwd).replace("/", "-")
     if not s:
@@ -324,10 +326,12 @@ def _neo4j_http() -> tuple[str, str]:
     return f"{base.rstrip('/')}/db/{db}/tx/commit", f"Basic {token}"
 
 
-def graph_facts(query: str, max_facts: int = 6, max_tokens: int = 6,
+def graph_facts(query: str, max_facts: int = 6, max_tokens: int = 32,
                 timeout: float = 5.0, tenant: str = None) -> list[str]:
     """The cheap graph leg: 1-hop RELATES_TO facts for entities named in the query.
-    One HTTP round trip for all tokens (UNWIND), so cost is flat in token count."""
+    One HTTP round trip for all tokens (UNWIND), so cost is flat in token count.
+    The cap is generous on purpose: at 6, prose prompts spent it on filler words
+    ("that", "when") and the real entity further in the sentence was never looked up."""
     try:
         endpoint, auth = _neo4j_http()
         tokens, seen = [], set()
@@ -341,12 +345,15 @@ def graph_facts(query: str, max_facts: int = 6, max_tokens: int = 6,
         if not tokens:
             return []
         res = _post(endpoint, {"statements": [{
-            # group_id-scoped, like the Rust LEGACY_FACTS_FOR_TOKENS. Without it
-            # this leg reads every identity's facts, because engram wrote them all
-            # into one group.
+            # group_id-scoped (tenant isolation) AND superseded-fact filtered.
+            # engram wrote every identity's facts into one group, so without the
+            # group predicate this leg leaks across identities; and Graphiti never
+            # deletes a superseded fact (it stamps invalid_at/expired_at), so
+            # without that predicate every version of history reads as current.
             "statement": "UNWIND $names AS nm MATCH (n:Entity)-[r:RELATES_TO]-(m:Entity) "
                          "WHERE toLower(n.name)=toLower(nm) AND n.group_id = $grp "
                          "AND m.group_id = $grp AND r.group_id = $grp "
+                         "AND r.invalid_at IS NULL AND r.expired_at IS NULL "
                          "RETURN r.fact AS fact LIMIT $lim",
             "parameters": {"names": tokens, "lim": max_facts,
                            "grp": graph_group(tenant)}}]},
@@ -385,7 +392,12 @@ def recall(query: str, k: int = 6, mtype: str = "", fast: bool = False,
     want = max(k * 2, 10)
     keyword_pairs = keyword_leg(query, want, mtype)
     graph_records = [] if fast else graph_recall_leg(query, want, mtype, tenant=tenant)
-    facts = graph_facts(query, timeout=timeout) if fast else []
+    # Facts are group-scoped by tenant (see graph_facts). On a tenanted install that
+    # is the isolation boundary; on a legacy/untenanted install the single canonical
+    # group spans every project, so only read it when on the pinned store (main's
+    # guard). Pass the resolved tenant either way.
+    facts = (graph_facts(query, timeout=timeout, tenant=tenant)
+             if fast and (enabled or slug == pinned_slug()) else [])
     # Embed the query ONCE. The graphiti graph leg (graph_recall_leg) runs its own
     # dense semantic search, so an independent Qdrant vector_leg here re-embeds the
     # same query for an overlapping result — one recall, two identical calls to the
