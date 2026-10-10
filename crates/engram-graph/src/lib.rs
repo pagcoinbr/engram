@@ -7,6 +7,7 @@
 //! therefore retired nothing — ever. No test could see it, because no test touched
 //! a query string.
 
+use engram_tenant::GraphScope;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -166,32 +167,59 @@ struct NeoError {
 // namespaced by slug (`{slug}::{file}`); the graph did not.
 // ---------------------------------------------------------------------------
 
+// Graphiti's own data (Entity / RELATES_TO / Episodic) is partitioned by
+// `group_id`, which engram pinned to the single literal "canonical" for every
+// memory in every store. So these statements were not merely unscoped by slug —
+// they had no partition at all, and the graph leg returned one project's facts
+// to another. $tenant IS the group_id: the legacy tenant passes "canonical", so
+// a pre-tenancy install reads exactly what it always did.
+
 const LEGACY_FACTS_FOR_TOKENS: &str = "\
 UNWIND $names AS nm \
 MATCH (n:Entity)-[r:RELATES_TO]-(m:Entity) \
 WHERE toLower(n.name) = toLower(nm) \
+  AND n.group_id = $tenant AND m.group_id = $tenant AND r.group_id = $tenant \
 RETURN r.fact AS fact LIMIT $lim";
 
 const NATIVE_FACTS_FOR_TOKENS: &str = "\
 UNWIND $names AS name \
-MATCH (m:EngramMemory {slug: $slug})-[:HAS_TRIPLE]->(t:EngramTriple {status: 'active'}) \
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug})-[:HAS_TRIPLE]->(t:EngramTriple {tenant: $tenant, status: 'active'}) \
 WHERE t.valid_until IS NULL \
   AND (toLower(t.subject) CONTAINS toLower(name) OR toLower(t.object) CONTAINS toLower(name)) \
 RETURN DISTINCT t.subject + ' ' + t.relation + ' ' + t.object AS fact LIMIT $lim";
 
 const LEGACY_SEMANTIC_FILES: &str = "\
-MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity) \
+MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity) WHERE e.group_id = $tenant \
 WITH e, vector.similarity.cosine(e.fact_embedding, $vector) AS score WHERE score > 0 \
 UNWIND coalesce(e.episodes, []) AS episode \
-MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL \
+MATCH (ep:Episodic {group_id: $tenant, uuid: episode}) WHERE ep.file IS NOT NULL \
 RETURN ep.file AS file, collect(DISTINCT e.fact) AS facts, max(score) AS score \
 ORDER BY score DESC LIMIT $limit";
 
+/// How many index hits to pull before filtering to this tenant's group.
+///
+/// A Neo4j fulltext index cannot be partitioned: `queryRelationships` ranks
+/// across EVERY group and applies its own limit, so filtering the yielded rows
+/// afterwards means a tenant with a small share of the index gets crowded out by
+/// a larger neighbour's edges — asking for 12 and receiving 0, with no error.
+/// This is the same defect that caused the abandoned native legacy-edge index
+/// to be deleted outright rather than filtered. (Its name is deliberately not
+/// written here: `no_unpartitionable_fulltext_index_is_queried_for_native_recall`
+/// greps this file for it.)
+///
+/// This index belongs to Graphiti and backs real functionality, so it is
+/// over-fetched instead of removed. That bounds the problem without solving it:
+/// a tenant holding under ~1/20th of the indexed edges can still be starved.
+/// The semantic and native keyword legs do not share the defect, so recall
+/// degrades rather than failing. Recorded as a known limitation.
+const LEGACY_KEYWORD_OVERFETCH: usize = 20;
+
 const LEGACY_KEYWORD_FILES: &str = "\
-CALL db.index.fulltext.queryRelationships('edge_name_and_fact', $query, {limit: $limit}) \
+CALL db.index.fulltext.queryRelationships('edge_name_and_fact', $query, {limit: $overfetch}) \
 YIELD relationship AS rel, score \
+WITH rel, score WHERE rel.group_id = $tenant \
 UNWIND coalesce(rel.episodes, []) AS episode \
-MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL \
+MATCH (ep:Episodic {group_id: $tenant, uuid: episode}) WHERE ep.file IS NOT NULL \
 RETURN ep.file AS file, collect(DISTINCT rel.fact) AS facts, max(score) AS score \
 ORDER BY score DESC LIMIT $limit";
 
@@ -219,12 +247,12 @@ MATCH (edge:EngramLegacyEdge) WITH edge LIMIT 10000 DETACH DELETE edge RETURN co
 /// have lost them for good. An unembedded fact simply sits out the semantic leg
 /// (which requires `f.embedding IS NOT NULL`) and is still found by keyword.
 const IMPORT_NATIVE_LEGACY_FACTS: &str = "\
-MATCH (:Entity)-[r:RELATES_TO]->(:Entity) \
+MATCH (:Entity)-[r:RELATES_TO]->(:Entity) WHERE r.group_id = $tenant \
 UNWIND coalesce(r.episodes, []) AS episode \
-MATCH (ep:Episodic {uuid: episode}) WHERE ep.file IS NOT NULL \
-MATCH (m:EngramMemory {slug: $slug, file: ep.file}) \
+MATCH (ep:Episodic {group_id: $tenant, uuid: episode}) WHERE ep.file IS NOT NULL \
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug, file: ep.file}) \
 WHERE r.fact IS NOT NULL \
-MERGE (f:EngramFact {slug: $slug, memory_file: m.file, text: r.fact}) \
+MERGE (f:EngramFact {tenant: $tenant, slug: $slug, memory_file: m.file, text: r.fact}) \
 ON CREATE SET f.created_at = datetime(), f.valid_from = datetime() \
 SET f.legacy_name = r.name, \
     f.embedding = coalesce(r.fact_embedding, f.embedding), \
@@ -242,13 +270,13 @@ RETURN count(DISTINCT f)";
 /// discarded before its facts were ever examined. `legacy_name` is searched too,
 /// since imported Graphiti facts carry their relation name there.
 const NATIVE_KEYWORD_FILES: &str = "\
-MATCH (m:EngramMemory {slug: $slug}) \
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug}) \
 WITH m, [token IN $tokens WHERE toLower(coalesce(m.name, '') + ' ' + coalesce(m.description, '') + ' ' + coalesce(m.body, '')) CONTAINS token] AS memory_matches \
 OPTIONAL MATCH (m)-[:HAS_FACT]->(f:EngramFact) \
   WHERE f.valid_until IS NULL AND any(token IN $tokens \
     WHERE toLower(coalesce(f.text, '') + ' ' + coalesce(f.legacy_name, '')) CONTAINS token) \
 WITH m, memory_matches, collect(DISTINCT f.text) AS fact_text, count(f) AS fact_score \
-OPTIONAL MATCH (m)-[:HAS_TRIPLE]->(t:EngramTriple {status: 'active'}) \
+OPTIONAL MATCH (m)-[:HAS_TRIPLE]->(t:EngramTriple {tenant: $tenant, status: 'active'}) \
   WHERE t.valid_until IS NULL AND any(token IN $tokens WHERE toLower(t.subject + ' ' + t.relation + ' ' + t.object) CONTAINS token) \
 WITH m, memory_matches, fact_text, fact_score, collect(DISTINCT t.subject + ' ' + t.relation + ' ' + t.object) AS triple_text, count(t) AS triple_score \
 WITH m, fact_text + triple_text AS texts, size(memory_matches) + fact_score + triple_score AS score \
@@ -256,7 +284,7 @@ WHERE score > 0 \
 RETURN m.file AS file, texts AS facts, score ORDER BY score DESC LIMIT $limit";
 
 const NATIVE_SEMANTIC_FILES: &str = "\
-MATCH (m:EngramMemory {slug: $slug})-[:HAS_FACT]->(f:EngramFact) \
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug})-[:HAS_FACT]->(f:EngramFact) \
 WHERE f.valid_until IS NULL AND f.embedding IS NOT NULL \
 WITH m, f, vector.similarity.cosine(f.embedding, $vector) AS score WHERE score > 0 \
 RETURN m.file AS file, collect(DISTINCT f.text) AS facts, max(score) AS score \
@@ -271,7 +299,7 @@ ORDER BY score DESC LIMIT $limit";
 /// skipped forever. With the marker nulled first, any interruption leaves the
 /// memory unstamped and therefore retryable, whatever the file does afterwards.
 const UPSERT_NATIVE_MEMORY: &str = "\
-MERGE (m:EngramMemory {slug: $slug, file: $file}) \
+MERGE (m:EngramMemory {tenant: $tenant, slug: $slug, file: $file}) \
 SET m.name = $name, m.description = $description, m.body = $body, \
     m.source_mtime = $source_mtime, m.updated_at = datetime(), \
     m.sha = null, m.embedding_space = null, \
@@ -293,7 +321,7 @@ RETURN m.file";
 /// the ordering dependence entirely. The guard makes it a no-op once values match.
 const SET_NATIVE_MEMORY_MTIMES: &str = "\
 UNWIND $memories AS entry \
-MATCH (m:EngramMemory {slug: $slug, file: entry.file}) \
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug, file: entry.file}) \
 WHERE coalesce(m.source_mtime, 0) <> entry.source_mtime \
 SET m.source_mtime = entry.source_mtime \
 RETURN count(m)";
@@ -305,27 +333,27 @@ RETURN count(m)";
 /// the memory as current — a transient embedding outage became a permanently
 /// incomplete index.
 const MARK_NATIVE_MEMORY_CURRENT: &str = "\
-MATCH (m:EngramMemory {slug: $slug, file: $file}) \
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug, file: $file}) \
 SET m.sha = $sha, m.embedding_space = $space, m.native_triple_version = 2, \
     m.native_triples_synced_at = datetime() \
 RETURN m.file";
 
 const NATIVE_MEMORY_IS_CURRENT: &str = "\
-MATCH (m:EngramMemory {slug: $slug, file: $file, sha: $sha, embedding_space: $space, native_triple_version: 2}) \
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug, file: $file, sha: $sha, embedding_space: $space, native_triple_version: 2}) \
 RETURN count(m) > 0";
 
 const REPLACE_NATIVE_FACTS: &str = "\
-MATCH (m:EngramMemory {slug: $slug, file: $file}) \
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug, file: $file}) \
 OPTIONAL MATCH (m)-[old:HAS_FACT]->(obsolete:EngramFact) WHERE NOT obsolete.text IN $facts \
 SET obsolete.valid_until = datetime() DELETE old \
 WITH m UNWIND $facts AS fact \
-MERGE (f:EngramFact {slug: $slug, memory_file: $file, text: fact}) \
+MERGE (f:EngramFact {tenant: $tenant, slug: $slug, memory_file: $file, text: fact}) \
 ON CREATE SET f.valid_from = datetime(), f.created_at = datetime() \
 SET f.valid_until = null, f.updated_at = datetime() \
 MERGE (m)-[:HAS_FACT]->(f) \
 WITH f, [word IN split(toLower(f.text), ' ') WHERE size(word) >= 6] AS names \
 UNWIND names AS name \
-MERGE (e:EngramEntity {name: name}) MERGE (f)-[:MENTIONS]->(e)";
+MERGE (e:EngramEntity {tenant: $tenant, name: name}) MERGE (f)-[:MENTIONS]->(e)";
 
 /// Retire triples this memory no longer asserts.
 ///
@@ -334,23 +362,23 @@ MERGE (e:EngramEntity {name: name}) MERGE (f)-[:MENTIONS]->(e)";
 /// never passed and obsolete triples stayed active indefinitely. The sibling fact
 /// query above always had it right.
 const RETIRE_OBSOLETE_TRIPLES: &str = "\
-MATCH (m:EngramMemory {slug: $slug, file: $file}) \
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug, file: $file}) \
 OPTIONAL MATCH (m)-[old:HAS_TRIPLE]->(obsolete:EngramTriple) \
 WHERE NOT obsolete.key IN [triple IN $triples | triple.key] \
 SET obsolete.valid_until = datetime(), obsolete.status = 'superseded' DELETE old";
 
 const WRITE_NATIVE_TRIPLES: &str = "\
-MATCH (m:EngramMemory {slug: $slug, file: $file}) \
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug, file: $file}) \
 UNWIND $triples AS triple \
-MERGE (t:EngramTriple {slug: $slug, memory_file: $file, key: triple.key}) \
+MERGE (t:EngramTriple {tenant: $tenant, slug: $slug, memory_file: $file, key: triple.key}) \
 ON CREATE SET t.valid_from = datetime(), t.created_at = datetime() \
 SET t.subject = triple.subject, t.relation = triple.relation, t.object = triple.object, \
     t.confidence = triple.confidence, t.temporal = triple.temporal, t.status = triple.status, \
     t.valid_until = CASE WHEN triple.closed THEN coalesce(t.valid_until, datetime()) ELSE null END, \
     t.updated_at = datetime() \
 MERGE (m)-[:HAS_TRIPLE]->(t) \
-MERGE (subject:EngramEntity {name: toLower(triple.subject)}) \
-MERGE (object:EngramEntity {name: toLower(triple.object)}) \
+MERGE (subject:EngramEntity {tenant: $tenant, name: toLower(triple.subject)}) \
+MERGE (object:EngramEntity {tenant: $tenant, name: toLower(triple.object)}) \
 MERGE (t)-[:SUBJECT]->(subject) MERGE (t)-[:OBJECT]->(object)";
 
 /// Close the claims named by a `supersedes` triple's object. Targets are computed
@@ -384,9 +412,9 @@ MERGE (t)-[:SUBJECT]->(subject) MERGE (t)-[:OBJECT]->(object)";
 /// which is arbitrary but gives a total order, so at most one direction ever
 /// applies and the outcome does not depend on sync order.
 const APPLY_SUPERSESSION: &str = "\
-MATCH (sm:EngramMemory {slug: $slug, file: $file})-[:HAS_TRIPLE]->(sup:EngramTriple) \
+MATCH (sm:EngramMemory {tenant: $tenant, slug: $slug, file: $file})-[:HAS_TRIPLE]->(sup:EngramTriple) \
 WHERE sup.relation = 'supersedes' AND toLower(sup.object) IN $targets \
-MATCH (pm:EngramMemory {slug: $slug})-[:HAS_TRIPLE]->(prior:EngramTriple) \
+MATCH (pm:EngramMemory {tenant: $tenant, slug: $slug})-[:HAS_TRIPLE]->(prior:EngramTriple) \
 WHERE prior.valid_until IS NULL AND prior.relation <> 'supersedes' \
   AND toLower(prior.object) = toLower(sup.object) \
   AND pm.file <> $file \
@@ -397,7 +425,7 @@ SET prior.valid_until = datetime(), prior.status = 'superseded'";
 
 const SET_NATIVE_FACT_EMBEDDINGS: &str = "\
 UNWIND $points AS point \
-MATCH (f:EngramFact {slug: $slug, memory_file: $file, text: point.text}) \
+MATCH (f:EngramFact {tenant: $tenant, slug: $slug, memory_file: $file, text: point.text}) \
 SET f.embedding = point.embedding, f.embedding_updated_at = datetime() \
 RETURN count(f)";
 
@@ -406,13 +434,71 @@ RETURN count(f)";
 /// Sync upserted current files and never retired anything, so a deleted or renamed
 /// memory left its claims behind, still eligible for recall.
 const PRUNE_MISSING_MEMORIES: &str = "\
-MATCH (m:EngramMemory {slug: $slug}) WHERE NOT m.file IN $files \
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug}) WHERE NOT m.file IN $files \
 OPTIONAL MATCH (m)-[:HAS_FACT]->(f:EngramFact) \
 OPTIONAL MATCH (m)-[:HAS_TRIPLE]->(t:EngramTriple) \
 DETACH DELETE f, t, m";
 
+// ---------------------------------------------------------------------------
+// Tenancy migration.
+//
+// These are the ONLY statements that deliberately read one group and write
+// another — that is what a migration is. They are exempt from the per-statement
+// $tenant check and are instead asserted positively, by
+// `migration_statements_name_both_groups`: each must bind BOTH `$from` and
+// `$tenant`, so an exempt statement still cannot touch an unbounded set of rows.
+// ---------------------------------------------------------------------------
+
+/// Which files Graphiti holds episodes for, in a given group.
+///
+/// `Episodic` carries `file` but no slug, so attributing an episode to a tenant
+/// means asking which owned store contains that filename. A filename present in
+/// two tenants' stores is genuinely ambiguous and the caller refuses — see
+/// `engram-tenant-migrate`.
+const MIGRATION_EPISODE_FILES: &str = "\
+MATCH (e:Episodic {group_id: $from}) WHERE e.file IS NOT NULL \
+RETURN collect(DISTINCT e.file)";
+
+/// Move a whole Graphiti group to a new one.
+///
+/// Wholesale rather than per-file, and only ever called once the caller has
+/// established that exactly ONE tenant owns the group's episodes. Entity nodes
+/// are shared across episodes — an entity mentioned by two tenants' memories is
+/// a single node with a single group — so splitting a group between tenants is
+/// not expressible as an update at all and requires a re-insert. Relabelling is
+/// correct precisely when there is nothing to split.
+const MIGRATION_RELABEL_GROUP: &str = "\
+CALL { WITH $from AS from, $tenant AS tenant \
+  MATCH (n) WHERE n.group_id = from SET n.group_id = tenant RETURN count(n) AS nodes } \
+CALL { WITH $from AS from, $tenant AS tenant \
+  MATCH ()-[r]->() WHERE r.group_id = from SET r.group_id = tenant RETURN count(r) AS rels } \
+RETURN nodes, rels";
+
+/// Count the pre-tenancy native nodes, which carry no scoping key at all.
+///
+/// Selected by the ABSENCE of both keys, which is a bound predicate and not a
+/// bare label scan: these rows predate slug scoping, which is precisely why no
+/// group parameter applies to them.
+const MIGRATION_COUNT_UNSCOPED_NATIVE: &str = "\
+MATCH (n) WHERE any(label IN labels(n) WHERE label STARTS WITH 'Engram') \
+  AND n.slug IS NULL AND n.tenant IS NULL \
+RETURN count(n)";
+
+/// Delete the pre-tenancy native nodes, in batches.
+///
+/// They are unreachable: every native statement now requires both `tenant` and
+/// `slug`, and these have neither, so no query can return them. They are not
+/// data loss waiting to happen — the markdown store is authoritative and
+/// `--rebuild` regenerates the index — they are weight that would otherwise sit
+/// in the graph forever, which is the same conclusion the abandoned legacy edge
+/// cache reached.
+const MIGRATION_PURGE_UNSCOPED_NATIVE: &str = "\
+MATCH (n) WHERE any(label IN labels(n) WHERE label STARTS WITH 'Engram') \
+  AND n.slug IS NULL AND n.tenant IS NULL \
+WITH n LIMIT 10000 DETACH DELETE n RETURN count(n)";
+
 const NATIVE_MEMORY_FILES: &str = "\
-MATCH (m:EngramMemory {slug: $slug}) RETURN collect(m.file)";
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug}) RETURN collect(m.file)";
 
 impl GraphClient {
     pub fn new(
@@ -460,8 +546,15 @@ impl GraphClient {
         )
     }
 
+    /// Graphiti's Entity/RELATES_TO facts for a set of query tokens.
+    ///
+    /// Takes a scope even though Graphiti data has no `slug`: the scope carries
+    /// the `group_id`, which is the only partition this data has. Without it
+    /// this query read every tenant's facts, because engram wrote them all into
+    /// one literal group.
     pub async fn facts_for_tokens(
         &self,
+        scope: &GraphScope,
         tokens: &[String],
         limit: usize,
     ) -> Result<Vec<String>, GraphError> {
@@ -470,14 +563,14 @@ impl GraphClient {
         }
         self.strings(
             LEGACY_FACTS_FOR_TOKENS,
-            serde_json::json!({"names": tokens, "lim": limit}),
+            serde_json::json!({"names": tokens, "lim": limit, "tenant": scope.tenant()}),
         )
         .await
     }
 
     pub async fn native_facts_for_tokens(
         &self,
-        slug: &str,
+        scope: &GraphScope,
         tokens: &[String],
         limit: usize,
     ) -> Result<Vec<String>, GraphError> {
@@ -486,38 +579,48 @@ impl GraphClient {
         }
         self.strings(
             NATIVE_FACTS_FOR_TOKENS,
-            serde_json::json!({"slug": slug, "names": tokens, "lim": limit}),
+            serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "names": tokens, "lim": limit}),
         )
         .await
     }
 
     pub async fn semantic_files(
         &self,
+        scope: &GraphScope,
         vector: &[f32],
         limit: usize,
     ) -> Result<Vec<RecallHit>, GraphError> {
         self.file_hits(
             LEGACY_SEMANTIC_FILES,
-            serde_json::json!({"vector": vector, "limit": limit}),
+            serde_json::json!({"vector": vector, "limit": limit, "tenant": scope.tenant()}),
         )
         .await
     }
 
+    /// See [`LEGACY_KEYWORD_OVERFETCH`]: this leg rides a fulltext index that
+    /// cannot be partitioned, so it over-fetches and filters rather than
+    /// trusting the index's own limit.
     pub async fn keyword_files(
         &self,
+        scope: &GraphScope,
         query: &str,
         limit: usize,
     ) -> Result<Vec<RecallHit>, GraphError> {
         self.file_hits(
             LEGACY_KEYWORD_FILES,
-            serde_json::json!({"query": query, "limit": limit}),
+            serde_json::json!({
+                "query": query,
+                "limit": limit,
+                "overfetch": limit.saturating_mul(LEGACY_KEYWORD_OVERFETCH).max(limit),
+                "tenant": scope.tenant(),
+            }),
         )
         .await
     }
 
     pub async fn native_keyword_files(
         &self,
-        slug: &str,
+        scope: &GraphScope,
         query: &str,
         limit: usize,
     ) -> Result<Vec<RecallHit>, GraphError> {
@@ -548,27 +651,27 @@ impl GraphClient {
         }
         self.file_hits(
             NATIVE_KEYWORD_FILES,
-            serde_json::json!({"slug": slug, "tokens": tokens, "limit": limit}),
+            serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "tokens": tokens, "limit": limit}),
         )
         .await
     }
 
     pub async fn native_semantic_files(
         &self,
-        slug: &str,
+        scope: &GraphScope,
         vector: &[f32],
         limit: usize,
     ) -> Result<Vec<RecallHit>, GraphError> {
         self.file_hits(
             NATIVE_SEMANTIC_FILES,
-            serde_json::json!({"slug": slug, "vector": vector, "limit": limit}),
+            serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "vector": vector, "limit": limit}),
         )
         .await
     }
 
     pub async fn upsert_native_memory(
         &self,
-        slug: &str,
+        scope: &GraphScope,
         file: &str,
         name: &str,
         description: &str,
@@ -578,7 +681,7 @@ impl GraphClient {
         self.query(
             UPSERT_NATIVE_MEMORY,
             serde_json::json!({
-                "slug": slug,
+                "slug": scope.slug(), "tenant": scope.tenant(),
                 "file": file,
                 "name": name,
                 "description": description,
@@ -594,7 +697,7 @@ impl GraphClient {
     /// to date for the whole store. Call once, before syncing any memory.
     pub async fn set_native_memory_mtimes(
         &self,
-        slug: &str,
+        scope: &GraphScope,
         memories: &[(String, i64)],
     ) -> Result<(), GraphError> {
         if memories.is_empty() {
@@ -606,7 +709,7 @@ impl GraphClient {
             .collect::<Vec<_>>();
         self.query(
             SET_NATIVE_MEMORY_MTIMES,
-            serde_json::json!({"slug": slug, "memories": entries}),
+            serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "memories": entries}),
         )
         .await?;
         Ok(())
@@ -614,7 +717,7 @@ impl GraphClient {
 
     pub async fn native_memory_is_current(
         &self,
-        slug: &str,
+        scope: &GraphScope,
         file: &str,
         sha: &str,
         space: &str,
@@ -622,7 +725,7 @@ impl GraphClient {
         let response = self
             .query(
                 NATIVE_MEMORY_IS_CURRENT,
-                serde_json::json!({"slug": slug, "file": file, "sha": sha, "space": space}),
+                serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "file": file, "sha": sha, "space": space}),
             )
             .await?;
         Ok(response
@@ -637,13 +740,13 @@ impl GraphClient {
 
     pub async fn replace_native_facts(
         &self,
-        slug: &str,
+        scope: &GraphScope,
         file: &str,
         facts: &[String],
     ) -> Result<(), GraphError> {
         self.query(
             REPLACE_NATIVE_FACTS,
-            serde_json::json!({"slug": slug, "file": file, "facts": facts}),
+            serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "file": file, "facts": facts}),
         )
         .await?;
         Ok(())
@@ -651,14 +754,14 @@ impl GraphClient {
 
     pub async fn replace_native_triples(
         &self,
-        slug: &str,
+        scope: &GraphScope,
         file: &str,
         triples: &[NativeTriple],
     ) -> Result<(), GraphError> {
         let payload = triple_payload(triples);
         self.query(
             RETIRE_OBSOLETE_TRIPLES,
-            serde_json::json!({"slug": slug, "file": file, "triples": payload}),
+            serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "file": file, "triples": payload}),
         )
         .await?;
         if payload.is_empty() {
@@ -666,14 +769,14 @@ impl GraphClient {
         }
         self.query(
             WRITE_NATIVE_TRIPLES,
-            serde_json::json!({"slug": slug, "file": file, "triples": payload}),
+            serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "file": file, "triples": payload}),
         )
         .await?;
         let targets = supersession_targets(triples);
         if !targets.is_empty() {
             self.query(
                 APPLY_SUPERSESSION,
-                serde_json::json!({"slug": slug, "file": file, "targets": targets}),
+                serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "file": file, "targets": targets}),
             )
             .await?;
         }
@@ -682,7 +785,7 @@ impl GraphClient {
 
     pub async fn set_native_fact_embeddings(
         &self,
-        slug: &str,
+        scope: &GraphScope,
         file: &str,
         points: &[(&str, Vec<f32>)],
     ) -> Result<(), GraphError> {
@@ -691,7 +794,7 @@ impl GraphClient {
         }
         self.query(
             SET_NATIVE_FACT_EMBEDDINGS,
-            serde_json::json!({"slug": slug, "file": file, "points": points.iter().map(|(text, embedding)| serde_json::json!({"text": text, "embedding": embedding})).collect::<Vec<_>>() }),
+            serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "file": file, "points": points.iter().map(|(text, embedding)| serde_json::json!({"text": text, "embedding": embedding})).collect::<Vec<_>>() }),
         )
         .await?;
         Ok(())
@@ -700,23 +803,123 @@ impl GraphClient {
     /// Record that `file` is fully synced. Must be the LAST write of a sync.
     pub async fn mark_native_memory_current(
         &self,
-        slug: &str,
+        scope: &GraphScope,
         file: &str,
         sha: &str,
         space: &str,
     ) -> Result<(), GraphError> {
         self.query(
             MARK_NATIVE_MEMORY_CURRENT,
-            serde_json::json!({"slug": slug, "file": file, "sha": sha, "space": space}),
+            serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "file": file, "sha": sha, "space": space}),
         )
         .await?;
         Ok(())
     }
 
     /// Every memory file the graph holds for a slug.
-    pub async fn native_memory_files(&self, slug: &str) -> Result<Vec<String>, GraphError> {
+    /// Files Graphiti holds episodes for in `from_group`. See
+    /// [`MIGRATION_EPISODE_FILES`].
+    pub async fn migration_episode_files(
+        &self,
+        from_group: &str,
+    ) -> Result<Vec<String>, GraphError> {
         let response = self
-            .query(NATIVE_MEMORY_FILES, serde_json::json!({"slug": slug}))
+            .query(
+                MIGRATION_EPISODE_FILES,
+                serde_json::json!({"from": from_group}),
+            )
+            .await?;
+        Ok(response
+            .results
+            .into_iter()
+            .flat_map(|set| set.data)
+            .filter_map(|row| row.row.into_iter().next())
+            .filter_map(|value| value.as_array().cloned())
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect())
+    }
+
+    /// Move a whole Graphiti group. Returns (nodes, relationships) touched.
+    ///
+    /// Only valid once the caller has established that one tenant owns the
+    /// group — see [`MIGRATION_RELABEL_GROUP`].
+    pub async fn migration_relabel_group(
+        &self,
+        from_group: &str,
+        to_group: &str,
+    ) -> Result<(u64, u64), GraphError> {
+        let response = self
+            .query(
+                MIGRATION_RELABEL_GROUP,
+                serde_json::json!({"from": from_group, "tenant": to_group}),
+            )
+            .await?;
+        let row = response
+            .results
+            .into_iter()
+            .flat_map(|set| set.data)
+            .next()
+            .map(|row| row.row)
+            .unwrap_or_default();
+        let number = |index: usize| {
+            row.get(index)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+        };
+        Ok((number(0), number(1)))
+    }
+
+    /// How many pre-tenancy native nodes are present (no slug, no tenant).
+    pub async fn migration_count_unscoped_native(&self) -> Result<u64, GraphError> {
+        let response = self
+            .query(MIGRATION_COUNT_UNSCOPED_NATIVE, serde_json::json!({}))
+            .await?;
+        Ok(response
+            .results
+            .into_iter()
+            .flat_map(|set| set.data)
+            .next()
+            .and_then(|row| row.row.into_iter().next())
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default())
+    }
+
+    /// Delete the pre-tenancy native nodes. Batched, and capped, for the same
+    /// reason the legacy edge cache drop is: an unbounded loop against a large
+    /// graph is how a maintenance pass becomes an outage. An unreadable response
+    /// stops the loop rather than being treated as "done".
+    pub async fn migration_purge_unscoped_native(&self) -> Result<u64, GraphError> {
+        const MAX_BATCHES: usize = 100;
+        let mut purged = 0;
+        for _ in 0..MAX_BATCHES {
+            let response = self
+                .query(MIGRATION_PURGE_UNSCOPED_NATIVE, serde_json::json!({}))
+                .await?;
+            let batch = response
+                .results
+                .into_iter()
+                .flat_map(|set| set.data)
+                .next()
+                .and_then(|row| row.row.into_iter().next())
+                .and_then(|value| value.as_u64());
+            match batch {
+                Some(0) => return Ok(purged),
+                Some(count) => purged += count,
+                // Unreadable means "stop", not "finished": continuing would spin
+                // MAX_BATCHES times against a graph we cannot measure.
+                None => return Ok(purged),
+            }
+        }
+        Ok(purged)
+    }
+
+    pub async fn native_memory_files(&self, scope: &GraphScope) -> Result<Vec<String>, GraphError> {
+        let response = self
+            .query(
+                NATIVE_MEMORY_FILES,
+                serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant()}),
+            )
             .await?;
         Ok(response
             .results
@@ -737,12 +940,12 @@ impl GraphClient {
     /// Remove graph data for memories that are no longer in the store.
     pub async fn prune_missing_memories(
         &self,
-        slug: &str,
+        scope: &GraphScope,
         files: &[String],
     ) -> Result<(), GraphError> {
         self.query(
             PRUNE_MISSING_MEMORIES,
-            serde_json::json!({"slug": slug, "files": files}),
+            serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "files": files}),
         )
         .await?;
         Ok(())
@@ -750,10 +953,16 @@ impl GraphClient {
 
     /// Import legacy Graphiti facts as slug-scoped native facts, and clear out
     /// the abandoned edge cache the previous version of this import created.
-    pub async fn import_legacy_fact_embeddings(&self, slug: &str) -> Result<(), GraphError> {
+    pub async fn import_legacy_fact_embeddings(
+        &self,
+        scope: &GraphScope,
+    ) -> Result<(), GraphError> {
         for statement in [CREATE_NATIVE_FACT_INDEX, IMPORT_NATIVE_LEGACY_FACTS] {
-            self.query(statement, serde_json::json!({"slug": slug}))
-                .await?;
+            self.query(
+                statement,
+                serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant()}),
+            )
+            .await?;
         }
         // Batched, so a large legacy graph is cleaned without one transaction big
         // enough to fail — and capped, because "loop until a batch deletes
@@ -1021,7 +1230,7 @@ mod tests {
     #[test]
     fn supersession_is_bounded_in_both_directions() {
         assert!(
-            APPLY_SUPERSESSION.contains("{slug: $slug}"),
+            APPLY_SUPERSESSION.contains("{tenant: $tenant, slug: $slug}"),
             "not slug-scoped: {APPLY_SUPERSESSION}"
         );
         for guard in [
@@ -1110,32 +1319,167 @@ mod tests {
             // visible decision rather than a quiet carve-out: the abandoned edge
             // cache is deleted wholesale precisely BECAUSE those nodes predate
             // slug scoping and carry no slug to filter on.
-            if ["DROP_LEGACY_EDGE_CACHE"].contains(&name) {
+            if MIGRATION_STATEMENTS.contains(&name) || ["DROP_LEGACY_EDGE_CACHE"].contains(&name) {
                 continue;
             }
-            if !statement.contains("Engram") {
-                continue; // a Graphiti-only statement, scoped by Graphiti itself
+            // Graphiti's own labels. These used to be skipped outright, with the
+            // comment "scoped by Graphiti itself" — which was simply false.
+            // Graphiti partitions by `group_id`, and engram wrote the literal
+            // "canonical" for every memory in every store, so the skip exempted
+            // precisely the statements that were returning one project's facts
+            // to another. They are now checked for a $tenant group predicate.
+            let graphiti = ["(:Entity", "(n:Entity", "(ep:Episodic", "RELATES_TO"]
+                .iter()
+                .any(|label| statement.contains(label));
+            let native = statement.contains("Engram");
+            if !graphiti && !native {
+                continue;
+            }
+            if native {
+                assert!(
+                    statement.contains("$slug"),
+                    "{name} touches Engram* data without a $slug predicate"
+                );
             }
             assert!(
-                statement.contains("$slug"),
-                "{name} touches Engram* data without a $slug predicate"
+                statement.contains("$tenant"),
+                "{name} touches tenant-owned data without a $tenant predicate"
             );
+            // Per-PATTERN, not merely per-statement. The old check asked only
+            // whether `$slug` appeared somewhere in the string, which
+            // `WRITE_NATIVE_TRIPLES` satisfied while merging
+            // `(e:EngramEntity {name: name})` with no scope at all — entity
+            // nodes were global, shared across every store and every identity.
+            // Nothing read them, so it never surfaced; it would have the moment
+            // anything traversed MENTIONS or SUBJECT.
+            for pattern in scoped_patterns(statement) {
+                // Two spellings of the same partition, because the two data
+                // models name it differently: engram's own nodes carry
+                // `tenant`, and Graphiti's carry `group_id`. Both bind to
+                // $tenant, so a legacy install passes "canonical" to each and
+                // reads exactly what it read before.
+                assert!(
+                    pattern.contains("tenant: $tenant") || pattern.contains("group_id: $tenant"),
+                    "{name} has an unscoped node pattern: ({pattern})"
+                );
+            }
             checked.push(name.to_string());
         }
         // Guard the guard: if the parse silently matches nothing, the assertion
         // above is vacuous and we are back to a test that proves nothing.
         assert!(
-            checked.len() >= 14,
-            "expected to scan the native statements, only found {checked:?}"
+            checked.len() >= 18,
+            "expected to scan the native and Graphiti statements, only found {checked:?}"
         );
         // The legacy import is the statement class that slipped through a
-        // hand-written list; prove the scan reaches it.
-        assert!(
-            checked
-                .iter()
-                .any(|name| name == "IMPORT_NATIVE_LEGACY_FACTS"),
-            "the legacy import is not being scanned: {checked:?}"
+        // hand-written list; prove the scan reaches it. The Graphiti-only
+        // statements are the class the `!contains("Engram")` skip hid.
+        for required in [
+            "IMPORT_NATIVE_LEGACY_FACTS",
+            "LEGACY_FACTS_FOR_TOKENS",
+            "LEGACY_SEMANTIC_FILES",
+            "LEGACY_KEYWORD_FILES",
+            "WRITE_NATIVE_TRIPLES",
+        ] {
+            assert!(
+                checked.iter().any(|name| name == required),
+                "{required} is not being scanned: {checked:?}"
+            );
+        }
+    }
+
+    /// The statements exempt from the per-statement `$tenant` check, because
+    /// crossing groups is their whole purpose. Named here rather than skipped by
+    /// a pattern match, so adding one is a visible decision.
+    const MIGRATION_STATEMENTS: [&str; 4] = [
+        "MIGRATION_EPISODE_FILES",
+        "MIGRATION_RELABEL_GROUP",
+        "MIGRATION_COUNT_UNSCOPED_NATIVE",
+        "MIGRATION_PURGE_UNSCOPED_NATIVE",
+    ];
+
+    /// An exemption that only subtracts a check is how the `!contains("Engram")`
+    /// carve-out hid a live leak for as long as it did. So the migration
+    /// statements get a POSITIVE requirement instead of a bare pass.
+    ///
+    /// The invariant that matters is not "binds both groups" — a read-only
+    /// statement reading one group correctly binds one. It is that **no
+    /// migration statement may select its rows by nothing**: each must either be
+    /// group-scoped, or explicitly target the rows that predate both scoping
+    /// keys. And anything that *writes* a group must bind the group it writes.
+    #[test]
+    fn migration_statements_always_bound_their_rows() {
+        let mut checked = 0;
+        for declaration in include_str!("lib.rs").split("\nconst ").skip(1) {
+            let Some((name, body)) = declaration.split_once(": &str = ") else {
+                continue;
+            };
+            if !MIGRATION_STATEMENTS.contains(&name) {
+                continue;
+            }
+            let statement = body.split(";\n").next().unwrap_or_default();
+            let group_scoped = statement.contains("group_id");
+            // The pre-tenancy rows cannot be group-scoped — having no group is
+            // what identifies them — so their predicate is the absence itself.
+            let targets_unscoped =
+                statement.contains("slug IS NULL") && statement.contains("tenant IS NULL");
+            assert!(
+                group_scoped || targets_unscoped,
+                "{name} is exempt from tenant scoping and selects its rows by nothing"
+            );
+            if statement.contains("SET n.group_id") {
+                assert!(
+                    statement.contains("$tenant"),
+                    "{name} writes a group without binding the group it writes"
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            MIGRATION_STATEMENTS.len(),
+            "a named migration statement was not found in the source"
         );
+    }
+
+    /// Node patterns that look up data by identity, i.e. carry a `{...}` property
+    /// map, and therefore have to name the tenant.
+    ///
+    /// A pattern with no property map — `(f:EngramFact)` in a traversal — is
+    /// reached through an already-scoped variable and is legitimately unscoped;
+    /// requiring a predicate there would be noise. A pattern WITH a map is an
+    /// anchor, and an unscoped anchor is a cross-tenant read.
+    fn scoped_patterns(statement: &str) -> Vec<&str> {
+        let mut found = Vec::new();
+        let bytes = statement.as_bytes();
+        for (open, _) in statement.match_indices('(') {
+            // The pattern runs to its matching ')'. Property maps here contain
+            // no nested parens except in function calls like toLower(...), so
+            // track depth rather than taking the first ')'.
+            let mut depth = 0usize;
+            let mut close = None;
+            for (offset, byte) in bytes[open..].iter().enumerate() {
+                match byte {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else { continue };
+            let inner = &statement[open + 1..close];
+            // Only labelled node patterns with a property map.
+            let labelled = inner.contains(":Engram") || inner.contains(":Episodic");
+            if labelled && inner.contains('{') {
+                found.push(inner);
+            }
+        }
+        found
     }
 
     /// Recall must only surface claims that are both active and still open.

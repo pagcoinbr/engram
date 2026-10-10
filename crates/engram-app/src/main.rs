@@ -9,7 +9,7 @@ use clap::Parser;
 use engram_config::{Config, ModelProfile, recommended_embedders};
 use engram_hybrid::recall;
 use engram_models::OpenAiCompatibleClient;
-use engram_vector::QdrantClient;
+use engram_vector::{Corpus, QdrantClient};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -30,11 +30,26 @@ struct Args {
     config: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:8787")]
     bind: SocketAddr,
+    /// The agent identity this server serves. Required on an install that
+    /// defines tenants.
+    ///
+    /// One identity per process, like the MCP server: an operator wanting to
+    /// inspect two tenants runs two instances or uses the CLI. A per-request
+    /// tenant parameter would turn a loopback dashboard into a way to read any
+    /// identity's memories over HTTP, which is not a trade this endpoint needs
+    /// to make.
+    #[arg(long, env = "ENGRAM_TENANT")]
+    tenant: Option<String>,
 }
 
 #[derive(Clone)]
 struct AppState {
     config: PathBuf,
+    /// The requested tenant NAME, resolved against the config on each request
+    /// rather than at startup — the config is reloaded per request, so an
+    /// operator adding a `tenants:` block does not have to restart the server to
+    /// have it take effect.
+    tenant: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -178,7 +193,10 @@ async fn main() {
         .route("/api/v1/config/editor", get(editor).put(save_editor))
         .route("/api/v1/config/editor/validate", post(validate_editor))
         .route("/api/v1/recall", get(recall_api))
-        .with_state(Arc::new(AppState { config }));
+        .with_state(Arc::new(AppState {
+            config,
+            tenant: args.tenant,
+        }));
     // A bind failure is an operator problem, not a bug: the usual cause is an
     // older copy of this service still holding the port, and `unwrap()` reported
     // it as a panic with a bare `Os { code: 98 }`, which reads like a crash.
@@ -222,19 +240,35 @@ async fn index_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         Ok(config) => config,
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     };
+    // The same resolution `recall_api` uses, so the two endpoints cannot
+    // disagree about which identity this server serves. Resolving directly
+    // through `Tenant::resolve` here made /index/status refuse on a tenanted
+    // install while /recall worked — one process, two answers.
+    let tenant = match engram_tenant::resolve_tenant(
+        &config,
+        state.tenant.as_deref(),
+        &engram_paths::resolve_slug(None),
+        None,
+    ) {
+        Ok(tenant) => tenant,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
     // local_enabled is the documented master switch: with it off there is no index
     // work at all, whatever vector_store says.
     let mut status = IndexStatus {
         enabled: config.local_enabled && config.vector_store.enabled,
         local_enabled: config.local_enabled,
-        collection: config.vector_store.collection.clone(),
+        collection: tenant.memory_collection().to_string(),
         dimension: config.embed.dim,
         embedding_space: config.embedding_space_id(),
         points: None,
         error: None,
     };
     if status.enabled {
-        match QdrantClient::from_config(&config).count(None).await {
+        match QdrantClient::for_tenant(&config, &tenant, Corpus::Memory)
+            .count(None)
+            .await
+        {
             Ok(points) => status.points = Some(points),
             Err(error) => status.error = Some(error.to_string()),
         }
@@ -698,10 +732,22 @@ async fn recall_api(
 ) -> impl IntoResponse {
     // A `-root` default made this endpoint search a store that only exists on one
     // machine; resolve it the same way every other entry point does.
-    let slug = engram_paths::resolve_slug(query.slug.as_deref());
+    //
+    // Derive::Environment, not Cwd: a service's working directory says nothing
+    // about which project a request is about.
+    let resolved = match engram_tenant::resolve_for_cli(
+        &state.config,
+        state.tenant.as_deref(),
+        query.slug.as_deref(),
+        engram_tenant::Derive::Environment,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
     match recall(
         &state.config,
-        &slug,
+        &resolved.tenant,
+        &resolved.slug,
         &query.q,
         query.k.unwrap_or(6).clamp(1, 20),
     )

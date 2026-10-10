@@ -34,6 +34,11 @@ struct Args {
     // unusable as typed.
     #[arg(long, allow_hyphen_values = true)]
     slug: Option<String>,
+    /// The agent identity to inject memories for. Required on an install that
+    /// defines tenants; without it this hook injects nothing and says so on
+    /// stderr rather than guessing which identity the session belongs to.
+    #[arg(long, env = "ENGRAM_TENANT")]
+    tenant: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -67,7 +72,7 @@ async fn main() {
     // used the payload value; reading current_dir() here resolved a different
     // store, and a store that does not exist injects nothing, silently. The slug
     // was hard-wired to "-root" before that.
-    let slug = engram_paths::resolve_slug_in(
+    let derived = engram_paths::resolve_slug_in(
         args.slug.as_deref(),
         payload
             .cwd
@@ -80,12 +85,55 @@ async fn main() {
     // recall.inject was read by the Python hook and ignored here: `enabled` had no
     // effect and `k` was the literal 4. A config that cannot be read leaves the
     // documented defaults in place rather than disabling recall.
-    let inject = Config::load(&config_path)
-        .map(|config| config.recall.inject)
+    let config = Config::load(&config_path);
+    let inject = config
+        .as_ref()
+        .map(|config| config.recall.inject.clone())
         .unwrap_or_default();
     if !inject.enabled {
         return;
     }
+
+    // Resolve the identity before recalling anything.
+    //
+    // This hook is fail-open everywhere else — a missing config or a slow
+    // backend simply injects nothing, because delaying the user's prompt is
+    // worse than omitting context. A tenant failure is fail-open in the same
+    // direction, and that is also the SAFE direction: injecting nothing costs
+    // the user some context, while injecting another identity's memories is the
+    // single outcome the tenant model exists to prevent.
+    //
+    // Unlike the other failures this one is reported on stderr. Everything here
+    // is silent by design, and silence would hide the one mistake an operator is
+    // likely to make while setting tenants up: registering this hook without
+    // `--tenant`, which would otherwise look exactly like "no relevant
+    // memories" forever. Hook stderr surfaces in Claude Code's debug output.
+    let (tenant, slug) = match config
+        .map_err(|error| error.to_string())
+        .and_then(|config| {
+            // The identity follows the session's store, derived from the
+            // PAYLOAD cwd. This hook is registered once in settings.json and has
+            // to serve every identity on the host, so a fixed --tenant could
+            // serve one. A session in a directory no tenant claims injects
+            // nothing and says so, rather than borrowing another identity.
+            let tenant = engram_tenant::resolve_tenant(
+                &config,
+                args.tenant.as_deref(),
+                &derived,
+                args.slug.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+            let slug = tenant
+                .choose_slug(args.slug.as_deref(), &derived)
+                .map_err(|error| error.to_string())?;
+            Ok((tenant, slug))
+        }) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("engram-recall-hook: not injecting: {error}");
+            return;
+        }
+    };
 
     let session = payload
         .session_id
@@ -114,7 +162,7 @@ async fn main() {
     let budget = Duration::from_millis(inject.timeout_ms.max(250));
     let Ok(Ok(result)) = tokio::time::timeout(
         budget,
-        recall_fast(&config_path, &slug, prompt, inject.k.max(1)),
+        recall_fast(&config_path, &tenant, &slug, prompt, inject.k.max(1)),
     )
     .await
     else {

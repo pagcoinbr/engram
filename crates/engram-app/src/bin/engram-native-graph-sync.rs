@@ -29,6 +29,11 @@ struct Args {
     // unusable as typed.
     #[arg(long, allow_hyphen_values = true)]
     slug: Option<String>,
+    /// Which agent identity's graph to write. Required on an install that
+    /// defines tenants: every node this writes carries the tenant, and the
+    /// Graphiti group it reads legacy facts from is derived from it.
+    #[arg(long, env = "ENGRAM_TENANT")]
+    tenant: Option<String>,
     #[arg(long, default_value_t = 25)]
     limit: usize,
     #[arg(long)]
@@ -93,8 +98,23 @@ impl<T: Into<String>> From<T> for SyncError {
 
 async fn run(args: Args) -> Result<usize, SyncError> {
     let config_path = engram_paths::config_path(args.config);
-    let slug = engram_paths::resolve_slug(args.slug.as_deref());
-    let config = Config::load(&config_path).map_err(|error| error.to_string())?;
+    // Derive::Environment: this runs as a daemon job with an arbitrary working
+    // directory, so the store must not be inferred from one.
+    let engram_tenant::Resolved {
+        config,
+        tenant,
+        slug,
+    } = engram_tenant::resolve_for_cli(
+        &config_path,
+        args.tenant.as_deref(),
+        args.slug.as_deref(),
+        engram_tenant::Derive::Environment,
+    )?;
+    // Authorises every graph call below, and carries both the slug and the
+    // tenant into each statement.
+    let scope = tenant
+        .graph_scope(&slug)
+        .map_err(|error| error.to_string())?;
     if !config.local_enabled {
         return Err("local_enabled is false".into());
     }
@@ -122,7 +142,7 @@ async fn run(args: Args) -> Result<usize, SyncError> {
     // native install that needs it most.
     if args.import_legacy_embeddings {
         client
-            .import_legacy_fact_embeddings(&slug)
+            .import_legacy_fact_embeddings(&scope)
             .await
             .map_err(|error| error.to_string())?;
         return Ok(0);
@@ -168,7 +188,7 @@ async fn run(args: Args) -> Result<usize, SyncError> {
     if full_pass {
         let present: Vec<String> = memories.iter().map(|memory| memory.file.clone()).collect();
         client
-            .prune_missing_memories(&slug, &present)
+            .prune_missing_memories(&scope, &present)
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -186,7 +206,7 @@ async fn run(args: Args) -> Result<usize, SyncError> {
     // batched write up front, no model calls, and a no-op once values match.
     client
         .set_native_memory_mtimes(
-            &slug,
+            &scope,
             &memories
                 .iter()
                 .map(|memory| (memory.file.clone(), memory.source_mtime))
@@ -214,7 +234,7 @@ async fn run(args: Args) -> Result<usize, SyncError> {
             )
         );
         if client
-            .native_memory_is_current(&slug, &memory.file, &sha, &space)
+            .native_memory_is_current(&scope, &memory.file, &sha, &space)
             .await
             .map_err(|error| error.to_string())?
         {
@@ -227,7 +247,7 @@ async fn run(args: Args) -> Result<usize, SyncError> {
             &config,
             &reasoning,
             &embeddings,
-            &slug,
+            &scope,
             &space,
             &sha,
             memory,
@@ -254,7 +274,7 @@ async fn sync_memory(
     config: &Config,
     reasoning: &OpenAiCompatibleClient,
     embeddings: &OpenAiCompatibleClient,
-    slug: &str,
+    scope: &engram_tenant::GraphScope,
     space: &str,
     sha: &str,
     memory: &engram_store::Memory,
@@ -311,7 +331,7 @@ async fn sync_memory(
 
     client
         .upsert_native_memory(
-            slug,
+            scope,
             &memory.file,
             &safe_name,
             &safe_description,
@@ -321,7 +341,7 @@ async fn sync_memory(
         .await
         .map_err(|error| error.to_string())?;
     client
-        .replace_native_facts(slug, &memory.file, &extracted)
+        .replace_native_facts(scope, &memory.file, &extracted)
         .await
         .map_err(|error| error.to_string())?;
 
@@ -336,16 +356,16 @@ async fn sync_memory(
         fact_vectors.push((fact.as_str(), vector));
     }
     client
-        .set_native_fact_embeddings(slug, &memory.file, &fact_vectors)
+        .set_native_fact_embeddings(scope, &memory.file, &fact_vectors)
         .await
         .map_err(|error| error.to_string())?;
     client
-        .replace_native_triples(slug, &memory.file, &triples)
+        .replace_native_triples(scope, &memory.file, &triples)
         .await
         .map_err(|error| error.to_string())?;
     // Last: everything above committed, so this memory really is current.
     client
-        .mark_native_memory_current(slug, &memory.file, sha, space)
+        .mark_native_memory_current(scope, &memory.file, sha, space)
         .await
         .map_err(|error| error.to_string())
 }
