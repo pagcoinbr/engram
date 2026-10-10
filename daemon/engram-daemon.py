@@ -52,10 +52,10 @@ except Exception:
 #   maintenance = fixate SCORE + light_pass -> nightly (signals move over days).
 #   distill (LLM) is gated WEEKLY inside memory_fixate_cron.sh.
 DEFAULT_INTERVALS = {"health": 300, "approvals": 300, "harvest": 3600,
-                     "graph": 1800, "vector": 1800, "maintenance": 86400,
-                     "curate": 604800, "export": 86400, "reconcile": 86400}
-ORDER = ["health", "approvals", "harvest", "graph", "vector", "maintenance",
-         "curate", "export", "reconcile"]
+                     "graph": 1800, "vector": 1800, "wiki": 1800, "maintenance": 86400,
+                     "backup": 86400, "curate": 604800, "export": 86400, "reconcile": 86400}
+ORDER = ["health", "approvals", "harvest", "graph", "vector", "wiki", "maintenance",
+         "backup", "curate", "export", "reconcile"]
 
 
 def cfg():
@@ -81,6 +81,67 @@ def memory_slug() -> str:
     except Exception:
         pass
     return str(HOME).replace("/", "-")
+
+
+def tenants() -> list:
+    """The agent identities this daemon serves, as (tenant_name_or_None, slug)
+    pairs — exactly one entry per store that needs indexing.
+
+    This daemon used to own ONE store (`memory_slug()`), which is still right for
+    a pre-tenancy install: it yields a single (None, slug) pair and every task
+    behaves as before. With tenants configured it yields one pair per declared
+    store, and each task iterates — because a tenant's index is addressed by its
+    own Qdrant collection and Graphiti group, so one pass per identity is the
+    only way to write them all.
+
+    Unassigned stores are deliberately NOT included. A store no tenant claims has
+    no collection to be written to, and guessing one would put it in whichever
+    identity ran last. `engram-tenant-migrate` is where that gets resolved.
+    """
+    config = cfg()
+    declared = (config.get("tenants") or {}) if isinstance(config, dict) else {}
+    if not declared:
+        return [(None, memory_slug())]
+    pairs = []
+    for name in sorted(declared):
+        for slug in ((declared[name] or {}).get("slugs") or []):
+            slug = str(slug).strip()
+            if slug:
+                pairs.append((name, slug))
+    if not pairs:
+        log("tenants are configured but none declares a slug — nothing to index")
+    return pairs
+
+
+def _scoped(argv: list, tenant, slug: str) -> list:
+    """Add --slug and, when tenancy is in use, --tenant to a child invocation.
+
+    The tenant flag is omitted entirely on a pre-tenancy install rather than
+    passed as an empty string: the binaries refuse a --tenant that names nothing,
+    which is the correct behaviour and would otherwise break every existing
+    install the moment this daemon was upgraded.
+    """
+    argv = argv + ["--slug", slug]
+    if tenant:
+        argv += ["--tenant", tenant]
+    return argv
+
+
+def _per_tenant(label: str, run_one) -> bool:
+    """Run `run_one(tenant, slug)` for every identity, isolating failures.
+
+    One tenant's unreachable backend must not stop the others — the whole point
+    of separate identities is that they are independent, and a shared failure
+    mode would undo that at the orchestration layer.
+    """
+    results = []
+    for tenant, slug in tenants():
+        try:
+            results.append(bool(run_one(tenant, slug)))
+        except Exception as error:
+            log("%s: %s/%s failed: %s" % (label, tenant or "(untenanted)", slug, error))
+            results.append(False)
+    return all(results) if results else False
 
 
 def graph_backend() -> str:
@@ -277,8 +338,9 @@ def task_graph():
         # The native backend is selected, so the READER queries the native index.
         # Only the native writer may run here.
         if rust_sync and rust_native_sync_supported():
-            return _run([str(rust_sync), "--config", str(ENGRAM_CONFIG),
-                         "--slug", memory_slug(), "--limit", "25"]) == 0
+            return _per_tenant("graph", lambda tenant, slug: _run(_scoped(
+                [str(rust_sync), "--config", str(ENGRAM_CONFIG)],
+                tenant, slug) + ["--limit", "25"]) == 0)
         # Do NOT fall back to graph_sync.py: it writes the Graphiti index, which
         # nothing is reading in this configuration. The old fallback produced a
         # split brain — writes landing in one index while recall queried the
@@ -290,8 +352,12 @@ def task_graph():
             "graph.backend: graphiti_compat to use the Python writer."
             % (rust_embedding_supported(), rust_reasoning_supported()))
         return False
-    return _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"),
-                 "--insert", "--limit", "25"]) == 0
+    # Per tenant, like the vector task: graph_sync reads ONE store and inserts
+    # into ONE Graphiti group, so a single pass would index whichever store the
+    # environment happened to name and leave the others unsynced.
+    return _per_tenant("graph", lambda tenant, slug: _run(_scoped(
+        [sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--insert"],
+        tenant, slug) + ["--limit", "25"]) == 0)
 
 def task_vector():
     if not _vector_enabled():
@@ -301,9 +367,79 @@ def task_vector():
         return False
     rust_index = _rust("engram-index")
     if rust_index and rust_embedding_supported():
-        return _run([str(rust_index), "--config", str(ENGRAM_CONFIG),
-                     "--slug", memory_slug()]) == 0
+        return _per_tenant("vector", lambda tenant, slug: _run(_scoped(
+            [str(rust_index), "--config", str(ENGRAM_CONFIG)], tenant, slug)) == 0)
     return _run([_vector_python(), str(ENGRAM_VECTOR / "vector_sync.py"), "--insert"]) == 0
+
+def task_wiki():
+    """Index each tenant's Obsidian vault.
+
+    Per TENANT, not per store: a vault belongs to an identity, and several of a
+    tenant's memory stores would otherwise each trigger a full re-walk of the
+    same vault. Tenants with no `vault:` are skipped silently — that is the
+    normal state for an identity that only keeps memories.
+
+    Needs the Rust indexer; there is no Python wiki path, so when the binary is
+    absent or the provider is one it cannot serve, this is a no-op rather than a
+    fallback to something that would write a different index.
+    """
+    if not _vector_enabled():
+        return
+    rust_wiki = _rust("engram-wiki-index")
+    if not rust_wiki or not rust_embedding_supported():
+        return
+    if not _qdrant_up():
+        log("wiki: Qdrant down — skipping")
+        return False
+    config = cfg()
+    declared = (config.get("tenants") or {}) if isinstance(config, dict) else {}
+    vaulted = [name for name in sorted(declared)
+               if ((declared[name] or {}).get("vault") or "").strip()]
+    if not vaulted:
+        return
+    results = []
+    for name in vaulted:
+        try:
+            results.append(_run([str(rust_wiki), "--config", str(ENGRAM_CONFIG),
+                                 "--tenant", name]) == 0)
+        except Exception as error:
+            log("wiki: %s failed: %s" % (name, error))
+            results.append(False)
+    return all(results)
+
+
+def task_backup():
+    """Daily encrypted off-host backup of the authoritative data.
+
+    No-op unless `backup.enabled` AND the restic password is present, exactly
+    like task_vector no-ops when Qdrant is down: a backup that cannot run is a
+    one-line log, never a crash. Returns False (so the tick does NOT stamp it,
+    and it retries next tick) when the password is missing or restic is absent —
+    a transient misconfiguration should not cost a whole day. A clean run, or an
+    explicitly-disabled backup, returns True so the daily interval holds.
+
+    One whole-system snapshot: the per-tenant iteration the other tasks do does
+    not apply, the backup is of everything at once.
+    """
+    b = (cfg().get("backup") or {})
+    if not (isinstance(b, dict) and b.get("enabled")):
+        return True  # disabled is a settled state, not a deferral
+    script = ENGRAM_BIN / "engram_backup.py"
+    if not script.is_file():
+        log("backup: engram_backup.py not installed — skipping")
+        return False
+    if not (os.environ.get("ENGRAM_BACKUP_PASSWORD") or "").strip():
+        log("backup: ENGRAM_BACKUP_PASSWORD not set (put it in daemon.env) — skipping")
+        return False
+    # restic's own presence is checked inside engram_backup.py, which exits with
+    # a clear message the daemon logs; no need to duplicate the probe here.
+    check_every = int(b.get("check_every_days", 7) or 0)
+    # The script owns the backup+prune and its own periodic-check timer, so the
+    # daemon stays a dumb scheduler and nothing writes daemon_state.json from
+    # inside a task (tick() rewrites it wholesale at the end of the tick).
+    return _run([sys.executable, str(script), "backup",
+                 "--check-every-days", str(check_every)], timeout=3600) == 0
+
 
 def _generate_available() -> bool:
     """Can the configured backend (or its fallback) actually generate right now?
@@ -398,11 +534,18 @@ def _graphiti_maintenance(mode: str, *python_args: str) -> bool:
         log(f"{mode}: native backend selected and there is no native {mode} — "
             f"SKIPPING (graph.backend: graphiti_compat enables the Graphiti one)")
         return False
+    # Per tenant: export regenerates .md from ONE store's episodes and reconcile
+    # reads ONE group, so an unscoped pass operates on whichever store the
+    # environment names and reports success for the rest.
     rust_sync = _rust("engram-graph-sync")
     if rust_sync:
-        return _run([str(rust_sync), "--config", str(ENGRAM_CONFIG),
-                     "--graph-dir", str(ENGRAM_GRAPH), "--mode", mode]) == 0
-    return _run([sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), *python_args]) == 0
+        return _per_tenant(mode, lambda tenant, slug: _run(_scoped(
+            [str(rust_sync), "--config", str(ENGRAM_CONFIG),
+             "--graph-dir", str(ENGRAM_GRAPH)], tenant, slug)
+            + ["--mode", mode]) == 0)
+    return _per_tenant(mode, lambda tenant, slug: _run(_scoped(
+        [sys.executable, str(ENGRAM_GRAPH / "graph_sync.py")], tenant, slug)
+        + list(python_args)) == 0)
 
 def task_export():
     if not _neo4j_up():
@@ -424,7 +567,8 @@ def task_approvals():
     _run([sys.executable, str(gate), "--poll"], timeout=60)
 
 TASKS = {"health": task_health, "approvals": task_approvals, "harvest": task_harvest,
-         "graph": task_graph, "vector": task_vector, "maintenance": task_maintenance,
+         "graph": task_graph, "vector": task_vector, "wiki": task_wiki,
+         "backup": task_backup, "maintenance": task_maintenance,
          "curate": task_curate, "export": task_export, "reconcile": task_reconcile}
 
 

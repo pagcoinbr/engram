@@ -157,19 +157,48 @@ def embed(text: str, cfg: dict, timeout: float = 5.0, kind: str = "query") -> li
                  timeout=timeout)["embeddings"][0]
 
 
+def _vector_collection(cfg: dict, tenant: str | None) -> str | None:
+    """The Qdrant collection to search, or None meaning "refuse — do not search".
+
+    Per-tenant collections ARE the isolation boundary, so on a tenanted install
+    this must be the active tenant's suffixed collection, never the shared
+    `engram_memory`. A slug that no tenant claims (`tenant is None` while tenancy
+    is on) returns None so recall yields nothing rather than reading another
+    identity's vectors. An explicit ENGRAM_VECTOR_COLLECTION override still wins."""
+    override = os.environ.get("ENGRAM_VECTOR_COLLECTION")
+    if override:
+        return override
+    try:
+        import engram_tenant
+        tenanted = engram_tenant.tenancy_enabled(cfg)
+    except Exception:
+        tenanted = False
+    if not tenanted:
+        return (cfg.get("vector_store", {}) or {}).get("collection") or "engram_memory"
+    if not tenant:
+        return None                      # unclaimed slug -> never the shared collection
+    try:
+        return engram_tenant.resolve(cfg, tenant).memory_collection
+    except Exception:
+        return None                      # cannot resolve -> refuse rather than leak
+
+
 def vector_leg(query: str, k: int, mtype: str = "", cfg: dict | None = None,
-               timeout: float = 5.0) -> list[dict]:
+               timeout: float = 5.0, tenant: str | None = None) -> list[dict]:
     """Qdrant semantic hits over the REST API — stdlib only, deliberately NOT via
     qdrant_client: importing that library measures 0.78s against a 0.04s search, and
-    this runs on every prompt. Same collection, same payload, same slug/type filter
-    as vector_store.search(); it is the transport that differs, not the semantics."""
+    this runs on every prompt. Same payload and slug/type filter as
+    vector_store.search(); the COLLECTION is resolved per tenant (the isolation
+    boundary), and an unresolvable/unclaimed tenant returns nothing, not shared data."""
     cfg = cfg or memory_ai.load()
     try:
         if not memory_ai.vector_enabled(cfg):
             return []
+        coll = _vector_collection(cfg, tenant)
+        if not coll:
+            return []
         vs = cfg.get("vector_store", {}) or {}
         url = (os.environ.get("ENGRAM_QDRANT_URL") or vs.get("url") or "http://127.0.0.1:6333").rstrip("/")
-        coll = os.environ.get("ENGRAM_VECTOR_COLLECTION") or vs.get("collection") or "engram_memory"
         must = []
         if mtype:
             must.append({"key": "type", "match": {"value": mtype}})
@@ -202,7 +231,37 @@ def keyword_leg(query: str, k: int, mtype: str = "") -> list[tuple]:
         return []
 
 
-def graph_recall_leg(query: str, k: int, mtype: str = "", timeout: int = 120) -> list[dict]:
+def graph_group(tenant: str = None) -> str:
+    """The Graphiti group_id for the active identity.
+
+    Every memory was inserted under one literal group, so an unscoped graph query
+    returns another project's facts. Resolved through engram_tenant so the Python
+    and Rust recall paths partition identically; on an install with no `tenants:`
+    block this is the historical group and nothing changes.
+    """
+    import engram_tenant
+
+    return engram_tenant.resolve(requested=tenant).graph_group
+
+
+def _recall_tenant(slug: str, cfg: dict) -> tuple[bool, str | None]:
+    """(tenancy_enabled, tenant_name) for the store being recalled.
+
+    (False, None) -> pre-tenancy install: legacy collection + canonical group,
+    exactly as before. (True, name) -> scope every leg to that tenant. (True,
+    None) -> the slug is claimed by NO tenant; the caller must return nothing
+    rather than read shared/legacy data (the cross-tenant leak this prevents)."""
+    try:
+        import engram_tenant
+        if not engram_tenant.tenancy_enabled(cfg):
+            return False, None
+        return True, engram_tenant.tenant_of_slug(slug, cfg)
+    except Exception:
+        return False, None
+
+
+def graph_recall_leg(query: str, k: int, mtype: str = "", timeout: int = 120,
+                     tenant: str = None) -> list[dict]:
     """Full graphiti hybrid search, out-of-process in the graph venv. Seconds, not
     milliseconds — for interactive recall, never for the prompt hook."""
     script = ENGRAM_GRAPH / "memory_graph_recall.py"
@@ -210,7 +269,8 @@ def graph_recall_leg(query: str, k: int, mtype: str = "", timeout: int = 120) ->
         return []
     py = GRAPH_PY if Path(GRAPH_PY).exists() else sys.executable
     try:
-        r = subprocess.run([py, str(script), query, "--k", str(k), "--json"],
+        r = subprocess.run([py, str(script), query, "--k", str(k),
+                            "--group", graph_group(tenant), "--json"],
                            capture_output=True, text=True, timeout=timeout)
         if r.returncode or not r.stdout.strip():
             return []
@@ -265,7 +325,7 @@ def _neo4j_http() -> tuple[str, str]:
 
 
 def graph_facts(query: str, max_facts: int = 6, max_tokens: int = 6,
-                timeout: float = 5.0) -> list[str]:
+                timeout: float = 5.0, tenant: str = None) -> list[str]:
     """The cheap graph leg: 1-hop RELATES_TO facts for entities named in the query.
     One HTTP round trip for all tokens (UNWIND), so cost is flat in token count."""
     try:
@@ -281,9 +341,15 @@ def graph_facts(query: str, max_facts: int = 6, max_tokens: int = 6,
         if not tokens:
             return []
         res = _post(endpoint, {"statements": [{
+            # group_id-scoped, like the Rust LEGACY_FACTS_FOR_TOKENS. Without it
+            # this leg reads every identity's facts, because engram wrote them all
+            # into one group.
             "statement": "UNWIND $names AS nm MATCH (n:Entity)-[r:RELATES_TO]-(m:Entity) "
-                         "WHERE toLower(n.name)=toLower(nm) RETURN r.fact AS fact LIMIT $lim",
-            "parameters": {"names": tokens, "lim": max_facts}}]},
+                         "WHERE toLower(n.name)=toLower(nm) AND n.group_id = $grp "
+                         "AND m.group_id = $grp AND r.group_id = $grp "
+                         "RETURN r.fact AS fact LIMIT $lim",
+            "parameters": {"names": tokens, "lim": max_facts,
+                           "grp": graph_group(tenant)}}]},
             {"Authorization": auth}, timeout)
         rows = res["results"][0]["data"]
         return [r["row"][0] for r in rows if r["row"] and r["row"][0]][:max_facts]
@@ -308,13 +374,26 @@ def recall(query: str, k: int = 6, mtype: str = "", fast: bool = False,
     """Hybrid recall. fast=True swaps the graphiti graph leg for 1-hop neighbour
     facts, which is the difference between ~0.3s and several seconds. `timeout`
     bounds each HTTP leg (the prompt hook lowers it)."""
-    resolve_slug(cwd)
+    slug = resolve_slug(cwd)
     cfg = memory_ai.load()
+    # Resolve the identity ONCE and scope every leg to it. On a tenanted install a
+    # slug that no tenant claims must return nothing, not another identity's data.
+    enabled, tenant = _recall_tenant(slug, cfg)
+    if enabled and tenant is None:
+        return {"query": query, "results": [], "facts": [],
+                "sources_used": [], "warning": f"slug {slug!r} is claimed by no tenant"}
     want = max(k * 2, 10)
-    vector_hits = vector_leg(query, want, mtype, cfg, timeout)
     keyword_pairs = keyword_leg(query, want, mtype)
-    graph_records = [] if fast else graph_recall_leg(query, want, mtype)
+    graph_records = [] if fast else graph_recall_leg(query, want, mtype, tenant=tenant)
     facts = graph_facts(query, timeout=timeout) if fast else []
+    # Embed the query ONCE. The graphiti graph leg (graph_recall_leg) runs its own
+    # dense semantic search, so an independent Qdrant vector_leg here re-embeds the
+    # same query for an overlapping result — one recall, two identical calls to the
+    # embedding model. Mirror the Rust compat path, which disables its vector leg
+    # when graphiti owns recall: run the vector leg only when the graph leg did not
+    # (fast mode, or a graph that is down / returned nothing). Never both. The vector
+    # leg is scoped to the tenant's own collection (see _vector_collection).
+    vector_hits = [] if graph_records else vector_leg(query, want, mtype, cfg, timeout, tenant=tenant)
     results = fuse_records(graph_records, vector_hits, keyword_pairs, cfg, k)
     return {"query": query, "results": results, "facts": facts,
             "sources_used": sorted({s for r in results for s in r["sources"]})}

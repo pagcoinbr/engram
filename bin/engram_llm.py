@@ -33,7 +33,7 @@ CLI:
   engram_llm.py --embed                 # read text on stdin, print JSON vector
 """
 from __future__ import annotations
-import hashlib, json, os, re, shutil, struct, subprocess, sys, urllib.request
+import hashlib, json, os, re, shutil, struct, subprocess, sys, time, urllib.request
 from pathlib import Path
 
 # Make sibling modules importable; the sibling (this dir) wins over ~/.claude so
@@ -42,6 +42,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 if str(Path.home() / ".claude") not in sys.path:
     sys.path.append(str(Path.home() / ".claude"))
 import memory_ai  # config loader (no engram_llm import there = no import cycle)
+
+# Audit of generation calls (loop visibility). Guarded: a missing module must never
+# break generation — see bin/engram_llm_audit.py.
+try:
+    import engram_llm_audit as _audit
+except Exception:  # pragma: no cover - defensive
+    _audit = None
+
+
+def _err_detail(exc) -> str:
+    """A sanitized error label — class name (+ HTTP code), never raw stderr/reason,
+    which could echo prompt or response text into the shared, cross-tenant log."""
+    code = getattr(exc, "code", None)
+    return f"{type(exc).__name__}:{code}" if code else type(exc).__name__
+
+
+def _audit_gen(*, kind, backend, endpoint, model, role, prompt, call_id,
+               attempt, t0, outcome, detail=""):
+    """Record one generation attempt. Best-effort; never raises into the caller."""
+    if _audit is None:
+        return
+    try:
+        _audit.record(src="engram_llm", kind=kind, call_id=call_id, attempt=attempt,
+                      backend=backend, endpoint=endpoint or "", model=model or "",
+                      role=role or "", chars=len(prompt or ""),
+                      digest=_audit.digest(prompt or ""),
+                      ms=int((time.time() - t0) * 1000), outcome=outcome, detail=detail)
+    except Exception:
+        pass
+
+
+def _call_id() -> str:
+    return _audit.new_call_id() if _audit else ""
 
 # ---------------------------------------------------------------------------
 # Tier presets: hardware class -> {role: ollama model}. A per-role override in
@@ -113,7 +146,7 @@ def _ccg_gateway_from_cli() -> str | None:
     return m.group(1) if m else None
 
 
-def _ccg_generate(prompt: str, role: str, cfg) -> str:
+def _ccg_generate(prompt: str, role: str, cfg, *, audit_kind: str = "generation") -> str:
     """Generation via cc-gateway (ccg): the Claude Code CLI pointed at the ccg OAuth
     proxy (ANTHROPIC_BASE_URL) with the ccg client key (ANTHROPIC_API_KEY). ccg swaps
     the client key for the real Claude.ai OAuth token, so this works HEADLESS (no local
@@ -123,6 +156,11 @@ def _ccg_generate(prompt: str, role: str, cfg) -> str:
     # Explicit config wins; fall back to the installed `ccg` CLI's gateway host.
     base_url = gc.get("base_url") or os.environ.get("ANTHROPIC_BASE_URL") or _ccg_gateway_from_cli()
     if not base_url:
+        # Preflight rejection happens before _claude_generate would log it — record
+        # it here so a misconfigured ccg is visible in the audit, not just absent.
+        _audit_gen(kind=audit_kind, backend="ccg", endpoint="", model="", role=role,
+                   prompt=prompt, call_id=_call_id(), attempt=1, t0=time.time(),
+                   outcome="error", detail="preflight_no_base_url")
         raise RuntimeError("ccg backend: no base_url configured (ccg.base_url, ANTHROPIC_BASE_URL, or an installed `ccg` CLI)")
     # Require the configured key env EXPLICITLY. No implicit ANTHROPIC_API_KEY
     # fallback: that would ship the REAL Anthropic key to the gateway as the client
@@ -131,6 +169,9 @@ def _ccg_generate(prompt: str, role: str, cfg) -> str:
     key_env = gc.get("api_key_env", "ENGRAM_CCG_KEY")
     key = os.environ.get(key_env)
     if not key:
+        _audit_gen(kind=audit_kind, backend="ccg", endpoint=base_url, model="", role=role,
+                   prompt=prompt, call_id=_call_id(), attempt=1, t0=time.time(),
+                   outcome="error", detail="preflight_no_key")
         raise RuntimeError(f"ccg backend: api key env {key_env!r} not set")
     # ccg reuses the claude CLI path/flags; override model from the ccg block if given.
     sub = dict(cfg)
@@ -142,7 +183,7 @@ def _ccg_generate(prompt: str, role: str, cfg) -> str:
         sub = {**cfg, "claude": cc}
     return _claude_generate(prompt, role, sub,
                             env_extra={"ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_API_KEY": key},
-                            label="ccg")
+                            label="ccg", audit_kind=audit_kind)
 
 
 def generate(prompt: str, role: str = "distill", cfg=None) -> str:
@@ -205,7 +246,7 @@ def _strip_think(text: str) -> str:
     return t.strip()
 
 
-def _llamacpp_generate(prompt: str, role: str, cfg) -> str:
+def _llamacpp_generate(prompt: str, role: str, cfg, *, audit_kind: str = "generation") -> str:
     """Generation via an OpenAI-compatible llama.cpp server (llama-server /v1).
     Single user message, no tools — pure text. Honors num_predict as max_tokens."""
     lc = cfg.get("llama_cpp", {})
@@ -230,12 +271,22 @@ def _llamacpp_generate(prompt: str, role: str, cfg) -> str:
     req = urllib.request.Request(f"{url}/chat/completions",
                                  data=json.dumps(body).encode(), headers=headers)
     timeout = int(lc.get("timeout_seconds", _timeout(cfg)))
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.loads(r.read().decode())
-    return _strip_think(data["choices"][0]["message"]["content"])
+    call_id, t0 = _call_id(), time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode())
+        text = _strip_think(data["choices"][0]["message"]["content"])
+    except Exception as exc:
+        _audit_gen(kind=audit_kind, backend="llama_cpp", endpoint=url, model=body["model"],
+                   role=role, prompt=prompt, call_id=call_id, attempt=1, t0=t0,
+                   outcome="error", detail=_err_detail(exc))
+        raise
+    _audit_gen(kind=audit_kind, backend="llama_cpp", endpoint=url, model=body["model"],
+               role=role, prompt=prompt, call_id=call_id, attempt=1, t0=t0, outcome="ok")
+    return text
 
 
-def _ollama_generate(prompt: str, role: str, cfg) -> str:
+def _ollama_generate(prompt: str, role: str, cfg, *, audit_kind: str = "generation") -> str:
     oc = cfg.get("ollama", {})
     options = {
         "temperature": float(oc.get("temperature", 0.2)),
@@ -257,11 +308,22 @@ def _ollama_generate(prompt: str, role: str, cfg) -> str:
     req = urllib.request.Request(f"{_ollama_host(cfg)}/api/generate",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=_timeout(cfg)) as r:
-        # Strip CoT here too. The llama.cpp path already did this; ollama did not,
-        # so a reasoning model's <think> block leaked into JSON-expecting callers
-        # (harvest/distill) — which is why `think` was pinned False upstream.
-        return _strip_think(json.loads(r.read().decode())["response"])
+    endpoint, model = _ollama_host(cfg), body["model"]
+    call_id, t0 = _call_id(), time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=_timeout(cfg)) as r:
+            # Strip CoT here too. The llama.cpp path already did this; ollama did not,
+            # so a reasoning model's <think> block leaked into JSON-expecting callers
+            # (harvest/distill) — which is why `think` was pinned False upstream.
+            text = _strip_think(json.loads(r.read().decode())["response"])
+    except Exception as exc:
+        _audit_gen(kind=audit_kind, backend="ollama", endpoint=endpoint, model=model,
+                   role=role, prompt=prompt, call_id=call_id, attempt=1, t0=t0,
+                   outcome="error", detail=_err_detail(exc))
+        raise
+    _audit_gen(kind=audit_kind, backend="ollama", endpoint=endpoint, model=model,
+               role=role, prompt=prompt, call_id=call_id, attempt=1, t0=t0, outcome="ok")
+    return text
 
 
 # A "not authenticated" failure is PERMANENT within a run (expired OAuth with no
@@ -280,7 +342,8 @@ class BackendAuthError(RuntimeError):
     route around the gateway's auth/audit/DLP boundary (a data-exfil path)."""
 
 
-def _claude_generate(prompt: str, role: str, cfg, env_extra=None, label="claude -p") -> str:
+def _claude_generate(prompt: str, role: str, cfg, env_extra=None, label="claude -p",
+                     *, audit_kind: str = "generation") -> str:
     """Headless generation via the Claude Code CLI. No tools, single turn — pure text.
     Flags are configurable (cfg['claude']) since they can vary by CLI version.
     `env_extra` injects env vars into the subprocess (used by the ccg backend to set
@@ -306,21 +369,43 @@ def _claude_generate(prompt: str, role: str, cfg, env_extra=None, label="claude 
     attempts = max(1, int(cc.get("retries", 3)))
     backoff = float(cc.get("retry_backoff_seconds", 5))
     last_err = None
+    # One audit line per real subprocess attempt (so 3 retries = 3 lines sharing a
+    # call_id). backend "ccg" vs "claude" is carried via the label; detail is a
+    # sanitized token (exit code / timeout / auth), never the subprocess blob.
+    _backend = "ccg" if label == "ccg" else "claude"
+    _endpoint = (env_extra or {}).get("ANTHROPIC_BASE_URL") or "claude-cli"
+    _model = cc.get("model") or "claude"
+    _cid = _call_id()
     for attempt in range(attempts):
+        t0 = time.time()
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                                  check=True, env=env)
+            _audit_gen(kind=audit_kind, backend=_backend, endpoint=_endpoint, model=_model,
+                       role=role, prompt=prompt, call_id=_cid, attempt=attempt + 1, t0=t0,
+                       outcome="ok")
             break
         except FileNotFoundError:
+            _audit_gen(kind=audit_kind, backend=_backend, endpoint=_endpoint, model=_model,
+                       role=role, prompt=prompt, call_id=_cid, attempt=attempt + 1, t0=t0,
+                       outcome="error", detail="FileNotFoundError")
             raise RuntimeError(f"claude CLI not found (configured bin: {claude_bin!r})")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             blob = ((getattr(e, "stderr", "") or "") + (getattr(e, "stdout", "") or ""))[:400]
             kind = "timeout" if isinstance(e, subprocess.TimeoutExpired) else f"exit {e.returncode}"
             if _AUTH_FAIL_RE.search(blob):
+                _audit_gen(kind=audit_kind, backend=_backend, endpoint=_endpoint, model=_model,
+                           role=role, prompt=prompt, call_id=_cid, attempt=attempt + 1, t0=t0,
+                           outcome="error", detail="auth")
                 raise BackendAuthError(
                     f"{label} auth/policy denied ({blob.strip() or 'no detail'}) — non-retryable; "
                     f"check credentials. NOT falling back (would bypass the gateway boundary).")
             last_err = RuntimeError(f"{label} failed ({kind}): {blob.strip()}")
+            _audit_gen(kind=audit_kind, backend=_backend, endpoint=_endpoint, model=_model,
+                       role=role, prompt=prompt, call_id=_cid, attempt=attempt + 1, t0=t0,
+                       outcome="error",
+                       detail="timeout" if isinstance(e, subprocess.TimeoutExpired)
+                       else f"exit_{e.returncode}")
             if attempt < attempts - 1:
                 _time.sleep(backoff * (attempt + 1))
     else:
@@ -540,11 +625,11 @@ def health(cfg=None, force=False) -> dict:
                            capture_output=True, timeout=30, check=True)
         elif b == "ccg":
             # real round-trip through the proxy — a --version check wouldn't exercise auth
-            _ccg_generate("reply ok", "triage", cfg)
+            _ccg_generate("reply ok", "triage", cfg, audit_kind="health")
         elif b == "llama_cpp":
-            _llamacpp_generate("reply ok", "triage", cfg)
+            _llamacpp_generate("reply ok", "triage", cfg, audit_kind="health")
         else:
-            _ollama_generate("reply ok", "triage", cfg)
+            _ollama_generate("reply ok", "triage", cfg, audit_kind="health")
         out["generate"] = True
     except Exception as ex:
         out["detail"] = f"generate: {ex}"
