@@ -101,6 +101,41 @@ def _vector_store():
     s.ensure_collection()
     return s
 
+def _vector_summary(cfg) -> dict:
+    """Vector-store status for the dashboard, tenant-tolerant.
+
+    EngramVectorStore resolves a single tenant in its constructor, so on a
+    tenanted install the tenant-LESS dashboard process (engram-ui sets no
+    ENGRAM_TENANT) could not get stats and reported Qdrant as *down* — a false
+    negative, since "is Qdrant up and how many vectors does it hold" needs no
+    identity. When a single tenant IS resolvable (no `tenants:` block, or
+    ENGRAM_TENANT set) the exact per-collection stats are returned unchanged;
+    otherwise we sum every tenant's memory collection through a tenant-free
+    client. A genuinely unreachable Qdrant still raises VectorUnavailable."""
+    import vector_config as vc
+    import engram_tenant
+    try:
+        return {"reachable": True, **_vector_store().stats()}
+    except vc.VectorUnavailable:
+        raise                      # Qdrant down / vector disabled: a real outage
+    except Exception:
+        # Most likely: tenancy is on but no tenant is selected. If that is NOT
+        # the reason, re-raise so the caller reports the true error.
+        if not engram_tenant.tenancy_enabled(cfg):
+            raise
+    client = vc.build_client(cfg)  # raises VectorUnavailable if Qdrant is truly down
+    per, total = [], 0
+    for name in engram_tenant.names(cfg):
+        collection = vc.collection_name(cfg, name)
+        try:
+            count = client.count(collection_name=collection, exact=True).count
+        except Exception:
+            count = 0
+        per.append({"tenant": name, "collection": collection, "points": count})
+        total += count
+    return {"reachable": True, "points": total, "dim": vc.dim(cfg),
+            "scope": "all tenants", "tenants": per}
+
 app = FastAPI(title="engram", docs_url=None, redoc_url=None)
 
 
@@ -130,7 +165,7 @@ def health():
         out["vector"] = {"enabled": False}
     else:
         try:
-            out["vector"] = {"enabled": True, "reachable": True, "points": _vector_store().stats()["points"]}
+            out["vector"] = {"enabled": True, "reachable": True, "points": _vector_summary(cfg)["points"]}
         except Exception as e:
             out["vector"] = {"enabled": True, "reachable": False, "error": str(e)[:200]}
     return out
@@ -245,7 +280,7 @@ def vector_stats():
     if not memory_ai.vector_enabled(cfg):
         return {"enabled": False}
     try:
-        return {"enabled": True, "reachable": True, **_vector_store().stats()}
+        return {"enabled": True, **_vector_summary(cfg)}
     except Exception as e:
         return {"enabled": True, "reachable": False, "error": str(e)[:200]}
 

@@ -264,6 +264,33 @@ button, select { cursor: pointer; }
   .skills-grid { grid-template-columns: 1fr; }
 }
 
+/* LLM Calls tab */
+.panel-hint { margin: 0 0 12px; color: var(--subtle); font-size: 11px; line-height: 1.5; }
+.llm-table-wrap { overflow-x: auto; }
+.llm-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.llm-table th { text-align: left; color: var(--subtle); font-weight: 600; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.llm-table td { padding: 6px 10px; border-bottom: 1px solid #1d2938; color: var(--text); white-space: nowrap; }
+.llm-table tbody tr:hover { background: #131d29; }
+.llm-table .llm-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
+.llm-table tr.llm-health td { color: var(--subtle); opacity: .7; }
+
+/* Tenants view + per-tenant Wiki nav link */
+.navigation nav a.nav-external { height: 42px; display: flex; align-items: center; gap: 11px; padding: 0 12px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--muted); text-align: left; text-decoration: none; transition: 140ms ease; }
+.navigation nav a.nav-external:hover { color: var(--text); background: #131d29; }
+.navigation nav a.nav-external span { flex: 1; }
+.tenant-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; margin-top: 16px; }
+.tenant-card { display: flex; flex-direction: column; padding: 15px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); }
+.tenant-card .metadata { margin: 13px 0; }
+.tenant-card .action-button { align-self: flex-start; margin-top: auto; text-decoration: none; }
+.tenant-slugs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 14px; }
+.tenant-slugs > span { margin-right: 3px; color: var(--subtle); font-size: 10px; }
+.tenant-slugs em { color: var(--subtle); font-size: 10px; }
+.llm-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+@media (max-width: 1279px) { .navigation nav a.nav-external { justify-content: center; padding: 0; } }
+@media (max-width: 900px) { .tenant-grid { grid-template-columns: 1fr; } }
+@media (max-width: 767px) { .navigation nav a.nav-external { justify-content: flex-start; padding: 0 12px; } }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }

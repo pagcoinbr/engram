@@ -39,6 +39,40 @@ app = base.app
 if (DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="atlas-assets")
 
+# LLM-call audit module, loaded from ENGRAM_BIN so the UI reads exactly the engine's
+# schema. NON-FATAL: a missing or older installed copy must degrade to "unavailable",
+# never break atlas startup. A unique module name avoids clashing with the engine's.
+_audit = None
+try:
+    _audit_spec = importlib.util.spec_from_file_location(
+        "engram_llm_audit_atlas", ENGRAM_BIN / "engram_llm_audit.py")
+    if _audit_spec and _audit_spec.loader:
+        _audit_mod = importlib.util.module_from_spec(_audit_spec)
+        sys.modules[_audit_spec.name] = _audit_mod
+        _audit_spec.loader.exec_module(_audit_mod)
+        if all(hasattr(_audit_mod, fn) for fn in ("tail", "detect_loops")):
+            _audit = _audit_mod
+except Exception:
+    _audit = None
+
+# Tenant model, loaded from ENGRAM_BIN the same NON-FATAL way: atlas groups projects
+# and links to SilverBullet by tenant, but a missing/older engram_tenant.py must leave
+# atlas running untenanted rather than failing startup. The Rust API is single-tenant
+# per process and lists no tenants, so this is the only source of the tenant set.
+_tenant = None
+try:
+    _tenant_spec = importlib.util.spec_from_file_location(
+        "engram_tenant_atlas", ENGRAM_BIN / "engram_tenant.py")
+    if _tenant_spec and _tenant_spec.loader:
+        _tenant_mod = importlib.util.module_from_spec(_tenant_spec)
+        sys.modules[_tenant_spec.name] = _tenant_mod
+        _tenant_spec.loader.exec_module(_tenant_mod)
+        if all(hasattr(_tenant_mod, fn) for fn in
+               ("names", "resolve", "tenant_of_slug", "tenancy_enabled")):
+            _tenant = _tenant_mod
+except Exception:
+    _tenant = None
+
 _snapshot_cache: dict[str, tuple[float, dict]] = {}
 _model_cache: tuple[float, dict] | None = None
 
@@ -69,13 +103,41 @@ def _safe_project(project_id: str) -> Path:
     return target
 
 
+def _wiki_suffix(cfg: dict) -> str:
+    """Host suffix for per-tenant SilverBullet (wiki-<tenant>.<suffix>), matching
+    install.sh's SB_HOST_SUFFIX. Configurable via `ui.wiki_host_suffix`."""
+    ui = cfg.get("ui", {}) or {}
+    return str(ui.get("wiki_host_suffix") or "home.arpa").strip().strip(".")
+
+
+def _slug_owner():
+    """Return a slug -> tenant-name lookup, resolved once (config read a single
+    time) so _inventory doesn't reload config per project. Untenanted / module
+    absent -> every slug maps to None."""
+    if _tenant is None:
+        return lambda _slug: None
+    try:
+        cfg = base.memory_ai.load()
+        if not _tenant.tenancy_enabled(cfg):
+            return lambda _slug: None
+        mapping: dict[str, str] = {}
+        for name in _tenant.names(cfg):
+            for slug in _tenant.resolve(cfg, name).slugs:
+                mapping[str(slug)] = name
+        return lambda slug: mapping.get(slug)
+    except Exception:
+        return lambda _slug: None
+
+
 def _inventory(scope: str) -> tuple[list[dict], list[dict]]:
     projects = []
     nodes = []
+    owner = _slug_owner()
     for project_dir in _project_dirs():
         project_id = project_dir.name
         files = _memory_files(project_dir)
-        projects.append({"id": project_id, "label": _project_label(project_id), "count": len(files)})
+        projects.append({"id": project_id, "label": _project_label(project_id),
+                         "count": len(files), "tenant": owner(project_id)})
         if scope != "all" and scope != project_id:
             continue
         for path in files:
@@ -447,6 +509,62 @@ def atlas_snapshot(project: str = Query("all")):
     snapshot = _build_snapshot(project)
     _snapshot_cache[project] = (time.monotonic(), snapshot)
     return snapshot
+
+
+@app.get("/api/atlas/llm")
+def atlas_llm(limit: int = Query(300, ge=1, le=2000),
+              window: int = Query(300, ge=1, le=86400),
+              repeats: int = Query(3, ge=2, le=100)):
+    """The recent stream of generation calls engram sent to the model, plus groups
+    of identical prompts repeated >= `repeats` times within `window` seconds (an
+    exact-repeat / loop detector). Content-free: digests + metadata only. Degrades
+    to an empty 'unavailable' payload if the audit module or its log is absent."""
+    if _audit is None:
+        return {"events": [], "loops": [], "captured": "unavailable"}
+    events = _audit.tail(limit)
+    return {"events": events,
+            "loops": _audit.detect_loops(events, window, repeats),
+            "captured": "generation calls (python: engram_llm + graphiti)"}
+
+
+@app.get("/api/atlas/tenants")
+def atlas_tenants():
+    """The configured tenants and, for each, the memory stores (slugs) it owns,
+    its Qdrant collections, Graphiti group, vault, memory count, and the URL of
+    its SilverBullet vault (wiki-<name>.<suffix>). Read-only. Degrades to an
+    untenanted payload if the tenant module is absent or no tenants are defined —
+    atlas is fully usable untenanted."""
+    try:
+        cfg = base.memory_ai.load()
+    except Exception:
+        cfg = {}
+    suffix = _wiki_suffix(cfg)
+    if _tenant is None or not _tenant.tenancy_enabled(cfg):
+        return {"enabled": False, "legacy": True, "suffix": suffix, "tenants": []}
+    counts = {project_dir.name: len(_memory_files(project_dir))
+              for project_dir in _project_dirs()}
+    out = []
+    try:
+        for name in _tenant.names(cfg):
+            t = _tenant.resolve(cfg, name)
+            slugs = [str(s) for s in t.slugs]
+            out.append({
+                "name": name,
+                "label": t.label,
+                "slugs": slugs,
+                "vault": str(t.vault) if t.vault else None,
+                "agent_subtree": t.agent_subtree,
+                "extract_facts": bool(t.extract_facts),
+                "memory_collection": t.memory_collection,
+                "wiki_collection": t.wiki_collection,
+                "graph_group": t.graph_group,
+                "count": sum(counts.get(s, 0) for s in slugs),
+                "wiki_url": f"https://wiki-{name}.{suffix}",
+            })
+    except Exception as exc:
+        return {"enabled": True, "legacy": False, "suffix": suffix,
+                "tenants": out, "warning": str(exc)[:180]}
+    return {"enabled": True, "legacy": False, "suffix": suffix, "tenants": out}
 
 
 @app.get("/api/atlas/memory")

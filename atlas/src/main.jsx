@@ -4,9 +4,10 @@ import cytoscape from "cytoscape";
 import fcose from "cytoscape-fcose";
 import {
   Activity, AlertTriangle, BookOpen, Boxes, BrainCircuit, ChevronLeft,
-  ChevronRight, CircleDot, Database, Filter, Focus, GitBranch, HeartPulse,
-  Layers3, List, LocateFixed, Menu, Network, PanelLeftClose, PanelRightClose,
-  RefreshCw, Search, Server, Settings2, Sparkles, X, ZoomIn, ZoomOut,
+  ChevronRight, CircleDot, Database, ExternalLink, Filter, Focus, GitBranch,
+  HeartPulse, Layers3, List, LocateFixed, Menu, Network, PanelLeftClose,
+  PanelRightClose, RefreshCw, ScrollText, Search, Server, Settings2, Sparkles,
+  X, ZoomIn, ZoomOut,
 } from "lucide-react";
 import "./styles.css";
 
@@ -19,6 +20,9 @@ const NAV = [
   ["memories", "Memories", BookOpen],
   ["recall", "Recall", Sparkles],
   ["activity", "Activity", Activity],
+  ["llm", "LLM Calls", ScrollText],
+  ["tenants", "Tenants", Boxes],
+  ["wiki", "Wiki", ExternalLink],
   ["system", "System", Server],
   ["models", "Models", BrainCircuit],
   ["config", "Configuration", Settings2],
@@ -69,13 +73,25 @@ function Empty({title, detail}) {
   return <div className="empty"><CircleDot size={28}/><strong>{title}</strong><span>{detail}</span></div>;
 }
 
-function Navigation({view, setView, open, setOpen}) {
+function Navigation({view, setView, open, setOpen, wikiUrl}) {
   return <aside className={`navigation ${open ? "nav-open" : ""}`}>
     <div className="brand"><div className="brand-mark"><BrainCircuit size={23}/></div><div><strong>Engram</strong><span>Memory Atlas</span></div></div>
     <nav aria-label="Primary navigation">
-      {NAV.map(([id, label, Icon]) => <button key={id} className={view === id ? "active" : ""} onClick={() => {setView(id); setOpen(false);}}>
-        <Icon size={18}/><span>{label}</span>
-      </button>)}
+      {NAV.map(([id, label, Icon]) => {
+        // "Wiki" opens the selected tenant's SilverBullet vault in a new tab — a
+        // different origin with its own login, so a link, never an embed. With no
+        // resolvable tenant (scope=all / untenanted) it falls back to the Tenants view.
+        if (id === "wiki") {
+          return wikiUrl
+            ? <a key={id} className="nav-external" href={wikiUrl} target="_blank" rel="noopener noreferrer" onClick={() => setOpen(false)}>
+                <Icon size={18}/><span>{label}</span></a>
+            : <button key={id} title="Select a tenant's project to open its wiki" onClick={() => {setView("tenants"); setOpen(false);}}>
+                <Icon size={18}/><span>{label}</span></button>;
+        }
+        return <button key={id} className={view === id ? "active" : ""} onClick={() => {setView(id); setOpen(false);}}>
+          <Icon size={18}/><span>{label}</span>
+        </button>;
+      })}
     </nav>
     <div className="nav-foot"><span className="pulse"/>Local memory system</div>
   </aside>;
@@ -93,6 +109,21 @@ function Coverage({coverage, compact = false}) {
 
 function WorkspaceHeader({view, project, setProject, projects, coverage, setNavOpen}) {
   const title = NAV.find(([id]) => id === view)?.[1] || "Atlas";
+  // Group the scope list by owning tenant when tenancy is configured; projects
+  // with no tenant fall into a trailing "Unassigned" group. Untenanted installs
+  // (no project carries a tenant) keep the original flat list.
+  const grouped = useMemo(() => {
+    const groups = new Map();
+    for (const item of projects) {
+      const key = item.tenant || "Unassigned";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(item);
+    }
+    return [...groups.entries()].sort(([a], [b]) =>
+      a === "Unassigned" ? 1 : b === "Unassigned" ? -1 : a.localeCompare(b));
+  }, [projects]);
+  const tenantAware = projects.some(item => item.tenant);
+  const Option = item => <option key={item.id} value={item.id}>{item.label} · {item.count}</option>;
   return <header className="workspace-header">
     <button className="icon-button menu-button" onClick={() => setNavOpen(true)} aria-label="Open navigation"><Menu size={20}/></button>
     <div className="workspace-title"><span>Engram</span><h1>{title}</h1></div>
@@ -100,7 +131,9 @@ function WorkspaceHeader({view, project, setProject, projects, coverage, setNavO
       <Coverage coverage={coverage} compact/>
       <label className="scope-select"><span>Scope</span><select value={project} onChange={e => setProject(e.target.value)}>
         <option value="all">All projects</option>
-        {projects.map(item => <option key={item.id} value={item.id}>{item.label} · {item.count}</option>)}
+        {tenantAware
+          ? grouped.map(([tenant, items]) => <optgroup key={tenant} label={tenant}>{items.map(Option)}</optgroup>)
+          : projects.map(Option)}
       </select></label>
     </div>
   </header>;
@@ -316,6 +349,73 @@ function ActivityPage({snapshot}) {
   return <div className="page-content"><div className="metric-grid">{cards.map(card => <div className="metric-card" key={card.label}><i className={`dot ${card.tone}`}/><span>{card.label}</span><strong>{card.value}</strong></div>)}</div><div className="two-column"><section className="panel"><div className="section-heading"><h3>Staging</h3><Badge>{queues?.staging?.length || 0}</Badge></div>{queues?.staging?.map(item => <div className="queue-item" key={item}>{item}</div>) || <Spinner/>}{queues && !queues.staging.length && <Empty title="Staging is clear" detail="No short-term memories are waiting."/>}</section><section className="panel"><div className="section-heading"><h3>Quarantine</h3><Badge>{queues?.quarantine?.length || 0}</Badge></div>{queues?.quarantine?.map(item => <div className="queue-item" key={item}>{item}</div>)}{queues && !queues.quarantine.length && <Empty title="Quarantine is clear" detail="No suspect memories require review."/>}</section></div></div>;
 }
 
+function fmtAgo(ts) {
+  if (!ts) return "—";
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+function LlmPage() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const [paused, setPaused] = useState(false);
+  const load = useCallback(() => api("/api/atlas/llm?limit=300").then(d => {setData(d); setError("");}).catch(e => setError(e.message)), []);
+  useEffect(() => {
+    load();
+    if (paused) return undefined;
+    const id = setInterval(load, 5000);
+    return () => clearInterval(id);
+  }, [load, paused]);
+  if (error) return <div className="page-content"><Notice>{error}</Notice><button className="action-button" onClick={load}><RefreshCw size={15}/>Retry</button></div>;
+  if (!data) return <Spinner label="Loading LLM activity…"/>;
+  if (data.captured === "unavailable") return <div className="page-content"><Empty title="LLM audit unavailable" detail="The audit module or its log is not present yet. Trigger a generation call, then refresh."/></div>;
+  const events = data.events || [];
+  const loops = data.loops || [];
+  const now = Date.now() / 1000;
+  const recent = events.filter(e => e.kind !== "health" && now - (e.ts || 0) <= 300);
+  const distinct = new Set(recent.map(e => e.digest)).size;
+  const repeatRatio = recent.length ? Math.round((1 - distinct / recent.length) * 100) : 0;
+  const cards = [
+    {label: "Gen calls / 5 min", value: recent.length, tone: "indexed"},
+    {label: "Distinct prompts", value: distinct, tone: "unknown"},
+    {label: "Repeat ratio", value: `${repeatRatio}%`, tone: repeatRatio >= 50 ? "stale" : "indexed"},
+  ];
+  return <div className="page-content">
+    <div className="metric-grid">{cards.map(c => <div className="metric-card" key={c.label}><i className={`dot ${c.tone}`}/><span>{c.label}</span><strong>{c.value}</strong></div>)}</div>
+    <section className="panel">
+      <div className="section-heading"><h3>Possible loops</h3><Badge tone={loops.length ? "danger" : "ok"}>{loops.length}</Badge></div>
+      <p className="panel-hint">Exact-repeat detector: the same prompt re-sent to the model. Prompts differing only by a timestamp or whitespace won't match; health probes are excluded.</p>
+      {loops.length
+        ? loops.map(g => <Notice key={`${g.digest}-${g.proc}`} tone="warning"><strong>{g.count}×</strong>&nbsp; {g.model || "?"} · {g.role || "—"} · {g.proc} · over {Math.max(1, Math.round((g.last_ts || 0) - (g.first_ts || 0)))}s · <code>{g.digest}</code></Notice>)
+        : <Empty title="No repeated prompts" detail="No identical generation call has recurred in the window."/>}
+    </section>
+    <section className="panel">
+      <div className="section-heading"><h3>Recent calls</h3><Badge>{events.length}</Badge><button className="action-button" onClick={() => setPaused(p => !p)}>{paused ? "Resume" : "Pause"}</button></div>
+      <div className="llm-table-wrap"><table className="llm-table">
+        <thead><tr><th>When</th><th>Caller</th><th>Kind</th><th>Backend</th><th>Model</th><th>Role</th><th>Chars</th><th>ms</th><th>Outcome</th><th>Digest</th></tr></thead>
+        <tbody>
+          {events.map((e, i) => <tr key={i} className={e.kind === "health" ? "llm-health" : ""}>
+            <td title={e.ts ? new Date(e.ts * 1000).toLocaleString() : ""}>{fmtAgo(e.ts)}</td>
+            <td>{e.proc}</td>
+            <td>{e.kind}{e.attempt > 1 ? ` #${e.attempt}` : ""}</td>
+            <td>{e.backend}</td>
+            <td className="llm-mono">{e.model}</td>
+            <td>{e.role || "—"}</td>
+            <td>{e.chars}</td>
+            <td>{e.ms}</td>
+            <td><Badge tone={e.outcome === "ok" ? "ok" : e.outcome === "empty" ? "stale" : "danger"}>{e.outcome}</Badge></td>
+            <td className="llm-mono" title={e.detail || ""}>{e.digest}</td>
+          </tr>)}
+          {!events.length && <tr><td colSpan="10"><Empty title="No calls recorded yet" detail="Generation calls appear here as engram sends them."/></td></tr>}
+        </tbody>
+      </table></div>
+    </section>
+  </div>;
+}
+
 function SystemPage() {
   const [health, setHealth] = useState(null);
   const [stats, setStats] = useState(null);
@@ -372,26 +472,61 @@ function ConfigPage() {
   return <div className="page-content config-page"><span className="eyebrow">Configuration</span><h2>Models and retrieval</h2><Notice tone="info">Saved changes keep a local backup, use revision protection, and never expose secrets. Model-process restarts are required after saving.</Notice><section className="panel config-form"><div className="section-heading"><h3>{data.path}</h3><Badge>Revision {data.revision}</Badge></div><label>Generation backend<select value={draft.backend} onChange={event => update(null, "backend", event.target.value)}><option value="llama_cpp">llama.cpp</option><option value="ollama">Ollama</option><option value="claude">Claude CLI</option><option value="ccg">cc-gateway</option></select></label><h3>Reasoning model</h3><label>OpenAI-compatible endpoint<input value={draft.llama_cpp.url} onChange={event => update("llama_cpp", "url", event.target.value)} placeholder="http://host:port/v1"/></label><label>Model alias<input value={draft.llama_cpp.model} onChange={event => update("llama_cpp", "model", event.target.value)}/></label><label>Timeout seconds<input type="number" min="1" value={draft.llama_cpp.timeout_seconds} onChange={event => updateNumber("llama_cpp", "timeout_seconds", event.target.value)}/></label><h3>Embedding model</h3><label>Provider<select value={draft.embed.provider} onChange={event => update("embed", "provider", event.target.value)}><option value="llama_cpp">llama.cpp / OpenAI-compatible</option><option value="ollama">Ollama</option><option value="fastembed">FastEmbed</option></select></label><label>Embedding endpoint<input value={draft.embed.url} onChange={event => update("embed", "url", event.target.value)} placeholder="http://host:port/v1"/></label><label>Model alias<input value={draft.embed.model} onChange={event => update("embed", "model", event.target.value)}/></label><label>Vector dimension<input type="number" min="1" value={draft.embed.dim} onChange={event => updateNumber("embed", "dim", event.target.value)}/></label><h3>Graph recall</h3><label>Backend<select value={draft.graph.backend} onChange={event => update("graph", "backend", event.target.value)}><option value="graphiti_compat">Graphiti compatibility (recommended)</option><option value="native">Native Rust (shadow / evaluation)</option></select></label><div className="form-actions"><button className="action-button" onClick={validate}>Validate change</button><button className="action-button primary" onClick={save} disabled={saving}>{saving ? "Saving…" : "Save configuration"}</button></div></section>{preview && <Notice tone={preview.requiresReindex ? "warning" : "info"}>{[preview.saved ? `Saved. Backup: ${preview.backup}` : "Configuration is valid.", preview.requiresReindex ? "Embedding space changed: rebuild Qdrant and Neo4j before relying on recall." : "No index migration is required."].join(" ")}</Notice>}<section className="panel"><div className="section-heading"><h3>Full configuration</h3><Badge>Secrets redacted</Badge></div><pre className="config-json">{JSON.stringify(data.config, null, 2)}</pre></section></div>;
 }
 
+function TenantsPage() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const load = () => {setData(null); setError(""); api("/api/atlas/tenants").then(setData).catch(error => setError(error.message));};
+  useEffect(load, []);
+  if (error) return <div className="page-content"><Notice>{error}</Notice><button className="action-button" onClick={load}>Retry</button></div>;
+  if (!data) return <Spinner label="Loading tenants…"/>;
+  if (!data.enabled) return <div className="page-content"><span className="eyebrow">Tenants</span><h2>Identity boundaries</h2><Empty title="Tenancy not configured" detail="This install runs untenanted — every memory store shares one collection and Graphiti's 'canonical' group. Add a tenants: block to engram.yaml to partition identities."/></div>;
+  return <div className="page-content tenant-page">
+    <div className="section-heading"><div><span className="eyebrow">Tenants</span><h3>{data.tenants.length} configured · wiki suffix {data.suffix}</h3></div><button className="action-button" onClick={load}><RefreshCw size={15}/>Refresh</button></div>
+    <Notice tone="info">A tenant is one agent's world: the memory stores it owns, the vault it reads, and the Qdrant collections and Graphiti group it writes. Shown read-only — edit the tenants: block in engram.yaml to change it.</Notice>
+    <div className="tenant-grid">{data.tenants.map(tenant => <article className="tenant-card" key={tenant.name}>
+      <div className="section-heading"><div><span className="eyebrow">{tenant.graph_group}</span><h3>{tenant.label}</h3></div><Badge>{tenant.count} {tenant.count === 1 ? "memory" : "memories"}</Badge></div>
+      <dl className="metadata">
+        <div><dt>Vault</dt><dd className="llm-mono">{tenant.vault || "—"}</dd></div>
+        <div><dt>Memory collection</dt><dd className="llm-mono">{tenant.memory_collection}</dd></div>
+        <div><dt>Wiki collection</dt><dd className="llm-mono">{tenant.wiki_collection}</dd></div>
+        <div><dt>Graph group</dt><dd className="llm-mono">{tenant.graph_group}</dd></div>
+        <div><dt>Agent subtree</dt><dd className="llm-mono">{tenant.agent_subtree}</dd></div>
+        <div><dt>Section facts</dt><dd>{tenant.extract_facts ? "extracted" : "off"}</dd></div>
+      </dl>
+      <div className="tenant-slugs"><span>Stores</span>{tenant.slugs.length ? tenant.slugs.map(slug => <Badge key={slug} tone="neutral">{slug}</Badge>) : <em>none</em>}</div>
+      <a className="action-button" href={tenant.wiki_url} target="_blank" rel="noopener noreferrer"><ExternalLink size={15}/>Open wiki</a>
+    </article>)}</div>
+  </div>;
+}
+
 function App() {
   const url = useUrlState();
   const [snapshot, setSnapshot] = useState(null);
   const [error, setError] = useState("");
   const [navOpen, setNavOpen] = useState(false);
   const [selected, setSelected] = useState(url.node ? {kind: "memory", id: url.node} : null);
+  const [tenants, setTenants] = useState(null);
   const load = useCallback(() => {setSnapshot(null); setError(""); api(`/api/atlas/snapshot?project=${encodeURIComponent(url.project)}`).then(setSnapshot).catch(error => setError(error.message));}, [url.project]);
   useEffect(load, [load]);
+  // Tenant set drives the per-tenant "Wiki" link; fetched once, non-fatal.
+  useEffect(() => {api("/api/atlas/tenants").then(setTenants).catch(() => setTenants(null));}, []);
   useEffect(() => {url.setNode(selected?.kind === "memory" ? selected.id : "");}, [selected]);
   const locate = id => {url.setProject("all"); url.setView("atlas"); setSelected({kind: "memory", id});};
   const projects = snapshot?.projects || [];
+  // The Wiki link targets the tenant owning the selected project; scope=all or an
+  // unowned slug leaves it null (Navigation then routes "Wiki" to the Tenants view).
+  const wikiUrl = useMemo(() => (tenants?.tenants || []).find(tenant => (tenant.slugs || []).includes(url.project))?.wiki_url || null, [tenants, url.project]);
   return <div className="app-shell">
-    <Navigation view={url.view} setView={url.setView} open={navOpen} setOpen={setNavOpen}/>{navOpen && <button className="nav-scrim" onClick={() => setNavOpen(false)} aria-label="Close navigation"/>}
+    <Navigation view={url.view} setView={url.setView} open={navOpen} setOpen={setNavOpen} wikiUrl={wikiUrl}/>{navOpen && <button className="nav-scrim" onClick={() => setNavOpen(false)} aria-label="Close navigation"/>}
     <main className="workspace"><WorkspaceHeader view={url.view} project={url.project} setProject={value => {url.setProject(value); setSelected(null);}} projects={projects} coverage={snapshot?.coverage} setNavOpen={setNavOpen}/>
       {error && <div className="fatal-state"><Notice>{error}</Notice><button onClick={load}><RefreshCw size={16}/>Retry</button></div>}
       {!snapshot && !error && <Spinner/>}
       {snapshot && url.view === "atlas" && <AtlasPage snapshot={snapshot} selected={selected} setSelected={setSelected}/>} 
       {snapshot && url.view === "memories" && <MemoriesPage snapshot={snapshot} selectedId={selected?.id || ""} setSelectedId={id => setSelected(id ? {kind: "memory", id} : null)}/>} 
       {snapshot && url.view === "recall" && <RecallPage onLocate={locate}/>} 
-      {snapshot && url.view === "activity" && <ActivityPage snapshot={snapshot}/>} 
+      {snapshot && url.view === "activity" && <ActivityPage snapshot={snapshot}/>}
+      {snapshot && url.view === "llm" && <LlmPage/>}
+      {snapshot && url.view === "tenants" && <TenantsPage/>}
       {snapshot && url.view === "system" && <SystemPage/>}
       {snapshot && url.view === "models" && <ModelsPage/>}
       {snapshot && url.view === "config" && <ConfigPage/>}
