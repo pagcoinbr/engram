@@ -19,6 +19,13 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Tests that exercise engram_llm.generate() now write LLM-audit events; keep them
+# out of the operator's real ~/.claude/logs/llm_events.jsonl by pointing the audit
+# log at a throwaway dir for the whole run.
+ENGRAM_AUDIT_TMP="$(mktemp -d)"
+export ENGRAM_LOG_DIR="$ENGRAM_AUDIT_TMP"
+trap 'rm -rf "$ENGRAM_AUDIT_TMP"' EXIT
+
 WANT_RUST=yes
 WANT_PYTHON=yes
 case "${1:-}" in
