@@ -2,21 +2,28 @@
 """A long memory at reasoning_effort=high can burn the whole max_tokens budget on
 hidden CoT and come back finish_reason=length with empty content. Graphiti then
 retries the identical call 4x (~12 min each on a CPU-offloaded local model) and the
-memory is silently absent from the graph. _inject_reasoning must degrade the effort
-and re-issue instead. Observed live: prompt 8387 tok, stop at 24770 = exactly the
-16384-token cap, 4 dead retries, cypher-bringup.md dropped."""
-import asyncio, sys, types
+memory is silently absent from the graph. The wrapper must degrade the effort and
+re-issue instead. Observed live: prompt 8387 tok, stop at 24770 = exactly the
+16384-token cap, 4 dead retries, cypher-bringup.md dropped.
+
+The reasoning logic now lives in `_instrument_llm` (which also audits every call
+for loop visibility); this pins the degrade behaviour regardless of auditing."""
+import asyncio, json, sys, time, types
 from pathlib import Path
 
 MG = Path(__file__).resolve().parent.parent / "graph" / "mg_config.py"
 
 
 def _inject_reasoning(effort):
+    # Splice _audit_graphiti + _instrument_llm out of mg_config and exec them with the
+    # module globals they reference. _audit=None disables the (best-effort) audit, so
+    # this exercises purely the reasoning-degrade path.
     txt = MG.read_text()
-    src = "def _inject_reasoning" + txt.split("def _inject_reasoning", 1)[1].split("def _llm_timeout")[0]
-    ns = {"REASONING_EFFORT": effort}
+    src = "def _audit_graphiti" + txt.split("def _audit_graphiti", 1)[1].split("def _llm_timeout")[0]
+    ns = {"REASONING_EFFORT": effort, "_audit": None, "LLM_MODEL": "m",
+          "OLLAMA_BASE": "http://x/v1", "json": json, "time": time}
     exec(compile(src, str(MG), "exec"), ns)
-    return ns["_inject_reasoning"]
+    return ns["_instrument_llm"]
 
 
 def _llm(*finish_reasons):

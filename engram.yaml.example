@@ -73,6 +73,31 @@ daemon:
     vector: 86400       # vector_sync.py --insert           (once/day)
     maintenance: 86400  # nightly fixate + light-pass pipeline (distill gated inside the cron)
 
+# ── Backups (encrypted, off-host) ───────────────────────────────────────────
+# Daily restic backup of the AUTHORITATIVE data — the .md memory stores and the
+# Obsidian vaults, plus engram.yaml and graph/.env so a restore stands the system
+# back up. The Qdrant/Neo4j indexes are NOT backed up: they rebuild from the .md
+# store. Off by default; the daemon's `backup` task no-ops until you enable it and
+# provide credentials.
+#
+# SECRETS DO NOT GO HERE. The restic password and the S3/B2 keys live in
+# ~/.config/engram/daemon.env (mode 600), never in this file:
+#   ENGRAM_BACKUP_PASSWORD   restic encryption password
+#   ENGRAM_BACKUP_S3_KEY_ID  B2/S3 application key id
+#   ENGRAM_BACKUP_S3_KEY     B2/S3 application key
+# restic encrypts client-side, so Backblaze never sees plaintext — which also
+# means: LOSE THE PASSWORD AND THE BACKUPS ARE UNRECOVERABLE. Store it in a
+# password manager. `./install.sh --backup` provisions all of this for you.
+backup:
+  enabled: false
+  provider: b2                                 # label only; any S3-compatible store works
+  endpoint: "s3.us-west-004.backblazeb2.com"   # your bucket's S3 endpoint
+  bucket: ""                                   # e.g. engram-backups
+  prefix: "engram"                             # path within the bucket
+  include_vaults: true
+  retention: { daily: 7, weekly: 4, monthly: 6 }
+  check_every_days: 7                          # periodic restic integrity check
+
 # OpenAI-compatible llama.cpp server (llama-server /v1). Used when backend: llama_cpp.
 # Generation routes to {url}/chat/completions; <think>…</think> reasoning is stripped.
 llama_cpp:
@@ -123,6 +148,49 @@ embed:
 #
 # native uses the Rust/Neo4j schema. Node identity includes the memory slug, so
 # switching to it needs a rebuild; it is still the unproven path.
+# ── Tenants: agent identities ───────────────────────────────────────────────
+# A tenant is one agent's world — the memory stores it owns, and (optionally) the
+# Obsidian vault it reads. Its purpose is isolation: a "work" agent must never
+# recall a "homelab" memory or wiki page, and vice versa.
+#
+# LEAVE THIS BLOCK OUT and nothing changes. An absent `tenants:` block means
+# tenancy is off, and engram behaves exactly as it did before: one shared Qdrant
+# collection, Graphiti's historical "canonical" group, the slug resolved the usual
+# way. That is the upgrade path, and it is the default.
+#
+# ADD EVEN ONE TENANT and the identity follows the store: naming a slug determines
+# the tenant, because the mapping below is total and has exactly one right answer.
+# --tenant is needed only where no store can be determined — the engram-app service
+# (one identity per process, no project directory to derive from) and the daemon's
+# children, which pass it explicitly per store. A store no tenant claims is REFUSED,
+# never adopted. There is still no default tenant when none can be derived.
+# Each tenant gets its own Qdrant collections
+# (engram_memory__<name>, engram_wiki__<name>) and its own Neo4j group, so
+# reaching another identity's data requires NAMING it rather than forgetting a
+# filter.
+#
+# Moving existing stores into tenants requires a migration (the Qdrant points must
+# be reindexed and the Graphiti episodes re-inserted under their new group) — see
+# `engram-tenant-migrate`. A slug may belong to exactly one tenant; two tenants
+# claiming the same store is a config error, because that IS the leak.
+#
+# tenants:
+#   work-company-x:
+#     slugs: ["-root-MJSV", "-root-dsec-lab"]   # the memory stores it owns
+#     vault: /vaults/work                       # absolute; optional (stores-only is fine)
+#     agent_subtree: _agent                     # the ONLY place an agent may write
+#     extract_facts: false                      # LLM facts per wiki section (costly)
+#   homelab:
+#     slugs: ["-root", "-root-ASCP"]
+#     vault: /vaults/homelab
+
+# ── UI (atlas dashboard) ────────────────────────────────────────────────────
+# ui:
+#   # Host suffix for the per-tenant "Wiki" link in atlas, which opens a tenant's
+#   # SilverBullet vault at https://wiki-<tenant>.<suffix>. Must match the
+#   # SB_HOST_SUFFIX used by `./install.sh --silverbullet`. Default: home.arpa.
+#   wiki_host_suffix: home.arpa
+
 graph:
   backend: graphiti_compat       # graphiti_compat | native
   neo4j_uri: "bolt://127.0.0.1:7687"
@@ -236,11 +304,12 @@ vector_store:
   provider: qdrant               # qdrant (only backend for now)
   url: "http://127.0.0.1:6333"   # loopback Qdrant
   api_key: ""                    # for Qdrant Cloud; blank for local
-  collection: "engram_memory"
+  collection: "engram_memory"    # base name; per tenant it becomes engram_memory__<tenant>
+  wiki_collection: "engram_wiki" # base name for the wiki corpus (chunked documents)
   on_disk: false                 # true = store vectors on disk (less RAM, slower search)
   timeout_seconds: 30
   recall:
-    default_k: 6                 # how many memories memory_vector_recall returns
+    default_k: 6                 # default k for vector search / recall hits
     threshold: 0.0               # min cosine for a search hit (0 = no floor)
   duplicate_finder:
     use_vector_store: true       # light pass uses Qdrant ANN instead of O(n^2) cosine when enabled
@@ -248,9 +317,10 @@ vector_store:
 # ── Hybrid recall (Reciprocal Rank Fusion) ──────────────────────────────────
 # Fuse the recall paths — graph (associative/temporal), vector (dense semantic),
 # and keyword (BM25 lexical) — into one ranking keyed by the .md filename, so the
-# indexes are greater than the sum. The full 3-way `memory_recall_hybrid` lives on
-# the engram-graph MCP server (warm graph + in-process Qdrant); engram-vector
-# exposes a 2-way `memory_recall_fused` (vector+keyword) for no-graph installs.
+# indexes are greater than the sum. The full 3-way `memory_recall` /
+# `memory_recall_hybrid` lives on the engram-rust MCP server, which embeds the
+# query once and degrades to vector+keyword on no-graph installs. (engram-graph and
+# engram-vector no longer expose recall — each re-embedded the query.)
 # Each ranker degrades independently — a disabled/down backend just drops out.
 recall:
   scope_to_slug: true            # restrict vector/hybrid recall to the current store's slug
@@ -280,14 +350,17 @@ recall:
     max_facts: 6                 # 1-hop graph facts per injection
     timeout_ms: 2500             # WALL-CLOCK budget for the whole injection
 
-# Local MCP servers wired into interactive sessions. The graph recall server
-# (graph/mcp_server.py) is registered by the installer as `engram-graph`; the
-# optional vector recall server (vector/vector_mcp_server.py) as `engram-vector`.
+# Local MCP servers wired into interactive sessions. Recall lives on `engram-rust`
+# (the Rust engram-mcp binary); `engram-graph` (graph/mg_mcp_server.py) and the
+# optional `engram-vector` (vector/vector_mcp_server.py) provide only their unique
+# tools, so a single recall embeds the query once instead of once per server.
 mcp_servers:
+  engram-rust:
+    note: "Single recall path: memory_recall / memory_recall_hybrid (graph+vector+keyword, embeds once) + wiki_search / wiki_fetch / wiki_write"
   engram-graph:
-    note: "Graphiti/Neo4j recall tools: memory_recall / memory_search_facts / memory_neighbors / memory_stats"
+    note: "Graphiti/Neo4j graph tools: memory_search_facts / memory_neighbors / memory_stats (recall is on engram-rust)"
   engram-vector:
-    note: "Qdrant semantic recall (optional): memory_vector_recall / memory_vector_search / memory_vector_stats"
+    note: "Qdrant inspection (optional): memory_vector_search / memory_vector_stats (recall is on engram-rust)"
 
 # Scheduling — the installer builds the systemd timer / daemon cadence from these.
 schedule:

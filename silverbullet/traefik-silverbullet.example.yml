@@ -1,0 +1,68 @@
+# Traefik dynamic config for the SilverBullet vault editors — REFERENCE COPY.
+#
+# `install.sh --silverbullet` generates the live version of this into the
+# gateway's dynamic-config dir (on this host: /opt/gateway-stack/traefik/dynamic/)
+# for the tenants you select, substituting the host suffix. It is kept here as the
+# reviewable source of truth for the routing the installer produces.
+#
+# One router + one service per tenant, pointing at the loopback port the compose
+# file publishes. Mirrors the existing hermes.yml on this gateway.
+#
+# AUTH: SilverBullet authenticates itself (SB_USER, with lockout), so — unlike the
+# hermes dashboard, which has none and therefore needs Traefik basicAuth — these
+# routers do TLS + routing only. For defense-in-depth on the sensitive work
+# vaults, uncomment the `sb-auth` middleware and attach it to those routers;
+# `users` is an htpasswd line (openssl passwd -apr1).
+#
+# POSTURE: `websecure` here is the gateway's LAN/tailnet entrypoint (TLS). There is
+# deliberately NO public entrypoint and NO Tailscale funnel — these vaults are
+# reachable only from the private network.
+
+http:
+  # middlewares:
+  #   sb-auth:
+  #     basicAuth:
+  #       users:
+  #         - "you:$apr1$....."   # openssl passwd -apr1
+  #       removeHeader: true
+
+  services:
+    sb-homelab:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:3011"
+    sb-mjsv:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:3012"
+    sb-bbhost:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:3013"
+    sb-dseclab:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:3014"
+
+  routers:
+    sb-homelab:
+      rule: "Host(`wiki-homelab.home.arpa`)"
+      entryPoints: [websecure, websecure-v6]
+      tls: {}
+      service: sb-homelab
+      # middlewares: [sb-auth]
+    sb-mjsv:
+      rule: "Host(`wiki-mjsv.home.arpa`)"
+      entryPoints: [websecure, websecure-v6]
+      tls: {}
+      service: sb-mjsv
+    sb-bbhost:
+      rule: "Host(`wiki-bbhost.home.arpa`)"
+      entryPoints: [websecure, websecure-v6]
+      tls: {}
+      service: sb-bbhost
+    sb-dseclab:
+      rule: "Host(`wiki-dseclab.home.arpa`)"
+      entryPoints: [websecure, websecure-v6]
+      tls: {}
+      service: sb-dseclab

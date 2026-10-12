@@ -33,13 +33,15 @@ logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 
 from graphiti_core.nodes import EntityNode, EpisodicNode, EpisodeType
 from graphiti_core.edges import EntityEdge
-from mg_config import build_graphiti, CANONICAL_GROUP
+from mg_config import build_graphiti, active_group
+import mg_state     # per-slug scoping; must agree with graph_sync.py / graph_maint.py
 
 HERE = Path(__file__).resolve().parent
-MEM_DIR = Path.home() / ".claude" / "projects" / (os.environ.get("CLAUDE_MEMORY_SLUG") or str(Path.home()).replace("/", "-")) / "memory"
-EXTRACT_DIR = HERE / "extractions"
-STATE = HERE / "insert_state.json"
-SYNC_STATE = HERE / "sync_state.json"
+_SLUG = mg_state.slug_from_argv_env()
+MEM_DIR = Path.home() / ".claude" / "projects" / _SLUG / "memory"
+# Per-slug: the extraction this run inserts and the "done" set it stamps must be
+# the SAME store's MEM_DIR, or every file would `skip (no .md)` and never commit.
+EXTRACT_DIR, STATE, SYNC_STATE = mg_state.paths(HERE, _SLUG)
 LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 
@@ -82,8 +84,31 @@ def save_sync_state(sync: dict):
 
 async def main():
     args = sys.argv[1:]
+    # Safety net for a direct invocation: fold legacy flat state in before reading
+    # it. Idempotent + flock-guarded; graph_sync already does this first on the
+    # daemon path, so this is normally a no-op.
+    mg_state.migrate_legacy(HERE)
+    EXTRACT_DIR.mkdir(parents=True, exist_ok=True)   # ensure state/<slug>/ exists to write state into
+    # Which identity's graph to write. Resolved before anything is inserted, and
+    # fatally: writing into the shared pre-tenancy group is what made the graph
+    # leg cross projects, so a run that cannot name its tenant must not proceed.
+    tenant = args[args.index("--tenant") + 1] if "--tenant" in args else None
+    try:
+        group = active_group(tenant)
+    except Exception as error:
+        print(f"[insert] {error}", file=sys.stderr)
+        sys.exit(2)
     rebuild = "--rebuild" in args
-    only = [a for a in args[args.index("--only") + 1:] if not a.startswith("--")] if "--only" in args else []
+    # Stop at the next flag rather than filtering flags out of the whole tail.
+    # The old form collected every non-"--" argument after --only, so any later
+    # flag's VALUE became a filename: `--only a.md --tenant work` silently asked
+    # for a memory called "work" and then reported nothing to insert.
+    only = []
+    if "--only" in args:
+        for a in args[args.index("--only") + 1:]:
+            if a.startswith("--"):
+                break
+            only.append(a)
 
     jsons = sorted(EXTRACT_DIR.glob("*.json"))
     if only:
@@ -135,7 +160,7 @@ async def main():
             return None
         if name in ent_uuid:
             return ent_uuid[name]
-        n = EntityNode(name=name, group_id=CANONICAL_GROUP,
+        n = EntityNode(name=name, group_id=group,
                        labels=["Entity", etype.get(name, "Concept")], summary="")
         await n.generate_name_embedding(emb)
         await n.save(g.driver)
@@ -162,7 +187,7 @@ async def main():
         meta, body = parse(raw)
         ref = dt.datetime.fromtimestamp(mdfile.stat().st_mtime, dt.timezone.utc)
 
-        ep = EpisodicNode(name=mdfile.stem, group_id=CANONICAL_GROUP, source=EpisodeType.text,
+        ep = EpisodicNode(name=mdfile.stem, group_id=group, source=EpisodeType.text,
                           source_description=f"canonical memory ({meta.get('type','reference')})",
                           content=body, valid_at=ref, created_at=now)
         await ep.save(g.driver)
@@ -195,7 +220,7 @@ async def main():
                 f"{ed.get('source', '').strip()} {rel} {ed.get('target', '').strip()}".strip()
             edge = EntityEdge(source_node_uuid=s, target_node_uuid=t,
                               name=rel,
-                              fact=fact, group_id=CANONICAL_GROUP,
+                              fact=fact, group_id=group,
                               episodes=[ep.uuid], created_at=now, valid_at=ref)
             await edge.generate_embedding(emb)
             if not edge.fact_embedding:

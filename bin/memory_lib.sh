@@ -252,6 +252,14 @@ memory_guard_secret_content() {
 # no-ops itself if disabled/unreachable. Backgrounded with output discarded so a
 # slow or down Qdrant never delays (or fails) a save/delete. Mirrors the local-first
 # posture of the optional GitHub push above.
+#
+# No --tenant is passed, deliberately. The identity follows the store: engram-index
+# resolves it from the owner of the --slug it is given, which is the only right
+# answer and cannot be chosen wrongly (see engram_tenant::resolve_tenant). Hard-
+# coding one here would mean this call site served exactly one of several
+# identities — and because the call is backgrounded with its output discarded, the
+# failure would be a memory that silently stopped being indexed rather than an
+# error anyone saw.
 # Is the configured embedding provider one the Rust indexer implements?
 #
 # engram-index speaks exactly one transport: an OpenAI-compatible /v1/embeddings

@@ -26,6 +26,7 @@ sys.path.insert(0, str(HERE.parent / "bin"))
 if str(Path.home() / ".claude") not in sys.path:
     sys.path.append(str(Path.home() / ".claude"))
 import engram_llm
+import engram_tenant
 import engram_secrets
 import memory_ai
 import vector_config as vc
@@ -42,10 +43,15 @@ class EngramVectorStore:
     """Qdrant-backed semantic index over the markdown store. Construct lazily;
     construction itself does no network I/O beyond building the client object."""
 
-    def __init__(self, cfg=None):
+    def __init__(self, cfg=None, tenant=None):
         self.cfg = cfg or memory_ai.load()
         self.client = vc.build_client(self.cfg)        # may raise VectorUnavailable
-        self.collection = vc.collection_name(self.cfg)
+        # Resolved here so the collection name and the payload tenant cannot
+        # disagree, and so a store object simply cannot exist without an
+        # identity. On an install with no `tenants:` block this is the legacy
+        # tenant and the collection is the one it always was.
+        self.tenant = engram_tenant.resolve(self.cfg, tenant)
+        self.collection = vc.collection_name(self.cfg, tenant)
         self.dim = vc.dim(self.cfg)
 
     # ---- collection lifecycle ------------------------------------------------
@@ -94,8 +100,13 @@ class EngramVectorStore:
             # models need on this side and this side only.
             vector = engram_llm.embed(f"{name} {description} {body[:1500]}".strip(),
                                       self.cfg, kind="document")
+        # `tenant` is written but never filtered on: the COLLECTION is the
+        # tenant boundary. It is here so a point can be audited back to its owner
+        # and a misfiled one is detectable, which matters most during the
+        # migration while points are moving between collections.
         payload = {"file": filename, "name": name, "description": description,
                    "type": mtype, "slug": slug(), "sha": sha,
+                   "tenant": self.tenant.graph_group,
                    "space": engram_llm.embedding_space_id(self.cfg)}
         self.client.upsert(
             collection_name=self.collection,

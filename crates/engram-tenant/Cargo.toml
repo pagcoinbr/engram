@@ -1,0 +1,13 @@
+[package]
+name = "engram-tenant"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engram-config = { path = "../engram-config" }
+engram-paths = { path = "../engram-paths" }
+thiserror = "2"
+
+[dev-dependencies]
+serde_yaml = "0.9"

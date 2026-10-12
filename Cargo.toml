@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/engram-config", "crates/engram-models", "crates/engram-app", "crates/engram-paths", "crates/engram-store", "crates/engram-retrieval", "crates/engram-secrets", "crates/engram-vector", "crates/engram-graph", "crates/engram-hybrid"]
+members = ["crates/engram-config", "crates/engram-models", "crates/engram-app", "crates/engram-paths", "crates/engram-store", "crates/engram-retrieval", "crates/engram-secrets", "crates/engram-tenant", "crates/engram-vector", "crates/engram-wiki", "crates/engram-graph", "crates/engram-hybrid"]
 resolver = "2"
 
 [workspace.package]

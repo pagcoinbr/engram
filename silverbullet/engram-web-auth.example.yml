@@ -1,0 +1,43 @@
+# Shared web auth for engram's dashboard — REFERENCE COPY.
+#
+# `install.sh --web-auth` generates the live version of this into the gateway's
+# dynamic-config dir and wires it up. Kept here as the reviewable source of truth.
+#
+# THE MODEL (one credential, web-only):
+#   - engram's atlas dashboard (engram.home.arpa -> 127.0.0.1:8765) has no built-in
+#     auth, and its config editor can change engram.yaml — so over the LAN it must
+#     sit behind this basicAuth middleware. The installer attaches `engram-auth`
+#     to the existing `engram` router in the gateway's tls.yml.
+#   - SilverBullet is NOT fronted by this middleware (that would double-prompt);
+#     instead each instance's own SB_USER is set to the SAME user:password, so one
+#     credential logs you into both. See silverbullet/README.md.
+#   - "Web only": this lives at the gateway. The loopback API (127.0.0.1:8787),
+#     the CLI, the MCP server and the daemon are unaffected — they never cross it.
+#
+# bcrypt (htpasswd -nbB), the same scheme the gateway's hermes router uses.
+#
+# This is SHARED CREDENTIALS, not SSO: the same user:password is enforced
+# independently by Traefik (atlas) and by SilverBullet (SB_USER). There is no
+# shared session; logging out of one does not log out of the other, and basicAuth
+# itself has no lockout/rate-limit (SilverBullet's own login does).
+
+http:
+  middlewares:
+    engram-auth:
+      basicAuth:
+        # Inline bcrypt (htpasswd -nbB), NOT usersFile: the gateway mounts
+        # individual files, so a separate htpasswd would not be visible inside
+        # the traefik container. A file already under the mounted dynamic/ dir
+        # (this one) needs no new mount. '$' in the hash is literal here.
+        users:
+          - "admin:$2y$05$EXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEX"
+        removeHeader: true   # don't forward the Authorization header to atlas
+
+# The installer adds `engram-auth` to the existing engram router rather than
+# redeclaring it (two files defining the same router name is a Traefik conflict):
+#
+#   routers:
+#     engram:
+#       ...
+#       middlewares:
+#         - engram-auth

@@ -9,7 +9,12 @@ import sys
 from pathlib import Path
 
 from graphiti_core.nodes import EpisodeType
-from mg_config import build_graphiti, CANONICAL_GROUP
+from mg_config import build_graphiti, group_from_argv
+
+# The Graphiti group_id for the identity this run belongs to, resolved once.
+# Was the shared literal CANONICAL_GROUP, which is why one project's
+# maintenance pass could touch another's data.
+CANONICAL_GROUP = group_from_argv()
 
 MEM_DIR = Path.home() / ".claude" / "projects" / (os.environ.get("CLAUDE_MEMORY_SLUG") or str(Path.home()).replace("/", "-")) / "memory"
 SAMPLE = "feedback_strong_passwords.md"

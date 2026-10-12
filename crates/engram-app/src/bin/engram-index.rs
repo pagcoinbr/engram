@@ -1,8 +1,7 @@
 use clap::Parser;
-use engram_config::Config;
 use engram_models::OpenAiCompatibleClient;
 use engram_store::load;
-use engram_vector::{IndexPoint, QdrantClient};
+use engram_vector::{Corpus, IndexPoint, QdrantClient};
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, process::ExitCode};
 
@@ -24,6 +23,11 @@ struct Args {
     // unusable as typed.
     #[arg(long, allow_hyphen_values = true)]
     slug: Option<String>,
+    /// Which agent identity's collection to write. Required on an install that
+    /// defines tenants: the collection name is derived from it, so indexing
+    /// without one would write into the shared pre-tenancy collection.
+    #[arg(long, env = "ENGRAM_TENANT")]
+    tenant: Option<String>,
     #[arg(long, conflicts_with_all = ["only", "delete"])]
     rebuild: bool,
     #[arg(long, value_name = "FILE", conflicts_with = "delete")]
@@ -63,8 +67,19 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> Result<usize, IndexError> {
     let config_path = engram_paths::config_path(args.config);
-    let slug = engram_paths::resolve_slug(args.slug.as_deref());
-    let config = Config::load(&config_path).map_err(|error| error.to_string())?;
+    // Derive::Environment: this runs from the daemon and from save hooks, whose
+    // working directory is arbitrary, so the store must not be guessed from it.
+    let resolved = engram_tenant::resolve_for_cli(
+        &config_path,
+        args.tenant.as_deref(),
+        args.slug.as_deref(),
+        engram_tenant::Derive::Environment,
+    )?;
+    let engram_tenant::Resolved {
+        config,
+        tenant,
+        slug,
+    } = resolved;
     // The documented master switch outranks vector_store.enabled. Checking only
     // the latter let the save hook index while automation was meant to be off.
     if !config.local_enabled {
@@ -87,7 +102,7 @@ async fn run(args: Args) -> Result<usize, IndexError> {
     }
     let store = engram_paths::store_dir(&config_path, &slug);
     let mut memories = load(store).map_err(|error| error.to_string())?;
-    let vectors = QdrantClient::from_config(&config);
+    let vectors = QdrantClient::for_tenant(&config, &tenant, Corpus::Memory);
     vectors
         .ensure_collection(config.embed.dim, args.rebuild)
         .await
@@ -151,6 +166,7 @@ async fn run(args: Args) -> Result<usize, IndexError> {
                 description: &description,
                 memory_type: &memory.memory_type,
                 slug: &slug,
+                tenant: tenant.graph_group(),
                 sha: &sha,
                 space: &space,
                 vector,

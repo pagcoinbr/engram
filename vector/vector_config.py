@@ -55,9 +55,25 @@ def api_key(cfg=None) -> str:
             or _vcfg(cfg).get("api_key") or "").strip()
 
 
-def collection_name(cfg=None) -> str:
-    return (os.environ.get("ENGRAM_VECTOR_COLLECTION")
-            or _vcfg(cfg).get("collection") or "engram_memory")
+def collection_name(cfg=None, tenant=None) -> str:
+    """The memory collection for the active agent identity.
+
+    Per-tenant rather than one collection with a mandatory payload filter: the
+    collection name IS the tenant boundary, so reaching another identity's
+    vectors requires NAMING its collection instead of merely forgetting a filter
+    clause. Must match Rust's `Tenant::memory_collection` exactly — Python writes
+    this index and Rust reads it, and a mismatch is not an error, it is an index
+    that looks empty. Pinned by tests/test_tenant_parity.py.
+
+    `ENGRAM_VECTOR_COLLECTION` still wins, for operators pointing a one-off run
+    at a specific collection; it is an explicit override, not a default.
+    """
+    override = os.environ.get("ENGRAM_VECTOR_COLLECTION")
+    if override:
+        return override
+    import engram_tenant
+
+    return engram_tenant.resolve(cfg, tenant).memory_collection
 
 
 def on_disk(cfg=None) -> bool:

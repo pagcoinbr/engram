@@ -85,7 +85,7 @@ store from scratch. Losing Qdrant never loses a memory.
 vector/                         # mirrors graph/ layout
   vector_store.py               # EngramVectorStore: thin qdrant-client wrapper (ensure/upsert/search/delete/list/stats)
   vector_sync.py                # CLI orchestrator: --insert / --rebuild / --status / --delete (sha-synced like graph_sync)
-  vector_mcp_server.py          # FastMCP "engram-vector": memory_vector_recall / memory_vector_search / memory_vector_stats
+  vector_mcp_server.py          # FastMCP "engram-vector": memory_vector_search / memory_vector_stats (recall is on engram-rust)
   vector_config.py             # reads engram.yaml vector_store.* + env; builds QdrantClient; small helpers
   docker-compose.yml            # qdrant/qdrant:latest on 127.0.0.1:6333 (loopback only), named volume
   README.md                     # ops notes (start/stop, rebuild, disable)
@@ -137,10 +137,10 @@ Thin, dependency-light wrapper (patterns lifted from mem0's Qdrant usage, embedd
   disabled or unreachable** (never errors the caller).
 
 ### 5.4 `vector/vector_mcp_server.py` — `engram-vector` MCP
-FastMCP server parallel to `mg_mcp_server.py`:
-- `memory_vector_recall(query, k=6)` — semantic top-k: name + description + score. The
-  fast path for "load the relevant memories" when the graph is off or for pure-vector recall.
-- `memory_vector_search(query, k=8)` — raw scored hits.
+FastMCP server parallel to `mg_mcp_server.py`. Recall was removed from here (it
+re-embedded the query independently of `engram-rust`); what remains is raw
+inspection:
+- `memory_vector_search(query, k=8)` — raw scored hits ("is there a memory about X").
 - `memory_vector_stats()` — point count, collection, dim, on_disk.
 - Returns a friendly "(vector store disabled/unreachable — using markdown)" string instead
   of throwing when Qdrant is down, so Claude degrades gracefully.

@@ -28,8 +28,34 @@ pub fn rrf(rankings: &[Vec<String>], limit: usize, k: f64) -> Vec<Hit> {
     hits
 }
 
+/// Anything BM25 can rank: an id to return, and the text to score.
+///
+/// Introduced so wiki chunks reuse the ranking rather than getting a second,
+/// subtly different implementation. `Memory` implements it and the memory path
+/// is unchanged — `bm25` is still the entry point for it.
+pub trait Indexable {
+    /// What the hit identifies. A memory filename, or `path#chunk` for a chunk.
+    fn id(&self) -> String;
+    /// Everything searchable about the record, concatenated.
+    fn text(&self) -> String;
+}
+
+impl Indexable for Memory {
+    fn id(&self) -> String {
+        self.file.clone()
+    }
+    fn text(&self) -> String {
+        format!("{} {} {}", self.name, self.description, self.body)
+    }
+}
+
 pub fn bm25(memories: &[Memory], query: &str, limit: usize) -> Vec<Hit> {
-    let documents: Vec<Vec<String>> = memories.iter().map(tokens).collect();
+    rank(memories, query, limit)
+}
+
+/// BM25 over any [`Indexable`] collection.
+pub fn rank<T: Indexable>(records: &[T], query: &str, limit: usize) -> Vec<Hit> {
+    let documents: Vec<Vec<String>> = records.iter().map(|r| tokenize(&r.text())).collect();
     let terms = tokenize(query);
     if terms.is_empty() || documents.is_empty() {
         return Vec::new();
@@ -57,7 +83,7 @@ pub fn bm25(memories: &[Memory], query: &str, limit: usize) -> Vec<Hit> {
                     / (count + 1.2 * (1.0 - 0.75 + 0.75 * document.len() as f64 / average));
             }
             Hit {
-                file: memories[index].file.clone(),
+                file: records[index].id(),
                 score,
             }
         })
@@ -73,12 +99,6 @@ pub fn bm25(memories: &[Memory], query: &str, limit: usize) -> Vec<Hit> {
     hits
 }
 
-fn tokens(memory: &Memory) -> Vec<String> {
-    tokenize(&format!(
-        "{} {} {}",
-        memory.name, memory.description, memory.body
-    ))
-}
 fn tokenize(text: &str) -> Vec<String> {
     text.split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
         .filter(|part| part.len() > 1)

@@ -1,7 +1,14 @@
 """vector_mcp_server.py — MCP server exposing the OPTIONAL Qdrant semantic index to
-Claude Code as live tools (parallel to graph/mg_mcp_server.py). Dense-vector recall
-over the .md store: fast "load the relevant memories" without the graph, and the
-primary recall path on vector-only (no-Neo4j) installs.
+Claude Code as live tools (parallel to graph/mg_mcp_server.py). Raw dense-vector
+inspection over the .md store: "is there a memory about X", and index stats.
+
+Recall itself lives in the `engram-rust` (`engram-mcp`) server, which is the single
+recall path (hybrid keyword+vector+graph, degrading to keyword+vector when no graph
+is installed). This server used to also expose `memory_vector_recall` and
+`memory_recall_fused`; both re-embedded the query on their own, so a recall driven
+here plus engram-rust embedded the same text twice against the model. They were
+removed and recall consolidated onto engram-rust. What remains are the raw-search
+and stats tools nothing else provides.
 
 All tools degrade gracefully: if the vector store is disabled or Qdrant is
 unreachable they return a short notice (not an error), so Claude falls back to the
@@ -54,30 +61,6 @@ def _filters(cfg, mtype: str = "") -> dict | None:
 
 
 @mcp.tool()
-def memory_vector_recall(query: str, k: int = 6, type: str = "") -> str:
-    """Recall the most relevant memories for a task/query by dense semantic search
-    over the Qdrant index. Returns memory names, descriptions, and similarity scores.
-    Optionally filter by memory `type` (user|feedback|project|reference). Use at the
-    start of work to load only the relevant memories instead of all of them.
-    (Optional vector store — falls back to a notice if disabled/unreachable.)"""
-    try:
-        store = _get_store()
-    except vc.VectorUnavailable as e:
-        return f"(vector store unavailable — using markdown/graph instead: {e})"
-    try:
-        _, thr = vc.recall_defaults(store.cfg)
-        hits = store.search(query, k=k, threshold=thr, filters=_filters(store.cfg, type))
-    except Exception as e:
-        return f"(vector recall failed: {e})"
-    if not hits:
-        return f"(no memories matched: {query})"
-    out = [f"Recalled {len(hits)} memories for: {query}", ""]
-    for h in hits:
-        out.append(f"- {h['name'] or h['file']} (score {h['score']:.3f}): {(h['description'] or '').strip()}")
-    return "\n".join(out)
-
-
-@mcp.tool()
 def memory_vector_search(query: str, k: int = 8, type: str = "") -> str:
     """Raw semantic search over memories: returns the top-k matching files with
     their similarity scores (no graph facts). Optionally filter by memory `type`.
@@ -92,48 +75,6 @@ def memory_vector_search(query: str, k: int = 8, type: str = "") -> str:
         return f"(vector search failed: {e})"
     return "\n".join(f"- `{h['score']:.3f}`  {h['file']}: {(h['description'] or '').strip()}"
                      for h in hits) or "(no matches)"
-
-
-@mcp.tool()
-def memory_recall_fused(query: str, k: int = 6, type: str = "") -> str:
-    """Hybrid recall WITHOUT the graph: fuse dense vector search + keyword (BM25)
-    over the .md store via Reciprocal Rank Fusion. Best single recall tool when the
-    Neo4j graph isn't installed; for the full graph+vector+keyword fusion use the
-    engram-graph `memory_recall_hybrid` tool instead. Optionally filter by `type`."""
-    import memory_keyword
-    import memory_fusion
-    cfg = memory_ai.load()
-    rc = memory_ai.recall_cfg(cfg).get("hybrid", {})
-    mtype = type or None
-
-    rankings, names = {}, {}
-    # vector leg (optional — degrades to keyword-only if unavailable)
-    try:
-        store = _get_store()
-        vhits = store.search(query, k=max(k * 2, 10), filters=_filters(store.cfg, mtype))
-        rankings["vector"] = [h["file"] for h in vhits]
-        for h in vhits:
-            names.setdefault(h["file"], (h["name"], h["description"]))
-    except vc.VectorUnavailable:
-        pass
-    except Exception as e:
-        return f"(fused recall: vector leg failed: {e})"
-    # keyword leg (pure-python, effectively always available)
-    krank = memory_keyword.rank(query, k=max(k * 2, 10), mtype=mtype)
-    rankings["keyword"] = [f for f, _ in krank]
-
-    fused = memory_fusion.fuse(rankings, k_rrf=int(rc.get("k_rrf", 60)),
-                               weights=rc.get("weights"))[:k]
-    if not fused:
-        return f"(no memories matched: {query})"
-    out = [f"Recalled {len(fused)} memories for: {query}", ""]
-    for d in fused:
-        if d["file"] not in names:                  # keyword-only hit -> read frontmatter
-            nm, desc, _ = memory_keyword.meta(d["file"])
-            names[d["file"]] = (nm, desc)
-        nm, desc = names[d["file"]]
-        out.append(f"- {nm or d['file']} [{'+'.join(d['sources'])}]: {(desc or '').strip()}")
-    return "\n".join(out)
 
 
 @mcp.tool()

@@ -12,7 +12,13 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 CLAUDE="$TMP/claude"; REPO="$TMP/repo"; HOME="$TMP/home"
-mkdir -p "$CLAUDE/rust" "$REPO/target/release" "$HOME/.config/systemd/user" "$TMP/etc"
+# Sandbox the system-unit dir too. Without this the helper scanned the LIVE
+# /etc/systemd/system during the test and copied the placeholder below over any
+# real engram-app a unit there ran — this test overwriting the host's binary was
+# the whole bug. Must be exported so the helper (run below) sees it.
+SYSDIR="$TMP/etc/systemd/system"
+export ENGRAM_SYSTEMD_SYSTEM_DIR="$SYSDIR"
+mkdir -p "$CLAUDE/rust" "$REPO/target/release" "$HOME/.config/systemd/user" "$SYSDIR"
 printf 'NEW-BINARY\n' > "$REPO/target/release/engram-app"
 chmod 755 "$REPO/target/release/engram-app"
 
@@ -36,6 +42,15 @@ cat > "$HOME/.config/systemd/user/engram-managed.service" <<EOF
 [Service]
 ExecStart=$CLAUDE/rust/engram-app --config $CLAUDE/engram.yaml
 EOF
+# A SYSTEM unit (the branch that was unsandboxed) pointing at a bin_t-style path,
+# in the sandboxed system dir. On the real host this is where engram-api lives and
+# ExecStart is /usr/local/bin/engram-app — exactly what used to get clobbered.
+mkdir -p "$TMP/usrlocal-sys"
+printf 'OLD-BINARY\n' > "$TMP/usrlocal-sys/engram-app"; chmod 755 "$TMP/usrlocal-sys/engram-app"
+cat > "$SYSDIR/engram-api.service" <<EOF
+[Service]
+ExecStart=$TMP/usrlocal-sys/engram-app --config $CLAUDE/engram.yaml --bind 127.0.0.1:8787
+EOF
 
 # Extract the helper and run it against the fixture.
 say(){ printf '%s\n' "$*"; }
@@ -45,6 +60,8 @@ sync_service_binaries >"$TMP/out" 2>&1 || { echo "FAIL: helper errored"; cat "$T
 
 grep -q NEW-BINARY "$TMP/usrlocal/engram-app" \
   || { echo "FAIL: the binary the unit runs was not refreshed"; exit 1; }
+grep -q NEW-BINARY "$TMP/usrlocal-sys/engram-app" \
+  || { echo "FAIL: a system-unit's binary was not refreshed (sandboxed sysdir branch)"; exit 1; }
 grep -q "refreshed $TMP/usrlocal/engram-app" "$TMP/out" \
   || { echo "FAIL: refresh not reported"; cat "$TMP/out"; exit 1; }
 [[ ! -e "$ABSENT" ]] \

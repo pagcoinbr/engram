@@ -35,6 +35,10 @@ sys.path.insert(0, str(Path.home() / ".claude"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # find engram_secrets in-repo too
 import memory_ai
 import engram_secrets
+try:
+    import engram_llm_audit as _audit
+except Exception:  # pragma: no cover - auditing is never fatal
+    _audit = None
 
 MEM = Path.home() / ".claude" / "projects" / (os.environ.get("CLAUDE_MEMORY_SLUG") or str(Path.home()).replace("/", "-")) / "memory"
 
@@ -161,19 +165,42 @@ def ollama_stream(prompt, cfg):
     req = urllib.request.Request(f"{host}/api/generate", data=body,
                                  headers={"Content-Type": "application/json"})
     parts = []; done = None; t0 = time.time()
-    with urllib.request.urlopen(req, timeout=int(oc.get("timeout_seconds", 1200))) as r:
-        for line in r:
-            line = line.strip()
-            if not line:
-                continue
+    # Native streaming bypasses engram_llm's backends, so audit the call here too.
+    call_id = _audit.new_call_id() if _audit else ""
+    try:
+        with urllib.request.urlopen(req, timeout=int(oc.get("timeout_seconds", 1200))) as r:
+            for line in r:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    c = json.loads(line)
+                except Exception:
+                    continue
+                if c.get("response"):
+                    parts.append(c["response"])
+                if c.get("done"):
+                    done = c.get("done_reason")
+    except Exception as exc:
+        if _audit is not None:
             try:
-                c = json.loads(line)
+                _audit.record(src="engram_llm", kind="generation", call_id=call_id, attempt=1,
+                              backend="ollama", endpoint=host, model=model, role="distill",
+                              chars=len(prompt or ""), digest=_audit.digest(prompt or ""),
+                              ms=int((time.time() - t0) * 1000), outcome="error",
+                              detail=f"{type(exc).__name__}:{getattr(exc, 'code', '') or ''}".rstrip(":"))
             except Exception:
-                continue
-            if c.get("response"):
-                parts.append(c["response"])
-            if c.get("done"):
-                done = c.get("done_reason")
+                pass
+        raise
+    if _audit is not None:
+        try:
+            _audit.record(src="engram_llm", kind="generation", call_id=call_id, attempt=1,
+                          backend="ollama", endpoint=host, model=model, role="distill",
+                          chars=len(prompt or ""), digest=_audit.digest(prompt or ""),
+                          ms=int((time.time() - t0) * 1000),
+                          outcome="ok" if parts else "empty", detail=str(done or ""))
+        except Exception:
+            pass
     return "".join(parts), done, time.time() - t0
 
 def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):

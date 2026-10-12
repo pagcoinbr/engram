@@ -15,7 +15,9 @@ engram-paths = { path = "../engram-paths" }
 engram-retrieval = { path = "../engram-retrieval" }
 engram-secrets = { path = "../engram-secrets" }
 engram-store = { path = "../engram-store" }
+engram-tenant = { path = "../engram-tenant" }
 engram-vector = { path = "../engram-vector" }
+engram-wiki = { path = "../engram-wiki" }
 # For flock(2). Already in the dependency graph transitively; the config lock
 # needs kernel-held advisory locking, which std does not expose.
 libc = "0.2"
